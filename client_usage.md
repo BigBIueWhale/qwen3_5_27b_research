@@ -1,11 +1,35 @@
 # Qwen 3.5 27B on Ollama: Client-Side Usage Guide
 
-> **Fork:** [`BigBIueWhale/ollama`](https://github.com/BigBIueWhale/ollama) at commit [`fbae6976`](https://github.com/BigBIueWhale/ollama/commit/fbae6976a8d202a1a760915811968eb30ad8981a) (Feb 27, 2026 UTC)
+> **Fork:** [`BigBIueWhale/ollama`](https://github.com/BigBIueWhale/ollama) at commit [`ab234955`](https://github.com/BigBIueWhale/ollama/commit/ab234955) (Feb 28, 2026 UTC)
 > **Base:** Ollama v0.17.4 ([`cc90a035`](https://github.com/ollama/ollama/commit/cc90a035a0cc3ae9bd0c1dc95d42b620e8dcb0e2))
 > **Model:** `qwen3.5:27b` (Q4_K_M, ~16.2 GB on disk)
 > **Hardware:** NVIDIA RTX 5090 (32 GB VRAM)
 
-This document describes how to use the Qwen 3.5 27B dense model for agentic tool calling with thinking via our Ollama fork, which fixes [four critical bugs](https://github.com/ollama/ollama/issues/14493) that make tool calling completely non-functional in upstream Ollama (v0.17.1 through v0.17.4).
+This document describes how to use the Qwen 3.5 27B dense model for agentic tool calling with thinking via our Ollama fork. The fork addresses two independent sets of issues in upstream Ollama v0.17.4:
+
+1. **Four critical Qwen 3.5 bugs** that make tool calling completely non-functional — documented in the [Qwen 3.5 27B inference report](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md) and filed as [ollama/ollama#14493](https://github.com/ollama/ollama/issues/14493).
+
+2. **Tokenizer performance bugs** that cause 13+ seconds of CPU burn before GPU inference on long conversations — documented in the [Ollama performance deep dive](https://github.com/BigBIueWhale/ollama_perf_bug_report/blob/master/PERFORMANCE_DEEP_DIVE.md) and [benchmark results](https://github.com/BigBIueWhale/ollama_perf_bug_report/blob/master/BENCHMARK_RESULTS.md).
+
+---
+
+## All Changes in This Fork
+
+Every change in this fork has been [verified against the HuggingFace ground truth templates](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json) for correctness. Performance changes are output-identical to upstream — they produce the same results faster. All changes have passing tests.
+
+| Change | Affects | Category | Risk |
+|--------|---------|----------|------|
+| [Penalty sampling](https://github.com/BigBIueWhale/ollama/blob/ab234955/sample/transforms.go#L120) now implemented in Go runner | All Go-runner models | Qwen 3.5 fix | **High** — default `repeat_penalty=1.1` was silently ignored, now applied |
+| [Renderer/parser rewired](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/renderer.go#L59) from Qwen3VL (JSON) to Qwen3Coder (XML) | `qwen3.5` only | Qwen 3.5 fix | Low |
+| [Thinking support](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/qwen3coder.go#L58) added to Coder renderer/parser | `qwen3.5` only | Qwen 3.5 fix | Low |
+| [Prefill excludes tool calls](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/qwen3coder.go#L148) — generation prompt emitted after tool call turns | `qwen3.5`, `qwen3-coder`, `qwen3-vl-*` | Qwen 3.5 fix | Medium — also fixes `qwen3-coder` and `qwen3-vl` models |
+| [Tool call whitespace](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/qwen3coder.go#L163) matches HuggingFace template | `qwen3.5`, `qwen3-coder` | Qwen 3.5 fix | Low — verified against both [Qwen 3.5](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json) and [Qwen3-Coder](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/tokenizer_config.json) templates |
+| [`</think>` always closed](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/qwen3vl.go#L98) in VL renderer | `qwen3-vl-thinking` | Qwen 3.5 fix | Low |
+| [Binary search truncation](https://github.com/BigBIueWhale/ollama/blob/ab234955/server/prompt.go#L33) — O(log N) instead of O(N) tokenize calls | All models | [Perf fix](https://github.com/BigBIueWhale/ollama_perf_bug_report/blob/master/PERFORMANCE_DEEP_DIVE.md#bug-1-the-on-truncation-loop-that-nobody-else-uses) | Low — output-identical |
+| [`strings.Contains` early-out](https://github.com/BigBIueWhale/ollama/blob/ab234955/tokenizer/special.go#L28) + [`slices.Replace`](https://github.com/BigBIueWhale/ollama/blob/ab234955/tokenizer/special.go#L53) for special tokens | All models | [Perf fix](https://github.com/BigBIueWhale/ollama_perf_bug_report/blob/master/PERFORMANCE_DEEP_DIVE.md#bug-2-osf-special-token-scanning--1000-sequential-string-searches) | Low — output-identical, eliminates GC pressure |
+| [Stack-allocated `Merge()` key](https://github.com/BigBIueWhale/ollama/blob/ab234955/tokenizer/vocabulary.go#L107) avoids heap allocation per BPE lookup | All models | [Perf fix](https://github.com/BigBIueWhale/ollama_perf_bug_report/blob/master/PERFORMANCE_DEEP_DIVE.md#bug-5-merge-creates-a-new-string-on-every-bpe-lookup) | Low — output-identical |
+
+**High-risk note:** The penalty sampling fix is the only change that alters observable output for models other than Qwen 3.5. Upstream Ollama's Go runner silently discarded `repeat_penalty`, `frequency_penalty`, and `presence_penalty` — accepting them via the API but applying no effect. This fork makes them work. The default `repeat_penalty=1.1` (from `DefaultOptions()`) will now be applied to all Go-runner models, matching what the C++ runner (llamarunner) already does.
 
 ---
 
@@ -214,7 +238,7 @@ When you `ollama pull qwen3.5:27b` and call the API with no `options`, here is w
 
 ### Layer 1: Ollama Code Defaults
 
-Hardcoded in [`api/types.go:1054` (`DefaultOptions()`)](https://github.com/BigBIueWhale/ollama/blob/fbae6976/api/types.go#L1054):
+Hardcoded in [`api/types.go:1054` (`DefaultOptions()`)](https://github.com/BigBIueWhale/ollama/blob/ab234955/api/types.go#L1054):
 
 | Parameter | Code Default |
 |---|---|
@@ -244,7 +268,7 @@ These three values overwrite the code defaults. Everything else (penalties, cont
 
 ### Layer 3: VRAM-Based Context Length
 
-Since the params blob does not set `num_ctx`, and `DefaultOptions()` sets it to 0 (meaning "auto"), the VRAM-based tier system in [`server/routes.go:1758`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/server/routes.go#L1758) applies:
+Since the params blob does not set `num_ctx`, and `DefaultOptions()` sets it to 0 (meaning "auto"), the VRAM-based tier system in [`server/routes.go:1758`](https://github.com/BigBIueWhale/ollama/blob/ab234955/server/routes.go#L1758) applies:
 
 | Total VRAM | Default `num_ctx` |
 |---|---|
@@ -308,25 +332,25 @@ Upstream Ollama v0.17.1 through v0.17.4 has four bugs that make Qwen 3.5 27B age
 
 The Go runner's `NewSampler()` in [`sample/samplers.go`](https://github.com/ollama/ollama/blob/cc90a035/sample/samplers.go#L130) accepted 6 parameters (temperature, topK, topP, minP, seed, grammar) and silently discarded `repeat_penalty`, `frequency_penalty`, `presence_penalty`, and `repeat_last_n`. The API accepted these values without error but they had zero effect.
 
-**Fix:** Extended `Sampler` struct with penalty fields, added [`applyPenalties()`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/sample/transforms.go#L120) in `sample/transforms.go`, wired all four parameters through [`NewSampler()`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/runner/ollamarunner/runner.go#L890). This affects all models on the Go runner, not just Qwen 3.5.
+**Fix:** Extended `Sampler` struct with penalty fields, added [`applyPenalties()`](https://github.com/BigBIueWhale/ollama/blob/ab234955/sample/transforms.go#L120) in `sample/transforms.go`, wired all four parameters through [`NewSampler()`](https://github.com/BigBIueWhale/ollama/blob/ab234955/runner/ollamarunner/runner.go#L890). This affects all models on the Go runner, not just Qwen 3.5.
 
 ### Bug 2: Wrong Tool Calling Format + Missing Thinking Support
 
 The `"qwen3.5"` renderer/parser name mapped to `Qwen3VLRenderer`/`Qwen3Parser` — the **Qwen 3 Hermes-style JSON** tool calling pipeline. Qwen 3.5 was trained on the **Qwen3-Coder XML** format, as confirmed by the [HuggingFace chat template](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json). The correct `Qwen3CoderRenderer`/`Qwen3CoderParser` existed but had zero thinking support.
 
-**Fix:** Extended `Qwen3CoderRenderer` with `<think>`/`</think>` emission and `Qwen3CoderParser` with a full streaming state machine for thinking states. Rewired `"qwen3.5"` to the extended Coder pipeline in [`renderer.go`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/model/renderers/renderer.go#L59) and [`parsers.go`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/model/parsers/parsers.go#L52). Tool call whitespace [matches the HuggingFace Jinja2 ground truth](https://github.com/BigBIueWhale/ollama/blob/fbae6976/model/renderers/qwen3coder.go#L163).
+**Fix:** Extended `Qwen3CoderRenderer` with `<think>`/`</think>` emission and `Qwen3CoderParser` with a full streaming state machine for thinking states. Rewired `"qwen3.5"` to the extended Coder pipeline in [`renderer.go`](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/renderer.go#L59) and [`parsers.go`](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/parsers/parsers.go#L52). Tool call whitespace [matches the HuggingFace Jinja2 ground truth](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/qwen3coder.go#L163).
 
 ### Bug 3: Unclosed `</think>` Tag
 
 When an assistant message had thinking + tool calls but no text content, `Qwen3VLRenderer` never emitted `</think>`. The tool call was rendered inside an unclosed `<think>` block.
 
-**Fix:** Always emit `\n</think>\n\n` after thinking content in [`qwen3vl.go`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/model/renderers/qwen3vl.go#L98), regardless of whether `content` is empty. (This also affects `qwen3-vl-instruct` and `qwen3-vl-thinking` models.)
+**Fix:** Always emit `\n</think>\n\n` after thinking content in [`qwen3vl.go`](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/qwen3vl.go#L98), regardless of whether `content` is empty. (This also affects `qwen3-vl-instruct` and `qwen3-vl-thinking` models.)
 
 ### Bug 4: Missing Generation Prompt After Tool Calls
 
 The `prefill` variable in both renderers fired for any last assistant message, including ones with tool calls. This suppressed `<|im_end|>` and the `<|im_start|>assistant\n` generation prompt.
 
-**Fix:** Changed `prefill` to exclude tool call messages in both [`qwen3coder.go`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/model/renderers/qwen3coder.go#L148) and [`qwen3vl.go`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/model/renderers/qwen3vl.go#L82): `prefill := lastMessage && message.Role == "assistant" && len(message.ToolCalls) == 0`.
+**Fix:** Changed `prefill` to exclude tool call messages in both [`qwen3coder.go`](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/qwen3coder.go#L148) and [`qwen3vl.go`](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/qwen3vl.go#L82): `prefill := lastMessage && message.Role == "assistant" && len(message.ToolCalls) == 0`.
 
 ---
 
@@ -336,10 +360,10 @@ Unlike older Ollama models that ship a Go template blob (e.g. Qwen 3 ships a 1,7
 
 The entire chat prompt — system message formatting, tool definition rendering, tool call rendering, tool response formatting, thinking block handling, and generation prompt — is hardcoded in Go:
 
-- **Renderer:** [`Qwen3CoderRenderer`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/model/renderers/qwen3coder.go#L58) (our fork; upstream incorrectly uses `Qwen3VLRenderer`)
-- **Parser:** [`Qwen3CoderParser`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/model/parsers/qwen3coder.go#L31) (our fork; upstream incorrectly uses `Qwen3Parser`)
+- **Renderer:** [`Qwen3CoderRenderer`](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/qwen3coder.go#L58) (our fork; upstream incorrectly uses `Qwen3VLRenderer`)
+- **Parser:** [`Qwen3CoderParser`](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/parsers/qwen3coder.go#L31) (our fork; upstream incorrectly uses `Qwen3Parser`)
 
-The mapping from the registry's `renderer: "qwen3.5"` / `parser: "qwen3.5"` to these Go structs lives in [`renderer.go:59`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/model/renderers/renderer.go#L59) and [`parsers.go:52`](https://github.com/BigBIueWhale/ollama/blob/fbae6976/model/parsers/parsers.go#L52).
+The mapping from the registry's `renderer: "qwen3.5"` / `parser: "qwen3.5"` to these Go structs lives in [`renderer.go:59`](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/renderers/renderer.go#L59) and [`parsers.go:52`](https://github.com/BigBIueWhale/ollama/blob/ab234955/model/parsers/parsers.go#L52).
 
 This means: **you cannot customize the chat template via a Modelfile `TEMPLATE` directive.** The `TEMPLATE` directive only works for models that use the Go template engine (like Devstral, Llama, etc.). Qwen 3.5 uses a builtin renderer, so the template is whatever the Go code says it is. The only way to change the prompt format is to modify the Go source.
 
