@@ -11,6 +11,7 @@
 |-----------|---------|--------|------|
 | Ollama inference framework (original analysis) | v0.17.1 | `9bf4196` | [ollama/ollama@9bf4196](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a) |
 | Ollama inference framework (re-verified) | post-v0.17.4 (Feb 26, 2026 UTC) | `79917cf` | [ollama/ollama@79917cf](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) |
+| Ollama inference framework (fork base for fixes) | v0.17.4 | `cc90a035` | [ollama/ollama@cc90a03](https://github.com/ollama/ollama/tree/cc90a035a0cc3ae9bd0c1dc95d42b620e8dcb0e2) |
 | llama.cpp C++ inference library (Ollama-pinned) | — | `ec98e2002` | [ggml-org/llama.cpp@ec98e2002](https://github.com/ggml-org/llama.cpp/tree/ec98e2002) + [34 Ollama patches](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/llama/patches) |
 | llama.cpp C++ inference library (upstream) | post-b5136 (Feb 26, 2026 UTC) | `723c710` | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
 | vLLM inference server (stable) | v0.16.0 (Feb 25, 2026 UTC) | — | [vllm-project/vllm v0.16.0](https://github.com/vllm-project/vllm/releases/tag/v0.16.0) — **does NOT support Qwen 3.5** (branch cut Feb 8, 2026 UTC, before Qwen 3.5 series launch Feb 16, 2026 UTC / 27B release Feb 24, 2026 UTC) |
@@ -29,7 +30,7 @@
 | Framework | Latest Stable (as of Feb 27, 2026 UTC) | Qwen 3.5 Support? |
 |-----------|----------------------------------------|-------------------|
 | **vLLM inference server** | v0.16.0 (branch cut Feb 8, 2026 UTC) | **None** — series launched Feb 16, 27B released Feb 24, both after branch cut |
-| **Ollama inference framework** | v0.17.4 (Feb 26, 2026 UTC) | Yes, but with 3 critical bugs |
+| **Ollama inference framework** | v0.17.4 (Feb 26, 2026 UTC) | Yes, but with 4 critical bugs |
 
 ### vLLM: Zero Code Fixes Needed — But Nightly-Only With Known Issues
 
@@ -42,6 +43,7 @@ vLLM's stable v0.16.0 has zero Qwen 3.5 support. The nightly (commit [`a1f53ad`]
 | Reasoning parser | **Correct** — clean two-phase handoff to tool parser ([Section 4](#4-vllm-support-status)) |
 | Penalty sampling | **Correct** — `presence_penalty`, `frequency_penalty`, `repetition_penalty` all functional |
 | `</think>` closure | **Correct** — handled by HuggingFace template, not framework code |
+| Generation prompt | **Correct** — HuggingFace Jinja2 template unconditionally appends generation prompt after message loop |
 | Default parameters | **Not provided** — must set `temperature`, `top_p`, `top_k`, `presence_penalty` per-request (convenience gap, not a correctness bug) |
 | Quantization for 32 GB VRAM | **FP8 is the only well-tested option** (~28 GB model, ~4 GB KV, ~64K tokens). Community AWQ-4bit checkpoints exist but are [barely tested](#deep-dive-quantization-on-32-gb-vram): one TP=2 success, one failure with garbled output, zero single-GPU reports. No official Qwen 4-bit checkpoint exists. |
 
@@ -62,18 +64,24 @@ vLLM's stable v0.16.0 has zero Qwen 3.5 support. The nightly (commit [`a1f53ad`]
 
 **Effort to fix the code: 0 lines.** The template, tool format, penalty sampling, and reasoning parser are all correct in the nightly. The "fix" is waiting for v0.17.0 (the next stable release, which will include both Qwen 3.5 support and the sm_120 kernel fixes). The RTX 5090 packaging gap and open bugs above are real operational concerns but not code-correctness bugs — they affect the deployment environment and edge cases, not the fundamental template/format/sampling pipeline.
 
-### Ollama: ~350–700 Lines of Go Across 3 Bugs + Registry Update
+### Ollama: ~400–800 Lines of Go Across 4 Bugs + Registry Update
 
-Three verified bugs need fixing, each at a different layer of the Ollama codebase:
+Four verified bugs need fixing, each at a different layer of the Ollama codebase:
 
 **Bug 1 — Missing penalty sampling (~200–400 lines, high blast radius):**
-The Go runner's `Sampler` struct has no penalty fields. `NewSampler()` doesn't accept them. `sample()` doesn't apply them. Implementing this from scratch requires: adding `repeatPenalty`, `presencePenalty`, `frequencyPenalty`, and `repeatLastN` fields to the struct, adding a penalty application step that scans the token history window and adjusts logits before top-k/temperature/softmax, updating all `NewSampler()` call sites (at minimum [`runner/ollamarunner/runner.go:890-897`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/runner/ollamarunner/runner.go#L890-L897)), and writing tests. This touches the hot path of token generation for **every model on the Go runner**, not just Qwen 3.5.
+The Go runner's `Sampler` struct has no penalty fields. `NewSampler()` doesn't accept them. `sample()` doesn't apply them. Implementing this from scratch requires: adding `repeatPenalty`, `presencePenalty`, `frequencyPenalty`, and `repeatLastN` fields to the struct, a new `applyPenalties()` function that builds a frequency map from a ring buffer of recently generated tokens and adjusts logits (repeat penalty is multiplicative — divides positive logits, multiplies negative; frequency penalty subtracts proportional to count; presence penalty subtracts flat), integrating this into `Sample()` before both the initial sample and the grammar-fallback resample with a no-op fast path when all penalties are neutral (`repeatPenalty == 1.0 && frequencyPenalty == 0.0 && presencePenalty == 0.0`), updating all `NewSampler()` call sites (at minimum [`runner/ollamarunner/runner.go:890-897`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/runner/ollamarunner/runner.go#L890-L897) plus ~10 test call sites), and writing tests. This touches the hot path of token generation for **every model on the Go runner**, not just Qwen 3.5.
 
 **Bug 2 — Tool calling format mismatch (~150–300 lines, Qwen 3.5-only):**
-The correct `Qwen3CoderRenderer`/`Qwen3CoderParser` pipeline exists but lacks thinking support (`HasThinkingSupport()` returns `false` at [`qwen3coder.go:41-43`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3coder.go#L41-L43)). Requires either: (a) adding `<think>` prefill + thinking-collection state machine to the existing Coder pipeline, or (b) creating a new composite renderer/parser for `"qwen3.5"`. Also requires updating the switch statements in [`renderer.go`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/renderer.go#L59-L61)/[`parsers.go`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/parsers.go#L52-L53) and the registry config blob at `registry.ollama.ai`. The commented-out thinking tests in `qwen3vl_thinking_test.go` (lines 119–323) need to be un-commented and adapted.
+The correct `Qwen3CoderRenderer`/`Qwen3CoderParser` pipeline exists but lacks thinking support — a blocking gap that makes a simple rewire insufficient. Specifically:
+- **Renderer** (`Qwen3CoderRenderer` at [`qwen3coder.go:58-193`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/qwen3coder.go#L58-L193)): Has no `isThinking` or `emitEmptyThinkOnNoThink` fields. The `Render()` method ignores the `*api.ThinkValue` parameter (named `_`). No `<think>` blocks are emitted in assistant messages. No thinking prefill (`<think>\n` or `<think>\n\n</think>\n\n`) is appended to the generation prompt. Fix requires: adding both fields, resolving thinking state from `think` parameter at top of `Render()`, emitting `<think>\n{thinking}\n</think>\n\n` before content/tool calls in assistant messages when thinking is enabled and `message.Thinking != ""`, and adding the thinking/no-thinking prefill at the end.
+- **Parser** (`Qwen3CoderParser` at [`qwen3coder.go:31-194`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3coder.go#L31-L194)): `HasThinkingSupport()` returns `false` ([line 42](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3coder.go#L42)), so `<think>` blocks are never extracted. The parser state machine has only two states (`LookingForToolStart`, `CollectingToolContent`). Fix requires: adding two new states (`CollectingThinking`, `ThinkingDoneTransition`), adding `hasThinkingSupport`, `defaultThinking`, and `maybeThinkingOpenAtBOL` fields, extending `Init()` to set the initial state based on thinking enablement (following the `Qwen3Parser.Init()` pattern from [`qwen3.go:55-73`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3.go#L55-L73)), extending `Add()` to return thinking content separately from content, and extending the `eat()` function with thinking states that strip the optional leading `<think>` tag, handle `</think>` and `<tool_call>` detection with overlap handling for streaming, and transition to the existing tool-parsing states. The `qwenEventThinkingContent` type already exists in [`qwen3vl.go:63-67`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3vl.go#L63-L67) and is package-accessible.
+- **Wiring**: Update the switch statements in [`renderer.go:59-61`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/renderer.go#L59-L61) and [`parsers.go:52-53`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/parsers.go#L52-L53) to wire `"qwen3.5"` to `&Qwen3CoderRenderer{isThinking: true, emitEmptyThinkOnNoThink: true}` and `&Qwen3CoderParser{hasThinkingSupport: true, defaultThinking: true}` respectively. The registry config blob at `registry.ollama.ai` also needs updating but that is Ollama-team-only.
 
 **Bug 3 — Unclosed `</think>` tag (~5–20 lines, may become moot):**
 One-line logic fix at [`qwen3vl.go:98-99`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/qwen3vl.go#L98-L99) plus test updates. If Bug 2 is fixed by switching `"qwen3.5"` away from `Qwen3VLRenderer` entirely, this becomes moot *for Qwen 3.5* (though it still affects other models using `Qwen3VLRenderer` with thinking + tool calls).
+
+**Bug 4 — Missing generation prompt after assistant tool call turns (~1 line, affects agentic robustness):**
+In both `Qwen3VLRenderer` and `Qwen3CoderRenderer`, the `prefill` variable is defined as `lastMessage && message.Role == "assistant"` — treating ALL last-position assistant messages as text continuations (prefills), regardless of whether they have tool calls. An assistant message with tool calls is a **complete turn** (the model already finished generating), not a partial text to extend. The HuggingFace Jinja2 chat template always closes assistant turns with `<|im_end|>` and unconditionally appends the generation prompt (`<|im_start|>assistant\n<think>\n`) after the message loop. Without this fix, the model has no open assistant turn to generate into when the conversation ends with an assistant tool call message — a scenario that arises during cancellation, timeout, and error recovery in agentic coding flows. See [Section 9.5](#95-ollama-critical-bug-missing-generation-prompt-after-tool-call-turns) for full analysis.
 
 **Registry params blob (trivial, blocked by Bug 1):**
 Should set `presence_penalty: 1.5` per the [model card](https://huggingface.co/Qwen/Qwen3.5-27B), but pointless until Bug 1 is fixed since the Go runner silently ignores the parameter.
@@ -82,14 +90,14 @@ Should set `presence_penalty: 1.5` per the [model card](https://huggingface.co/Q
 
 | Dimension | Ollama (v0.17.1–v0.17.4) | vLLM (v0.16.0) |
 |-----------|--------------------------|-----------------|
-| Model supported at all? | Yes, with 3 critical bugs | No (nightly has full support) |
-| Lines of code to fix | ~350–700 lines of Go | 0 (correct in nightly) |
-| Number of distinct fixes | 3 bugs + 1 registry update | 0 |
+| Model supported at all? | Yes, with 4 critical bugs | No (nightly has full support) |
+| Lines of code to fix | ~400–800 lines of Go | 0 (correct in nightly) |
+| Number of distinct fixes | 4 bugs + 1 registry update | 0 |
 | Highest-stakes fix | Penalty sampling (all Go-runner models) | N/A |
 | Who can fix it? | Only Ollama team (source code + registry) | Already done by vLLM contributors |
-| User workaround available? | None for any of the 3 bugs | Use nightly build |
+| User workaround available? | None for any of the 4 bugs | Use nightly build |
 | RTX 5090 ready? | Yes (runs today, bugs aside) | Docker `-cu130` images include sm_120 kernels; `pip install` requires source build |
-| Nightly/edge-case bugs? | The 3 bugs above | 5 open issues ([#35221](https://github.com/vllm-project/vllm/issues/35221), [#29192](https://github.com/vllm-project/vllm/issues/29192), [#20611](https://github.com/vllm-project/vllm/issues/20611), [#19051](https://github.com/vllm-project/vllm/issues/19051), [#21711](https://github.com/vllm-project/vllm/issues/21711)) |
+| Nightly/edge-case bugs? | The 4 bugs above | 5 open issues ([#35221](https://github.com/vllm-project/vllm/issues/35221), [#29192](https://github.com/vllm-project/vllm/issues/29192), [#20611](https://github.com/vllm-project/vllm/issues/20611), [#19051](https://github.com/vllm-project/vllm/issues/19051), [#21711](https://github.com/vllm-project/vllm/issues/21711)) |
 | Architectural root cause | Compiled-in Go renderers must be manually kept in sync per model | HuggingFace Jinja2 template used verbatim — correct by design |
 
 ### Bottom Line
@@ -101,7 +109,7 @@ Should set `presence_penalty: 1.5` per the [model card](https://huggingface.co/Q
 ## Table of Contents
 
 - [Effort Comparison](#effort-comparison-fixing-qwen-35-27b-support-ollama-vs-vllm) — comparative analysis of what it takes to fix each framework
-- [Bug Report Summary](#bug-report-summary) — **start here** for the three verified, bug-report-worthy findings
+- [Bug Report Summary](#bug-report-summary) — **start here** for the four verified, bug-report-worthy findings
 
 1. [Model Overview](#1-model-overview)
 2. [VRAM Fit and Quantization Options](#2-vram-fit-and-quantization-options)
@@ -112,6 +120,7 @@ Should set `presence_penalty: 1.5` per the [model card](https://huggingface.co/Q
 7. [Ollama Critical Bug: Missing Penalty Sampling](#7-ollama-critical-bug-missing-penalty-sampling)
 8. [Ollama Critical Bug: Tool Calling Format Mismatch](#8-ollama-critical-bug-tool-calling-format-mismatch)
 9. [Ollama Registry Model Validation: `qwen3.5:27b-q4_K_M`](#9-ollama-registry-model-validation-qwen3527b-q4_k_m)
+9.5. [Ollama Critical Bug: Missing Generation Prompt After Tool Call Turns](#95-ollama-critical-bug-missing-generation-prompt-after-tool-call-turns)
 10. [Ollama Context Length](#10-ollama-context-length)
 11. [Ollama Per-Use-Case Parameter Settings](#11-ollama-per-use-case-parameter-settings)
 12. [Tool Calling Verdict](#12-tool-calling-verdict)
@@ -125,11 +134,11 @@ Should set `presence_penalty: 1.5` per the [model card](https://huggingface.co/Q
 
 ## Bug Report Summary
 
-The following three bugs in the Ollama inference framework were originally identified against v0.17.1 (commit [`9bf4196`](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a)) and **verified against source code, the Ollama model registry at `registry.ollama.ai`, and the HuggingFace model repository ground truth**. All three are unfixable by end users via API parameters or configuration — they require changes to Ollama's source code or registry model configuration by the Ollama team.
+The following four bugs in the Ollama inference framework were originally identified against v0.17.1 (commit [`9bf4196`](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a)) and **verified against source code, the Ollama model registry at `registry.ollama.ai`, and the HuggingFace model repository ground truth**. All four are unfixable by end users via API parameters or configuration — they require changes to Ollama's source code or registry model configuration by the Ollama team.
 
 ### Re-Verification Against Ollama Master (February 27, 2026 UTC)
 
-All three bugs were re-verified against Ollama master at commit [`79917cf`](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) (February 26, 2026 UTC, one commit ahead of v0.17.4). Stable releases checked: v0.17.1 through v0.17.4.
+All four bugs were re-verified against Ollama master at commit [`79917cf`](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) (February 26, 2026 UTC, one commit ahead of v0.17.4). Stable releases checked: v0.17.1 through v0.17.4.
 
 | Bug | v0.17.1 | v0.17.2 | v0.17.3 | v0.17.4 | master (`79917cf`) |
 |-----|---------|---------|---------|---------|-------------------|
@@ -137,6 +146,7 @@ All three bugs were re-verified against Ollama master at commit [`79917cf`](http
 | Bug 2: Tool calling format mismatch | Present | Present | Present | Present | **Present** |
 | Bug 3: Unclosed `</think>` tag (renderer) | Present | Present | Present | Present | **Present** |
 | Bug 3 (parser-side mitigation) | — | — | **Fixed** | Fixed | Fixed |
+| Bug 4: Missing generation prompt after tool calls | Present | Present | Present | Present | **Present** |
 
 **Bug 3 partial fix detail:** Commit [`d98dda4`](https://github.com/ollama/ollama/commit/d98dda4676d44a3882fd38492cc00db257f35974) ("model: fix qwen3 tool calling in thinking", PR [#14477](https://github.com/ollama/ollama/pull/14477), merged February 26, 2026 UTC) added parser-side handling so that `Qwen3Parser` and `Qwen3VLParser` now detect `<tool_call>` while still in thinking-collection state, treating it as the end of thinking and transitioning to tool-call parsing. This fix entered the **v0.17.3** stable release. However, the **renderer side** of the bug — the `Qwen3VLRenderer` at [`qwen3vl.go:98-99`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/renderers/qwen3vl.go#L98-L99) still gating `</think>` emission on `content != ""` — remains unfixed. Multi-turn prompts sent to the model still contain unclosed `<think>` tags when an assistant turn has thinking + tool calls + empty content. The tool-call thinking tests in `qwen3vl_thinking_test.go` (lines 119–323) remain commented out.
 
@@ -166,6 +176,14 @@ This bug has two sides — the **renderer** (prompt construction for the model) 
 
 - **Evidence:** [Section 9](#9-ollama-registry-model-validation-qwen3527b-q4_k_m) (Prompt Template Diff subsection)
 - **Key source files:** [`model/renderers/qwen3vl.go:95-120`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/renderers/qwen3vl.go#L95-L120) (renderer, still broken), [`model/parsers/qwen3.go:207-227`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/parsers/qwen3.go#L207-L227) (parser, fixed)
+
+### Bug 4: Missing Generation Prompt After Assistant Tool Call Turns
+
+Both `Qwen3VLRenderer` and `Qwen3CoderRenderer` define `prefill` as `lastMessage && message.Role == "assistant"`, treating all last-position assistant messages as text continuations regardless of whether they contain tool calls. An assistant message with tool calls is a **complete turn** — the model already finished generating. The HuggingFace Jinja2 chat template unconditionally appends `<|im_start|>assistant\n<think>\n` after the message loop when `add_generation_prompt` is true, regardless of the last message type. Without the generation prompt, the model has no open assistant turn to generate into when the conversation ends with an assistant tool call message — a scenario that arises during agentic cancellation, timeout, and error recovery flows.
+
+- **Evidence:** [Section 9.5](#95-ollama-critical-bug-missing-generation-prompt-after-tool-call-turns)
+- **Key source files:** [`model/renderers/qwen3coder.go:148`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/qwen3coder.go#L148) (`prefill` definition), [`model/renderers/qwen3vl.go:85`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/qwen3vl.go#L85) (same pattern)
+- **Ground truth:** [HuggingFace Jinja2 chat template](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json) — `add_generation_prompt` block fires unconditionally after message loop
 
 ### What Was Investigated But Does NOT Belong in the Bug Report
 
@@ -600,9 +618,10 @@ The main model code lives in [`qwen3_5.py`](https://github.com/vllm-project/vllm
 > **Items marked BUG REPORT are verified, source-linked, and ready for inclusion in a bug report to the Ollama team. Items marked INFORMATIONAL are true observations but should not be filed as bugs.**
 
 1. **BUG REPORT — Penalty sampling completely missing** — see [Section 7](#7-ollama-critical-bug-missing-penalty-sampling) and [Section 6](#6-ollama-deep-dive-parameter-flow-validation)
-2. **BUG REPORT — Tool calling format mismatch** — the Ollama inference framework sends Qwen 3 Hermes-style JSON format but the Qwen 3.5 model was trained on Qwen3-Coder XML format — see [Section 8](#8-ollama-critical-bug-tool-calling-format-mismatch)
+2. **BUG REPORT — Tool calling format mismatch** — the Ollama inference framework sends Qwen 3 Hermes-style JSON format but the Qwen 3.5 model was trained on Qwen3-Coder XML format. The correct Qwen3-Coder pipeline exists in the codebase but lacks thinking support, making the fix non-trivial — see [Section 8](#8-ollama-critical-bug-tool-calling-format-mismatch)
 3. **BUG REPORT — Unclosed `</think>` tag** — in multi-turn tool call history, thinking blocks are never closed before tool calls when assistant content is empty — see [Section 9](#9-ollama-registry-model-validation-qwen3527b-q4_k_m)
-4. **INFORMATIONAL — Thinking mode disable broken** ([#14418](https://github.com/ollama/ollama/issues/14418)) — `think: false` does not work. **This is actually desirable for agent use cases** — thinking should always be on. The model's agentic training assumes thinking mode.
+4. **BUG REPORT — Missing generation prompt after assistant tool call turns** — when the last message is an assistant message with tool calls, the renderer fails to append the generation prompt (`<|im_start|>assistant\n<think>\n`), leaving the model with no open turn to generate into. Affects agentic cancellation, timeout, and error recovery scenarios — see [Section 9.5](#95-ollama-critical-bug-missing-generation-prompt-after-tool-call-turns)
+5. **INFORMATIONAL — Thinking mode disable broken** ([#14418](https://github.com/ollama/ollama/issues/14418)) — `think: false` does not work. **This is actually desirable for agent use cases** — thinking should always be on. The model's agentic training assumes thinking mode.
 5. **INFORMATIONAL — Parallel requests forced to 1** for `qwen35` architecture ([`sched.go:450`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/server/sched.go#L450)) due to hybrid recurrent state — this is an expected architectural limitation
 6. **INFORMATIONAL — Only one 27B tag** in the Ollama model library: `qwen3.5:27b-q4_K_M` (17 GB)
 
@@ -863,13 +882,30 @@ The previously cited GitHub issues are **Qwen 3 issues using the Qwen 3 Hermes-s
 
 ### The Fix
 
-The correct fix is to wire `"qwen3.5"` to the Qwen3-Coder pipeline with thinking support added:
+The correct fix is to wire `"qwen3.5"` to the Qwen3-Coder pipeline with thinking support added. This is not a simple one-line rewire — the existing `Qwen3CoderRenderer` and `Qwen3CoderParser` have no thinking support, so both must be extended before they can replace the current (wrong) `Qwen3VLRenderer`/`Qwen3Parser` wiring.
 
-**Renderer:** Use `Qwen3CoderRenderer` (or a variant that adds thinking prefill, since `Qwen3CoderRenderer` currently has no thinking support — [`qwen3coder.go:43`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3coder.go#L43): `HasThinkingSupport() returns false`).
+**Renderer changes** (`Qwen3CoderRenderer` at [`qwen3coder.go:58-193`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/qwen3coder.go#L58-L193)):
+- Add `isThinking bool` and `emitEmptyThinkOnNoThink bool` fields to the struct (matching the pattern already used by `Qwen3VLRenderer`)
+- Accept the `*api.ThinkValue` parameter in `Render()` (currently named `_` and ignored)
+- Resolve thinking state at the top of `Render()`: use `think.Bool()` if the parameter is non-nil, otherwise fall back to `r.isThinking`
+- In the `case "assistant"` block, emit `<think>\n{thinking}\n</think>\n\n` before content or tool calls when thinking is enabled and `message.Thinking != ""`
+- Append thinking prefill at the end of the prompt: `<think>\n` when thinking is enabled, or `<think>\n\n</think>\n\n` when `emitEmptyThinkOnNoThink` is set and thinking is disabled (this matches the HuggingFace Jinja2 template behavior for `enable_thinking=False`)
+- Fix the `prefill` variable to exclude assistant messages with tool calls — see [Bug 4 (Section 9.5)](#95-ollama-critical-bug-missing-generation-prompt-after-tool-call-turns) for why this is critical
 
-**Parser:** Use `Qwen3CoderParser` with thinking support added. Currently `HasThinkingSupport()` returns `false` ([`qwen3coder.go:41-43`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3coder.go#L41-L43)), so `<think>` blocks would not be extracted. A combined parser that handles both thinking tags (from `Qwen3Parser`) and XML tool calls (from `Qwen3CoderParser`) is needed.
+**Parser changes** (`Qwen3CoderParser` at [`qwen3coder.go:31-194`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3coder.go#L31-L194)):
+- Add `hasThinkingSupport`, `defaultThinking`, and `maybeThinkingOpenAtBOL` fields
+- Add two new parser states: `CollectingThinking` (strips the optional leading `<think>` tag, accumulates thinking content, watches for `</think>` or `<tool_call>` — whichever comes first) and `ThinkingDoneTransition` (eats whitespace between `</think>` and the start of content or tool calls)
+- Extend `Init()` to set the initial state to `CollectingThinking` when thinking is enabled (following the pattern from `Qwen3Parser.Init()` at [`qwen3.go:55-73`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3.go#L55-L73))
+- Extend `Add()` to return thinking content separately (the `qwenEventThinkingContent` type already exists in the `parsers` package at [`qwen3vl.go:63-67`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3vl.go#L63-L67))
+- Handle streaming edge cases in the `eat()` function: partial `</think>` and `<tool_call>` tag overlaps at chunk boundaries, `<tool_call>` appearing inside an unclosed thinking block (direct transition to tool collection, skipping `ThinkingDoneTransition`)
 
-This is an Ollama-side change that only the Ollama team can make. The Qwen 3.5 model's tool calling capability is strong — it was trained on 20,000 parallel rollout environments for agentic tasks. The issue is entirely in the Ollama inference framework's wiring, not in the model.
+**Wiring changes:**
+- [`renderer.go:59-61`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/renderer.go#L59-L61): Change `"qwen3.5"` from `&Qwen3VLRenderer{isThinking: true, emitEmptyThinkOnNoThink: true}` to `&Qwen3CoderRenderer{isThinking: true, emitEmptyThinkOnNoThink: true}`
+- [`parsers.go:52-53`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/parsers.go#L52-L53): Change `"qwen3.5"` from `&Qwen3Parser{hasThinkingSupport: true, defaultThinking: true}` to `&Qwen3CoderParser{hasThinkingSupport: true, defaultThinking: true}`
+
+**Registry config blob** at `registry.ollama.ai` also needs updating (only the Ollama team can do this), but the config blob only specifies the string names `"qwen3.5"` for both renderer and parser — the actual behavior is determined by the switch statements in the Ollama binary. So the code-side fix takes effect immediately for users who update their Ollama binary, regardless of whether the registry blob is changed.
+
+The Qwen 3.5 model's tool calling capability is strong — it was trained on 20,000 parallel rollout environments for agentic tasks. The issue is entirely in the Ollama inference framework's wiring, not in the model.
 
 ### Additional Parser Quality Issues
 
@@ -1074,8 +1110,63 @@ Three critical issues in the multi-turn rendering:
 | Missing `presence_penalty` in params | Params blob at Ollama registry | Moot — Ollama Go-based runner ignores it anyway ([Bug 1](#7-ollama-critical-bug-missing-penalty-sampling)) | No (covered by Bug 1) |
 | No template blob (intentional — uses compiled-in renderer) | Manifest at Ollama registry | Neutral | No |
 | Unclosed `</think>` tag in multi-turn tool call history | Renderer bug in Ollama source code | **CRITICAL** | **YES** |
+| Missing generation prompt after assistant tool call turns | Renderer bug in Ollama source code | **CRITICAL** | **YES** — see [Section 9.5](#95-ollama-critical-bug-missing-generation-prompt-after-tool-call-turns) |
 | System message placed before tool instructions (should be after) | Renderer bug in Ollama source code | Moderate | Optional |
 | Missing `<IMPORTANT>` format compliance block | Renderer bug in Ollama source code | Moderate | Optional |
+
+---
+
+## 9.5. Ollama Critical Bug: Missing Generation Prompt After Tool Call Turns
+
+> **BUG REPORT ITEM** — When the last message in a conversation is an assistant message with tool calls, both `Qwen3VLRenderer` and `Qwen3CoderRenderer` fail to append the generation prompt. The model receives an incomplete prompt with no open assistant turn, breaking agentic cancellation, timeout, and error recovery scenarios.
+
+### The Problem
+
+In the Ollama rendering pipeline, the `prefill` variable controls whether the last assistant message is treated as a text continuation (no `<|im_end|>`, no generation prompt) or a complete turn (closed with `<|im_end|>`, followed by `<|im_start|>assistant\n`). In both renderers, `prefill` is defined as:
+
+```go
+prefill := lastMessage && message.Role == "assistant"
+```
+
+This treats ALL last-position assistant messages as prefills — including messages with tool calls. An assistant message with tool calls is a **complete turn** (the model already finished generating), not a partial text to extend. When such a message is last in the conversation, the renderer should close it with `<|im_end|>` and append the generation prompt (`<|im_start|>assistant\n<think>\n`), giving the model an open turn to generate into.
+
+**Source (Ollama v0.17.4):**
+- `Qwen3CoderRenderer`: [`qwen3coder.go:148`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/qwen3coder.go#L148) — `prefill := lastMessage && message.Role == "assistant"`
+- `Qwen3VLRenderer`: [`qwen3vl.go:85`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/qwen3vl.go#L85) — same pattern
+
+### HuggingFace Ground Truth
+
+The [HuggingFace Jinja2 chat template](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json) always closes assistant turns with `<|im_end|>` and **unconditionally** appends the generation prompt after the message loop when `add_generation_prompt` is true:
+
+```jinja
+{% if add_generation_prompt %}
+<|im_start|>assistant
+{% if enable_thinking %}<think>
+{% endif %}
+{% endif %}
+```
+
+This fires regardless of the last message type. There is no special-casing for tool calls vs content — every complete conversation gets the generation prompt.
+
+### When This Breaks
+
+This bug manifests in agentic tool-calling flows:
+
+1. **Cancellation/timeout:** The agent sends an assistant message with tool calls, then the user cancels or a timeout occurs before the tool response arrives. The conversation now ends with an assistant tool call message.
+2. **Error recovery:** The tool execution fails, and the framework re-prompts the model to try again. The last message in the re-prompt conversation is the original assistant tool call message.
+3. **Manual intervention:** The user sends a follow-up message while tool calls are pending, and the framework must construct a prompt that includes the prior assistant tool call turn.
+
+In all cases, the model receives a prompt that ends mid-turn — the assistant message's `<|im_end|>` is missing and no `<|im_start|>assistant\n<think>\n` generation prompt follows. The model has no open turn to generate into.
+
+### The Fix
+
+Change `prefill` to exclude assistant messages with tool calls:
+
+```go
+prefill := lastMessage && message.Role == "assistant" && len(message.ToolCalls) == 0
+```
+
+This is a one-line change in each renderer. With this fix, only assistant messages without tool calls are treated as text continuations (prefills). Assistant messages with tool calls are treated as complete turns: closed with `<|im_end|>` and followed by the generation prompt, matching the HuggingFace Jinja2 template behavior.
 
 ---
 
@@ -1315,6 +1406,7 @@ The CUDA multi-GPU crash fix ([llama.cpp PR #19866](https://github.com/ggml-org/
 | top_p | **Must set manually** | No defaults injected |
 | presence_penalty | **Works if set** | vLLM inference server implements it correctly; not defaulted (model card recommends 1.5) |
 | Tool calling format | **CORRECT** | `qwen3_coder` parser matches model's trained XML format |
+| Generation prompt | **CORRECT** | HuggingFace Jinja2 template unconditionally appends `<|im_start|>assistant\n<think>\n` after message loop |
 | Tool calling stability | **Buggy** | Multiple open issues ([#21711](https://github.com/vllm-project/vllm/issues/21711), [#20611](https://github.com/vllm-project/vllm/issues/20611), [#19051](https://github.com/vllm-project/vllm/issues/19051), [#29192](https://github.com/vllm-project/vllm/issues/29192)) |
 | Reasoning parser | **Known bug** | Truncated reasoning misclassified as content in non-streaming mode only ([#35221](https://github.com/vllm-project/vllm/issues/35221)) |
 | `eval()` security vuln | **FIXED** | Was `eval()`, now `ast.literal_eval()` since v0.10.1.1 ([PR #21396](https://github.com/vllm-project/vllm/pull/21396)) |
@@ -1338,6 +1430,7 @@ The CUDA multi-GPU crash fix ([llama.cpp PR #19866](https://github.com/ggml-org/
 | Tool system prompt | **WRONG** | 6 mismatches vs HuggingFace ground truth template: wrong format instruction, wrong header, missing `<IMPORTANT>` block, wrong system message position ([Section 9](#9-ollama-registry-model-validation-qwen3527b-q4_k_m)) | **YES** |
 | Tool call rendering in history | **WRONG + BROKEN** | Uses JSON format AND fails to close `</think>` tag before tool calls ([Section 9](#9-ollama-registry-model-validation-qwen3527b-q4_k_m)) | **YES** |
 | Tool calling parser | **WRONG** | `Qwen3Parser` (JSON via `json.Unmarshal`) instead of `Qwen3CoderParser` (XML via `xml.Unmarshal`) ([Section 8](#8-ollama-critical-bug-tool-calling-format-mismatch)) | **YES** |
+| Generation prompt after tool calls | **BROKEN** | `prefill` variable treats last assistant messages with tool calls as text continuations, omitting `<|im_end|>` and generation prompt ([Section 9.5](#95-ollama-critical-bug-missing-generation-prompt-after-tool-call-turns)) | **YES** |
 | Stop tokens | **Adequate** | Params blob has no string-based `stop` sequences, but EOS token IDs in the GGUF file (`<\|im_end\|>` 248046, `<\|endoftext\|>` 248044) handle turn-boundary stopping correctly ([Section 9](#9-ollama-registry-model-validation-qwen3527b-q4_k_m)) | No |
 | Non-tool prompt format | **CORRECT** | Matches HuggingFace ground truth template byte-for-byte for simple chat (no tools) | — |
 | Thinking prefill | **CORRECT** | Both enabled (`<think>\n`) and disabled (`<think>\n\n</think>\n\n`) match HuggingFace ground truth | — |
@@ -1350,17 +1443,19 @@ The CUDA multi-GPU crash fix ([llama.cpp PR #19866](https://github.com/ggml-org/
 
 ### Bottom Line
 
-**For agent coding use cases, the Ollama inference framework v0.17.1 has three layers of critical bugs that make Qwen 3.5 27B tool calling non-functional:**
+**For agent coding use cases, the Ollama inference framework v0.17.4 has four layers of critical bugs that make Qwen 3.5 27B tool calling non-functional:**
 
-> These three bugs are the verified, source-linked findings that belong in a bug report to the Ollama team. See the [Bug Report Summary](#bug-report-summary) at the top of this document for a self-contained summary with all links.
+> These four bugs are the verified, source-linked findings that belong in a bug report to the Ollama team. See the [Bug Report Summary](#bug-report-summary) at the top of this document for a self-contained summary with all links.
 
-1. **BUG REPORT — Missing penalty sampling** (Ollama Go-based runner limitation) — The Qwen 3.5 model's recommended `presence_penalty=1.5` is silently accepted by the Ollama API and silently ignored by the Go-based runner's sampler. Extended thinking sequences may enter repetition loops with no API-level workaround available.
+1. **BUG REPORT — Missing penalty sampling** (Ollama Go-based runner limitation) — The Qwen 3.5 model's recommended `presence_penalty=1.5` is silently accepted by the Ollama API and silently ignored by the Go-based runner's sampler. Extended thinking sequences may enter repetition loops with no API-level workaround available. See [Section 7](#7-ollama-critical-bug-missing-penalty-sampling).
 
-2. **BUG REPORT — Wrong tool calling format** (wiring bug in Ollama source code + Ollama model registry config blob) — The registry config blob sets `renderer: "qwen3.5"` and `parser: "qwen3.5"`, which map to the Qwen 3 Hermes-style JSON pipeline. The Qwen 3.5 model was trained on the Qwen3-Coder XML format. The correct `Qwen3CoderParser` + `Qwen3CoderRenderer` already exist in the Ollama codebase but are wired to `"qwen3-coder"` instead of `"qwen3.5"`.
+2. **BUG REPORT — Wrong tool calling format** (wiring bug in Ollama source code + Ollama model registry config blob) — The registry config blob sets `renderer: "qwen3.5"` and `parser: "qwen3.5"`, which map to the Qwen 3 Hermes-style JSON pipeline. The Qwen 3.5 model was trained on the Qwen3-Coder XML format. The correct `Qwen3CoderParser` + `Qwen3CoderRenderer` already exist in the Ollama codebase but lack thinking support, requiring non-trivial extension before they can be rewired to `"qwen3.5"`. See [Section 8](#8-ollama-critical-bug-tool-calling-format-mismatch).
 
-3. **BUG REPORT — Unclosed `</think>` tag in multi-turn tool call history** (renderer bug in Ollama source code) — The `Qwen3VLRenderer` fails to close `</think>` tags before tool calls when the assistant message has empty content, placing `<tool_call>` blocks inside unclosed thinking blocks and corrupting the conversation structure the model sees.
+3. **BUG REPORT — Unclosed `</think>` tag in multi-turn tool call history** (renderer bug in Ollama source code) — The `Qwen3VLRenderer` fails to close `</think>` tags before tool calls when the assistant message has empty content, placing `<tool_call>` blocks inside unclosed thinking blocks and corrupting the conversation structure the model sees. See [Section 9](#9-ollama-registry-model-validation-qwen3527b-q4_k_m).
 
-**For simple chat without tools, the Ollama inference framework works correctly.** The prompt format matches the HuggingFace ground truth template byte-for-byte, the sampling parameters (temperature, top_k, top_p) are correct, and thinking mode works. The bugs are specific to tool calling and penalty sampling.
+4. **BUG REPORT — Missing generation prompt after assistant tool call turns** (renderer bug in Ollama source code) — Both `Qwen3VLRenderer` and `Qwen3CoderRenderer` treat all last-position assistant messages as text continuations (prefills), including those with tool calls. The HuggingFace Jinja2 chat template unconditionally appends the generation prompt after the message loop. Without this, the model has no open assistant turn to generate into when the conversation ends with an assistant tool call — a scenario that arises during agentic cancellation, timeout, and error recovery. See [Section 9.5](#95-ollama-critical-bug-missing-generation-prompt-after-tool-call-turns).
+
+**For simple chat without tools, the Ollama inference framework works correctly.** The prompt format matches the HuggingFace ground truth template byte-for-byte, the sampling parameters (temperature, top_k, top_p) are correct, and thinking mode works. All four bugs are specific to tool calling and penalty sampling — areas that only matter for agentic use cases.
 
 **The vLLM inference server is the only viable path for agent/tool use** despite requiring a nightly build. It has working penalty sampling, the correct tool call parser (`qwen3_coder` matching the model's XML format), proper thinking mode, and — critically — **uses the HuggingFace Jinja2 chat template verbatim** ([Section 4](#4-vllm-support-status)), guaranteeing template correctness for tool definitions, system message ordering, format instructions, and the `<IMPORTANT>` compliance block. Official Docker images with sm_120 (Blackwell) kernels are available — no source build required. The Ollama inference framework compiles its own Go renderers that must be manually kept in sync — and for Qwen 3.5, they are not. vLLM's approach means the prompt format is always correct by construction. Tool calling has implementation bugs but the format is right — bugs are fixable, wrong format is architectural. **Quantization caveat:** The official FP8 checkpoint is the only well-tested quantization for 32 GB VRAM (~28 GB model, ~4 GB KV cache, ~64K tokens). Community 4-bit checkpoints exist but are unverified on single-GPU deployments — see [quantization deep dive](#deep-dive-quantization-on-32-gb-vram).
 
@@ -1379,6 +1474,7 @@ All source code analysis in this report was performed against locally cloned rep
 | vLLM inference server | nightly (post-v0.16.1rc0) | `a1f53addb` | Feb 26, 2026 UTC | [vllm-project/vllm@a1f53ad](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) |
 | Ollama inference framework (original analysis) | v0.17.1 | `9bf41969f` | Feb 24, 2026 UTC | [ollama/ollama@9bf4196](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a) |
 | Ollama inference framework (re-verification) | post-v0.17.4 | `79917cf` | Feb 26, 2026 UTC | [ollama/ollama@79917cf](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) |
+| Ollama inference framework (fork base for fixes) | v0.17.4 | `cc90a035` | Feb 26, 2026 UTC | [ollama/ollama@cc90a03](https://github.com/ollama/ollama/tree/cc90a035a0cc3ae9bd0c1dc95d42b620e8dcb0e2) |
 | llama.cpp C++ inference library (upstream) | post-b5136 | `723c71064` | Feb 26, 2026 UTC | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
 | llama.cpp C++ inference library (Ollama-pinned) | — | `ec98e2002` + [34 Ollama patches](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/llama/patches) | — | [ggml-org/llama.cpp@ec98e2002](https://github.com/ggml-org/llama.cpp/tree/ec98e2002) |
 
