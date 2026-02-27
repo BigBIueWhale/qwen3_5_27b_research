@@ -1,8 +1,8 @@
-# Qwen 3.5 27B: Four bugs make agentic tool calling completely non-functional
+# Qwen 3.5 27B: Tool calling completely non-functional and repetition penalties silently ignored
 
 Qwen 3.5 27B is the first consumer-GPU-capable model to match GPT-5 mini on SWE-bench (72.4), with native multimodal support, 262K context, and agentic tool calling trained across 1 million RL environments. It fits on a single RTX 5090 at Q4_K_M. There is currently no comparable alternative at this size.
 
-Four bugs in Ollama make its agentic capabilities — the model's primary differentiator — completely non-functional. All four are verified against source code (v0.17.1 through v0.17.4 / master `79917cf`) and the [HuggingFace ground truth template](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json). None are fixable by end users.
+Three bugs in Ollama make its agentic capabilities — the model's primary differentiator — completely non-functional. All three are verified against source code (v0.17.1 through master `79917cf`) and the [HuggingFace ground truth template](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json). None are fixable by end users.
 
 Full source-level analysis with exact file paths, line numbers, and diffs: [Inference Report](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md#bug-report-summary)
 
@@ -26,7 +26,7 @@ The registry config blob sets `renderer: "qwen3.5"` / `parser: "qwen3.5"`, which
 
 Qwen 3.5 was not trained on this format. It was trained on the **Qwen3-Coder XML** format (`<function=name><parameter=key>value</parameter></function>`), as confirmed by the [HuggingFace chat template](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json).
 
-The correct pipeline (`Qwen3CoderRenderer` + `Qwen3CoderParser`) already exists in the codebase — it's just wired to `"qwen3-coder"` instead of `"qwen3.5"`. Additionally, `Qwen3CoderRenderer` and `Qwen3CoderParser` have **zero thinking support** — no `<think>`/`</think>` handling in the renderer, no thinking state machine in the parser. Qwen 3.5 requires thinking support for agentic use (the model card recommends `enable_thinking=true`), so simply rewiring to the Coder pipeline is insufficient without extending it.
+The correct pipeline (`Qwen3CoderRenderer` + `Qwen3CoderParser`) already exists in the codebase — it's just wired to `"qwen3-coder"` instead of `"qwen3.5"`.
 
 The system prompt, the format instruction, the tool call rendering in conversation history, and the output parser are all wrong. There are [6 concrete mismatches](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md#prompt-template-diff-huggingface-ground-truth-vs-ollama-renderer-output) between what Ollama sends and what the model was trained on.
 
@@ -44,30 +44,6 @@ The **parser side** of this was fixed in v0.17.3 ([`d98dda4`](https://github.com
 
 ---
 
-## Bug 4: Missing generation prompt after tool call turns
-
-When the last message in a conversation is an assistant message with tool calls (the standard pattern after a tool response round-trip), the renderer treats it as a **prefill** — an incomplete assistant turn to be continued. It never emits `<|im_end|>` or the `<|im_start|>assistant\n` generation prompt that tells the model to start a new response.
-
-The root cause is the `prefill` variable in both `Qwen3CoderRenderer` ([`qwen3coder.go:148`](https://github.com/ollama/ollama/blob/cc90a035/model/renderers/qwen3coder.go#L148)) and `Qwen3VLRenderer` ([`qwen3vl.go:82`](https://github.com/ollama/ollama/blob/cc90a035/model/renderers/qwen3vl.go#L82)):
-
-```go
-prefill := lastMessage && message.Role == "assistant"
-```
-
-This fires for **any** last assistant message, including ones with tool calls. It should exclude tool call messages:
-
-```go
-prefill := lastMessage && message.Role == "assistant" && len(message.ToolCalls) == 0
-```
-
-Without the generation prompt, the model has no signal to begin generating. This breaks the entire tool call → tool response → model response loop. The [HuggingFace ground truth template](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json) emits `add_generation_prompt` unconditionally after the message loop, confirming the correct behavior.
-
-This bug also affects `Qwen3VLRenderer` (used by `qwen3-vl-instruct` and `qwen3-vl-thinking`).
-
-**Full evidence:** [Bug 4 details](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md#95-ollama-critical-bug-missing-generation-prompt-after-tool-call-turns)
-
----
-
 ## Status across releases
 
 | Bug | v0.17.1 | v0.17.2 | v0.17.3 | v0.17.4 | master |
@@ -76,10 +52,27 @@ This bug also affects `Qwen3VLRenderer` (used by `qwen3-vl-instruct` and `qwen3-
 | Wrong tool call format | Present | Present | Present | Present | **Present** |
 | Unclosed `</think>` (renderer) | Present | Present | Present | Present | **Present** |
 | Unclosed `</think>` (parser) | Present | Present | **Fixed** | Fixed | Fixed |
-| Missing generation prompt after tool calls | Present | Present | Present | Present | **Present** |
 
 ## Environment
 
-- Ollama v0.17.1 through v0.17.4 / master (`79917cf`, Feb 26, 2026 UTC)
+- Ollama v0.17.1 through master (`79917cf`, Feb 26, 2026 UTC)
 - Model: `qwen3.5:27b-q4_K_M`
 - Full report with source-level verification: [qwen3.5_27b_inference_report.md](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md)
+
+---
+
+**Edited (Feb 27, 2026 UTC):** Found two additional issues while implementing fixes for the above three bugs in a [fork based on v0.17.4](https://github.com/ollama/ollama/tree/cc90a035) (`cc90a035`):
+
+**Bug 2 expanded — Coder pipeline has zero thinking support:** Simply rewiring `"qwen3.5"` to `Qwen3CoderRenderer`/`Qwen3CoderParser` is insufficient. Both have **zero thinking support** — no `<think>`/`</think>` handling in the renderer, no thinking state machine in the parser. Qwen 3.5 requires thinking support for agentic use (the model card recommends `enable_thinking=true`), so the Coder pipeline needs to be extended with full thinking support before the rewiring is useful.
+
+**Bug 4 — Missing generation prompt after tool call turns:** When the last message is an assistant message with tool calls, the renderer treats it as a prefill (incomplete turn to be continued) and never emits `<|im_end|>` or the `<|im_start|>assistant\n` generation prompt. Root cause is the `prefill` variable in both [`qwen3coder.go:148`](https://github.com/ollama/ollama/blob/cc90a035/model/renderers/qwen3coder.go#L148) and [`qwen3vl.go:82`](https://github.com/ollama/ollama/blob/cc90a035/model/renderers/qwen3vl.go#L82) — it fires for any last assistant message including ones with tool calls. This breaks the entire tool call round-trip loop. Also affects `qwen3-vl-instruct` and `qwen3-vl-thinking`. [Full evidence](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md#95-ollama-critical-bug-missing-generation-prompt-after-tool-call-turns).
+
+Updated status table:
+
+| Bug | v0.17.1 | v0.17.2 | v0.17.3 | v0.17.4 | master |
+|-----|---------|---------|---------|---------|--------|
+| Penalty sampling silently ignored | Present | Present | Present | Present | **Present** |
+| Wrong tool call format (+ missing thinking support) | Present | Present | Present | Present | **Present** |
+| Unclosed `</think>` (renderer) | Present | Present | Present | Present | **Present** |
+| Unclosed `</think>` (parser) | Present | Present | **Fixed** | Fixed | Fixed |
+| Missing generation prompt after tool calls | Present | Present | Present | Present | **Present** |
