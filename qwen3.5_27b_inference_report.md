@@ -9,7 +9,8 @@
 
 | Component | Version | Commit | Link |
 |-----------|---------|--------|------|
-| Ollama inference framework | v0.17.1 | `9bf4196` | [ollama/ollama@9bf4196](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a) |
+| Ollama inference framework (original analysis) | v0.17.1 | `9bf4196` | [ollama/ollama@9bf4196](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a) |
+| Ollama inference framework (re-verified) | master (post-v0.17.4) | `79917cf` | [ollama/ollama@79917cf](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) |
 | llama.cpp C++ inference library (Ollama-pinned) | — | `ec98e2002` | [ggml-org/llama.cpp@ec98e2002](https://github.com/ggml-org/llama.cpp/tree/ec98e2002) + [34 Ollama patches](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/llama/patches) |
 | llama.cpp C++ inference library (upstream) | — | `723c710` | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
 | vLLM inference server | nightly (post-v0.16.1rc0) | `a1f53ad` | [vllm-project/vllm@a1f53ad](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) |
@@ -42,7 +43,20 @@
 
 ## Bug Report Summary
 
-The following three bugs in the Ollama inference framework (v0.17.1, commit [`9bf4196`](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a)) are **verified against source code, the Ollama model registry at `registry.ollama.ai`, and the HuggingFace model repository ground truth**. All three are unfixable by end users via API parameters or configuration — they require changes to Ollama's source code or registry model configuration by the Ollama team.
+The following three bugs in the Ollama inference framework were originally identified against v0.17.1 (commit [`9bf4196`](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a)) and **verified against source code, the Ollama model registry at `registry.ollama.ai`, and the HuggingFace model repository ground truth**. All three are unfixable by end users via API parameters or configuration — they require changes to Ollama's source code or registry model configuration by the Ollama team.
+
+### Re-Verification Against Ollama Master (February 27, 2026)
+
+All three bugs were re-verified against Ollama master at commit [`79917cf`](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) (February 26, 2026, one commit ahead of v0.17.4). Stable releases checked: v0.17.1 through v0.17.4.
+
+| Bug | v0.17.1 | v0.17.2 | v0.17.3 | v0.17.4 | master (`79917cf`) |
+|-----|---------|---------|---------|---------|-------------------|
+| Bug 1: Missing penalty sampling | Present | Present | Present | Present | **Present** |
+| Bug 2: Tool calling format mismatch | Present | Present | Present | Present | **Present** |
+| Bug 3: Unclosed `</think>` tag (renderer) | Present | Present | Present | Present | **Present** |
+| Bug 3 (parser-side mitigation) | — | — | **Fixed** | Fixed | Fixed |
+
+**Bug 3 partial fix detail:** Commit [`d98dda4`](https://github.com/ollama/ollama/commit/d98dda4676d44a3882fd38492cc00db257f35974) ("model: fix qwen3 tool calling in thinking", PR [#14477](https://github.com/ollama/ollama/pull/14477), merged February 26, 2026) added parser-side handling so that `Qwen3Parser` and `Qwen3VLParser` now detect `<tool_call>` while still in thinking-collection state, treating it as the end of thinking and transitioning to tool-call parsing. This fix entered the **v0.17.3** stable release. However, the **renderer side** of the bug — the `Qwen3VLRenderer` at [`qwen3vl.go:98-99`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/renderers/qwen3vl.go#L98-L99) still gating `</think>` emission on `content != ""` — remains unfixed. Multi-turn prompts sent to the model still contain unclosed `<think>` tags when an assistant turn has thinking + tool calls + empty content. The tool-call thinking tests in `qwen3vl_thinking_test.go` (lines 119–323) remain commented out.
 
 ### Bug 1: Ollama Go-Based Runner Silently Ignores All Penalty Sampling Parameters
 
@@ -62,10 +76,14 @@ The `qwen3.5:27b-q4_K_M` model published at the Ollama model registry (`registry
 
 ### Bug 3: Unclosed `</think>` Tag Before Tool Calls in Multi-Turn Conversation History
 
-The `Qwen3VLRenderer` (used for the `"qwen3.5"` renderer) has a bug where the `</think>` closing tag is only emitted when the assistant message has non-empty `Content` (at [`qwen3vl.go:98-99`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/qwen3vl.go#L98-L99)). When an assistant message has thinking text + tool calls but empty content (the common case for a "think then call a tool" turn), the `<tool_call>` block is rendered **inside an unclosed `<think>` block**, corrupting the conversation structure the model sees in multi-turn history. All tool-call thinking tests in `qwen3vl_thinking_test.go` are commented out (lines 119-323).
+This bug has two sides — the **renderer** (prompt construction for the model) and the **parser** (interpreting model output). The parser side was partially fixed in v0.17.3; the renderer side remains broken as of master (`79917cf`).
+
+**Renderer (STILL BROKEN):** The `Qwen3VLRenderer` (used for the `"qwen3.5"` renderer) has a bug where the `</think>` closing tag is only emitted when the assistant message has non-empty `Content` (at [`qwen3vl.go:98-99`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/renderers/qwen3vl.go#L98-L99)). When an assistant message has thinking text + tool calls but empty content (the common case for a "think then call a tool" turn), the `<tool_call>` block is rendered **inside an unclosed `<think>` block**, corrupting the conversation structure the model sees in multi-turn history. All tool-call thinking tests in `qwen3vl_thinking_test.go` are commented out (lines 119–323).
+
+**Parser (FIXED in v0.17.3):** Commit [`d98dda4`](https://github.com/ollama/ollama/commit/d98dda4676d44a3882fd38492cc00db257f35974) (PR [#14477](https://github.com/ollama/ollama/pull/14477), February 26, 2026) fixed the `Qwen3Parser` and `Qwen3VLParser` to detect `<tool_call>` tags while still in thinking-collection state, correctly transitioning to tool-call parsing without requiring `</think>` first. This means model output like `<think>reasoning<tool_call>...</tool_call>` is now parsed correctly. This fix entered the v0.17.3 stable release.
 
 - **Evidence:** [Section 9](#9-ollama-registry-model-validation-qwen3527b-q4_k_m) (Prompt Template Diff subsection)
-- **Key source file:** [`model/renderers/qwen3vl.go:95-120`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/qwen3vl.go#L95-L120)
+- **Key source files:** [`model/renderers/qwen3vl.go:95-120`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/renderers/qwen3vl.go#L95-L120) (renderer, still broken), [`model/parsers/qwen3.go:207-227`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/parsers/qwen3.go#L207-L227) (parser, fixed)
 
 ### What Was Investigated But Does NOT Belong in the Bug Report
 
