@@ -10,10 +10,11 @@
 | Component | Version | Commit | Link |
 |-----------|---------|--------|------|
 | Ollama inference framework (original analysis) | v0.17.1 | `9bf4196` | [ollama/ollama@9bf4196](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a) |
-| Ollama inference framework (re-verified) | master (post-v0.17.4) | `79917cf` | [ollama/ollama@79917cf](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) |
+| Ollama inference framework (re-verified) | post-v0.17.4 (Feb 26, 2026) | `79917cf` | [ollama/ollama@79917cf](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) |
 | llama.cpp C++ inference library (Ollama-pinned) | — | `ec98e2002` | [ggml-org/llama.cpp@ec98e2002](https://github.com/ggml-org/llama.cpp/tree/ec98e2002) + [34 Ollama patches](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/llama/patches) |
-| llama.cpp C++ inference library (upstream) | — | `723c710` | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
-| vLLM inference server | nightly (post-v0.16.1rc0) | `a1f53ad` | [vllm-project/vllm@a1f53ad](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) |
+| llama.cpp C++ inference library (upstream) | post-b5136 (Feb 26, 2026) | `723c710` | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
+| vLLM inference server (stable) | v0.16.0 (Feb 25, 2026) | — | [vllm-project/vllm v0.16.0](https://github.com/vllm-project/vllm/releases/tag/v0.16.0) — **does NOT support Qwen 3.5** (branch cut Feb 8, before model release Feb 16) |
+| vLLM inference server (nightly, used in this report) | nightly (post-v0.16.1rc0) | `a1f53ad` | [vllm-project/vllm@a1f53ad](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) |
 
 ---
 
@@ -24,7 +25,7 @@
 1. [Model Overview](#1-model-overview)
 2. [VRAM Fit and Quantization Options](#2-vram-fit-and-quantization-options)
 3. [Recommended Inference Parameters](#3-recommended-inference-parameters)
-4. [vLLM Support Status](#4-vllm-support-status)
+4. [vLLM Support Status](#4-vllm-support-status) — includes deep dive: chat template architecture, `enable_thinking` passthrough, reasoning+tool parser handoff, tool call parser architecture, special token flags, model implementation
 5. [Ollama Support Status](#5-ollama-support-status)
 6. [Ollama Deep Dive: Parameter Flow Validation](#6-ollama-deep-dive-parameter-flow-validation)
 7. [Ollama Critical Bug: Missing Penalty Sampling](#7-ollama-critical-bug-missing-penalty-sampling)
@@ -36,7 +37,7 @@
 13. [llama.cpp Backend Validation](#13-llamacpp-backend-validation)
 14. [Pinned llama.cpp Version in Ollama](#14-pinned-llamacpp-version-in-ollama)
 15. [Summary: Is Everything Truly Correct?](#15-summary-is-everything-truly-correct)
-16. [Cloned Repositories](#16-cloned-repositories)
+16. [Source Code Versions Used](#16-source-code-versions-used)
 17. [Sources](#17-sources)
 
 ---
@@ -259,15 +260,20 @@ From the [official Qwen 3.5 27B model card](https://huggingface.co/Qwen/Qwen3.5-
 
 ## 4. vLLM Inference Server Support Status
 
+> **Version note:** Latest stable release is **v0.16.0** (branch cut February 8, 2026). Qwen 3.5 was released February 16, 2026 — eight days after the branch cut. **v0.16.0 does not include Qwen 3.5 support.** All analysis below is pinned to commit [`a1f53ad`](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) (nightly post-v0.16.1rc0). Confirmed by vLLM maintainer @Isotr0py in [Issue #35391](https://github.com/vllm-project/vllm/issues/35391): *"vLLM 0.16.0 doesn't include Qwen3.5 support actually, because it's cut off before model support PR merged."*
+
 ### What Works
 
-- `Qwen3_5ForConditionalGeneration` is **registered** in the vLLM model registry ([`registry.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/models/registry.py))
+- `Qwen3_5ForConditionalGeneration` (dense) and `Qwen3_5MoeForConditionalGeneration` (MoE) are **registered** in the vLLM model registry ([`registry.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/models/registry.py))
 - Full Gated DeltaNet implementation with custom Triton GPU kernels (Flash Linear Attention ops) at [`vllm/model_executor/layers/fla/ops/`](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/layers/fla/ops)
 - `qwen3_coder` tool call parser implemented — XML-based: `<function=name><parameter=key>value</parameter>` ([`qwen3coder_tool_parser.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py))
 - `qwen3` reasoning parser covers both Qwen 3 and Qwen 3.5 ([`qwen3_reasoning_parser.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/reasoning/qwen3_reasoning_parser.py))
 - FP8, AWQ quantization supported through the standard pipeline
-- MTP (Multi-Token Prediction) speculative decoding supported via `Qwen3_5MTP`
+- MTP (Multi-Token Prediction) speculative decoding supported via `Qwen3_5MTP` ([`qwen3_5_mtp.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/models/qwen3_5_mtp.py))
 - Dedicated V1 attention backend (`GDNAttentionBackend`) for hybrid KV (Key-Value) cache management
+- `--language-model-only` flag skips the vision encoder for text-only deployment, freeing VRAM for KV cache ([`multimodal.py:258`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/config/multimodal.py#L258))
+- `--default-chat-template-kwargs '{"enable_thinking": false}'` allows server-level thinking mode control ([`cli_args.py:96-101`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/cli_args.py#L96-L101))
+- Penalty sampling (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) **fully implemented and functional**
 
 ### What's Broken / Concerning
 
@@ -278,7 +284,7 @@ From the [official Qwen 3.5 27B model card](https://huggingface.co/Qwen/Qwen3.5-
    Or Docker: `vllm/vllm-openai:nightly` (or `vllm/vllm-openai:cu130-nightly` for Blackwell GPUs).
    Documented in [Issue #35391](https://github.com/vllm-project/vllm/issues/35391).
 
-2. **Reasoning parser bug ([#35221](https://github.com/vllm-project/vllm/issues/35221)):** If generation is truncated mid-reasoning (before `</think>`), the reasoning text is misclassified as content in non-streaming mode. The code at [`qwen3_reasoning_parser.py:70-73`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/reasoning/qwen3_reasoning_parser.py#L70-L73) returns `(None, model_output)` when no `</think>` is found. The serving layer mitigates this for the `enable_thinking=False` case via `prompt_is_reasoning_end_arr`, but the truncation case is unhandled.
+2. **Reasoning parser truncation bug ([#35221](https://github.com/vllm-project/vllm/issues/35221)):** If generation is truncated mid-reasoning (before `</think>`), the reasoning text is misclassified as content in non-streaming mode. The code at [`qwen3_reasoning_parser.py:70-73`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/reasoning/qwen3_reasoning_parser.py#L70-L73) returns `(None, model_output)` when no `</think>` is found. The serving layer mitigates this for the `enable_thinking=False` case via `prompt_is_reasoning_end_arr`, but the `max_tokens` truncation case is unhandled. Only affects non-streaming mode — streaming correctly routes pre-`</think>` tokens as reasoning via `extract_reasoning_streaming()` ([`qwen3_reasoning_parser.py:131-133`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/reasoning/qwen3_reasoning_parser.py#L131-L133)).
 
 3. **Tool calling bugs:**
    - [#21711](https://github.com/vllm-project/vllm/issues/21711): `json.loads` fails because output includes XML `<tool_call>` tags
@@ -286,9 +292,11 @@ From the [official Qwen 3.5 27B model card](https://huggingface.co/Qwen/Qwen3.5-
    - [#19051](https://github.com/vllm-project/vllm/issues/19051): `tool_choice: required` + reasoning parsing causes 400 errors
    - [#29192](https://github.com/vllm-project/vllm/issues/29192): `qwen3_coder` parser can produce infinite "!" streams with long inputs
 
-4. **FP8 limitation:** The Gated DeltaNet's `ba_proj` (beta/alpha projection) does not support blockwise FP8 quantization.
+4. **FP8 limitation:** The Gated DeltaNet's `ba_proj` (beta/alpha projection) does not support blockwise FP8 quantization. A separate FP8 shard_id weight loading bug ([Issue #35289](https://github.com/vllm-project/vllm/issues/35289)) was fixed in the nightly (present in the pinned commit).
 
-5. **No default parameter injection:** vLLM's `Qwen3_5TextConfig` defines architecture parameters only — no sampling parameters. You must set `temperature`, `top_p`, `top_k`, `presence_penalty` explicitly in every API request.
+5. **No default parameter injection:** vLLM's `Qwen3_5TextConfig` defines architecture parameters only — no sampling parameters. You must set `temperature`, `top_p`, `top_k`, `presence_penalty` explicitly in every API request. The model card recommends `presence_penalty=1.5` for 3 of 4 usage profiles — users who don't set it get vLLM's default of `0.0`, risking repetition loops during extended thinking.
+
+6. **RTX 5090 (Blackwell sm_120) not stable yet:** vLLM does not have official RTX 5090 support. Users must build from source with PyTorch 2.9.0+cu128 nightly and CUDA 12.8. Flash Attention 3 does not work on Blackwell yet; `VLLM_FLASH_ATTN_VERSION=2` is required. See [vLLM forum thread](https://discuss.vllm.ai/t/vllm-on-rtx5090-working-gpu-setup-with-torch-2-9-0-cu128/1492). Dynamic FP8 quantization has been reported as slower than BF16 on RTX 5090 ([Issue #28234](https://github.com/vllm-project/vllm/issues/28234)) — use the pre-quantized `Qwen/Qwen3.5-27B-FP8` checkpoint instead of online quantization.
 
 ### Recommended vLLM Inference Server Launch Command
 
@@ -296,10 +304,134 @@ From the [official Qwen 3.5 27B model card](https://huggingface.co/Qwen/Qwen3.5-
 vllm serve Qwen/Qwen3.5-27B-FP8 \
     --port 8000 \
     --max-model-len 32768 \
+    --language-model-only \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3
 ```
+
+The `--language-model-only` flag disables the vision encoder, freeing VRAM for KV cache. For text-only deployment on a 32 GB card, this is recommended. The FP8 checkpoint (~28 GB) leaves ~4 GB for KV cache at 32K context; with `--language-model-only`, you gain additional headroom by skipping the 675M-parameter vision encoder.
+
+### Deep Dive: Chat Template Architecture — Why vLLM Has No Template Mismatch
+
+Unlike the Ollama inference framework (which compiles its own renderers in Go source code), **vLLM uses the HuggingFace model publisher's Jinja2 chat template verbatim**. This is the single most important architectural difference between the two frameworks for template correctness.
+
+#### Template Resolution Chain
+
+The function `resolve_chat_template()` in [`hf.py:102-149`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/renderers/hf.py#L102-L149) follows a priority chain:
+
+1. **Explicit override** ([`hf.py:110-111`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/renderers/hf.py#L110-L111)): If `--chat-template` CLI flag is set, uses that template verbatim.
+2. **AutoProcessor** ([`hf.py:114-120`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/renderers/hf.py#L114-L120)): For multimodal models without tools, tries the processor's template.
+3. **AutoTokenizer** ([`hf.py:123-130`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/renderers/hf.py#L123-L130)): Calls `tokenizer.get_chat_template()` — this reads the `chat_template` field from the model's `tokenizer_config.json` exactly as published on HuggingFace Hub.
+4. **Predefined fallbacks** ([`hf.py:132-149`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/renderers/hf.py#L132-L149)): Only if none of the above work. The fallback registry has a `"qwen"` entry ([`registry.py:42`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/transformers_utils/chat_templates/registry.py#L42)) but it only triggers for models with no chat template — Qwen 3.5 has one, so this never fires.
+
+For Qwen 3.5, priority #3 always wins — `tokenizer.get_chat_template()` loads the 7,757-byte Jinja2 template from [`Qwen/Qwen3.5-27B/tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json). There are **no Qwen3.5-specific template overrides** anywhere in the vLLM codebase.
+
+The template is applied unmodified at [`hf.py:472-478`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/renderers/hf.py#L472-L478):
+
+```python
+return tokenizer.apply_chat_template(
+    conversation=conversation,
+    tools=tools,
+    chat_template=chat_template,
+    tokenize=tokenize,
+    **resolved_kwargs,
+)
+```
+
+This is a direct call to the HuggingFace `transformers` library, which renders the Jinja2 template with the provided variables.
+
+#### What This Means for Template Correctness
+
+Because vLLM delegates template rendering entirely to the model publisher's Jinja2 template, every aspect of the prompt format is automatically correct:
+
+| Aspect | How vLLM Handles It | Correct? |
+|--------|-------------------|----------|
+| Tool definition system prompt | Template generates `# Tools\n\nYou have access to the following functions:\n\n<tools>...` | **YES** — from HF template |
+| Tool call format instruction | Template shows the XML example: `<function=name><parameter=key>value</parameter></function>` | **YES** — from HF template |
+| `<IMPORTANT>` compliance block | Template includes 4 formatting rules (function calls MUST follow format, required params, etc.) | **YES** — from HF template |
+| System message position | Template places user's system message **after** tool instructions | **YES** — from HF template |
+| Multi-turn tool call history | Template re-renders prior tool calls in XML using `tool_call.arguments\|items` | **YES** — from HF template |
+| Tool response wrapping | Template wraps `tool` role messages in `<tool_response>...</tool_response>` inside `user` messages | **YES** — from HF template |
+| `last_query_index` logic | Template distinguishes real user messages from tool responses for thinking block insertion | **YES** — from HF template |
+| `</think>` closure before tool calls | Template always emits `</think>\n\n` before `<tool_call>` | **YES** — from HF template |
+
+This is a **fundamental architectural advantage** over the Ollama inference framework. Ollama's compiled-in Go renderers must be manually kept in sync with each model's training format — and for Qwen 3.5, they are not. vLLM's approach guarantees template correctness for any model that publishes a proper Jinja2 template on HuggingFace.
+
+#### `enable_thinking` Parameter Passthrough
+
+The `enable_thinking` parameter follows this path:
+
+1. **Server-level default** ([`cli_args.py:96-101`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/cli_args.py#L96-L101)): Set via `--default-chat-template-kwargs '{"enable_thinking": false}'`.
+2. **Per-request override** ([`protocol.py:263-269`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/chat_completion/protocol.py#L263-L269)): Client sends `"chat_template_kwargs": {"enable_thinking": true}` in the request body.
+3. **Merge** ([`serving.py:917-926`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/engine/serving.py#L917-L926)): Request values override server defaults.
+4. **Template variable filtering** ([`hf.py:376-439`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/renderers/hf.py#L376-L439)): The function `resolve_chat_template_kwargs()` parses the Jinja template AST via `jinja2.meta.find_undeclared_variables()` ([`hf.py:383`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/renderers/hf.py#L383)) and only passes kwargs the template actually uses. The Qwen 3.5 template declares `enable_thinking` via `{% set enable_thinking = enable_thinking | default(true) %}`, so it passes through.
+
+When `enable_thinking=true` (default): the template ends with `<|im_start|>assistant\n<think>\n` — the model generates reasoning, then `</think>`, then content/tool calls.
+
+When `enable_thinking=false`: the template ends with `<|im_start|>assistant\n<think>\n\n</think>\n\n` — a pre-filled empty think block. The model skips directly to final content.
+
+The serving layer detects the disabled case without re-parsing the flag. At [`serving.py:808-817`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/chat_completion/serving.py#L808-L817), `reasoning_parser.is_reasoning_end(res.prompt_token_ids)` scans the prompt token IDs backwards ([`basic_parsers.py:69-78`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/reasoning/basic_parsers.py#L69-L78)) — if the last think-related token is `</think>` (ID 248069), it sets `prompt_is_reasoning_end_arr[i] = True`, causing all generated tokens to be routed as content without invoking the reasoning parser.
+
+**Important:** Qwen 3.5 does **NOT** support the `/think` and `/nothink` soft-switch syntax from Qwen 3. The only way to control thinking is via the `enable_thinking` template parameter.
+
+#### Reasoning Parser + Tool Call Parser: Clean Handoff
+
+When both `--reasoning-parser qwen3` and `--tool-call-parser qwen3_coder` are enabled, the serving layer at [`serving.py:1036-1101`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/chat_completion/serving.py#L1036-L1101) follows a strict two-phase protocol:
+
+**Phase 1 — Reasoning** ([`serving.py:1041-1077`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/chat_completion/serving.py#L1041-L1077)): All generated tokens are processed by `Qwen3ReasoningParser.extract_reasoning_streaming()`. Tokens before `</think>` are routed to the `reasoning` delta field. The tool parser is not invoked at all during this phase.
+
+**Transition** ([`serving.py:1065-1076`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/chat_completion/serving.py#L1065-L1076)): When `reasoning_parser.is_reasoning_end(output_token_ids)` returns `True` (i.e., `</think>` appears in the output), the code sets `reasoning_end_arr[i] = True`, extracts post-`</think>` content token IDs via `extract_content_ids()`, and strips the reasoning text. Only the content after `</think>` is carried forward.
+
+**Phase 2 — Tool parsing** ([`serving.py:1078-1101`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/chat_completion/serving.py#L1078-L1101)): The tool parser receives a **clean stream starting from content after `</think>`** — it never sees `<think>` tags. On the first tool-parsing invocation after reasoning ends, `previous_text` and `previous_token_ids` are reset to empty ([`serving.py:1086-1089`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/chat_completion/serving.py#L1086-L1089)), and `delta_text`/`delta_token_ids` contain only the post-reasoning content. Then `tool_parser.extract_tool_calls_streaming()` processes the `<tool_call>` XML.
+
+For the **non-streaming path** ([`serving.py:1490-1511`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/chat_completion/serving.py#L1490-L1511)): `extract_reasoning()` splits output into `(reasoning, content)`, then `_parse_tool_calls_from_content()` runs on just the `content` portion. Same clean handoff.
+
+This means vLLM correctly handles the standard Qwen 3.5 pattern of `<think>reasoning</think><tool_call>...</tool_call>` without any interference between the two parsers.
+
+#### Tool Call Parser Architecture
+
+Two Qwen3-compatible parsers are registered in [`__init__.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/__init__.py):
+
+| Parser Name | Class | File |
+|-------------|-------|------|
+| `qwen3_xml` | `Qwen3XMLToolParser` | [`qwen3xml_tool_parser.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3xml_tool_parser.py) |
+| `qwen3_coder` | `Qwen3CoderToolParser` | [`qwen3coder_tool_parser.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py) |
+
+Both parse the same XML format (`<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`). The `qwen3_coder` parser is the recommended one per the [HuggingFace model card](https://huggingface.co/Qwen/Qwen3.5-27B) and the [vLLM Qwen3.5 recipe](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3.5.html).
+
+The `Qwen3CoderToolParser` at [`qwen3coder_tool_parser.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py) provides:
+
+- **Non-streaming extraction** ([`extract_tool_calls`, lines 291-341](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py#L291-L341)): Regex-based parsing of complete `<tool_call>` blocks, then per-function XML parsing via `_parse_xml_function_call()`.
+- **Streaming extraction** ([`extract_tool_calls_streaming`, lines 343-783](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py#L343-L783)): Incremental state machine that detects `<tool_call>` start/end tokens by ID ([lines 76-83](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py#L76-L83)), tracks function names, and streams JSON argument fragments as they're parsed from XML parameters.
+- **Schema-aware type conversion** ([`_convert_param_value`, lines 136-240](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py#L136-L240)): Matches parameter values against the tool's JSON Schema definition. Converts strings to `int`, `float`, `bool`, `array`, or `object` as declared. Falls back to `ast.literal_eval()` for unrecognized types ([line 230](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py#L230)) — this replaced a former `eval()` call that was a security vulnerability ([GHSA-79j6-g2m3-jgfw](https://github.com/vllm-project/vllm/security/advisories/GHSA-79j6-g2m3-jgfw), fixed in v0.10.1.1 via [PR #21396](https://github.com/vllm-project/vllm/pull/21396)).
+
+#### Special Token Flags
+
+From the model's `tokenizer_config.json`, the tool call and thinking tokens are all `special: false`:
+
+| Token | ID | `special` flag |
+|-------|------|----------------|
+| `<\|endoftext\|>` | 248044 | **true** |
+| `<\|im_start\|>` | 248045 | **true** |
+| `<\|im_end\|>` | 248046 | **true** |
+| `<tool_call>` | 248058 | false |
+| `</tool_call>` | 248059 | false |
+| `<tool_response>` | 248066 | false |
+| `</tool_response>` | 248067 | false |
+| `<think>` | 248068 | false |
+| `</think>` | 248069 | false |
+
+These are regular vocabulary tokens, not special control tokens. The vLLM tool parser uses token IDs for detection (e.g., `self.tool_call_start_token_id` at [`qwen3coder_tool_parser.py:76`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py#L76)), which is correct regardless of the `special` flag. The reasoning parser similarly uses `self.end_token_id` ([`basic_parsers.py:62`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/reasoning/basic_parsers.py#L62)).
+
+#### Model Implementation
+
+The main model code lives in [`qwen3_5.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/models/qwen3_5.py) (880 lines):
+
+- **64 layers** in a 3:1 ratio — layer type determined by `config.layer_types`, defaulting to `linear_attention` for 3 out of every 4 layers
+- **Custom `Qwen3_5GatedDeltaNet`** extends `Qwen3NextGatedDeltaNet` with modified QKVZ projection ordering
+- **Vision support** via `Qwen3_5_VisionTransformer` inheriting from Qwen3-VL — disabled by `--language-model-only`
+- **Config** at [`configs/qwen3_5.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/transformers_utils/configs/qwen3_5.py): `vocab_size=248320`, `hidden_size=4096`, `num_hidden_layers=32` (the 27B model actually has 64 layers; this config covers the 2B variant)
 
 ---
 
@@ -935,7 +1067,7 @@ Launch with:
 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3
 ```
 
-Multiple open bugs exist: XML parsing failures, streaming conflicts, infinite "!" streams. The `qwen3_coder` parser also has a [security vulnerability](https://github.com/vllm-project/vllm/security/advisories/GHSA-79j6-g2m3-jgfw) — it uses Python's `eval()` for unknown parameter types.
+Multiple open bugs exist: XML parsing failures, streaming conflicts, infinite "!" streams. The `qwen3_coder` parser had a [security vulnerability (GHSA-79j6-g2m3-jgfw)](https://github.com/vllm-project/vllm/security/advisories/GHSA-79j6-g2m3-jgfw) where it used Python's `eval()` for unknown parameter types — **fixed in vLLM v0.10.1.1** ([PR #21396](https://github.com/vllm-project/vllm/pull/21396)). The current code at the pinned commit (`a1f53ad`) uses `ast.literal_eval()` ([`qwen3coder_tool_parser.py:230`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py#L230)), which only evaluates Python literals — no arbitrary code execution.
 
 ### Ollama Inference Framework
 
@@ -1026,16 +1158,21 @@ The CUDA multi-GPU crash fix ([llama.cpp PR #19866](https://github.com/ggml-org/
 
 | Aspect | Verdict | Detail |
 |--------|---------|--------|
-| Model loads | **Nightly only** | Stable vLLM v0.16.0 fails; nightly required |
+| Model loads | **Nightly only** | Stable vLLM v0.16.0 fails; nightly required ([#35391](https://github.com/vllm-project/vllm/issues/35391)) |
+| Chat template | **CORRECT** | Uses HF Jinja2 template verbatim via `tokenizer.apply_chat_template()` — no overrides ([Section 4](#4-vllm-support-status)) |
+| `enable_thinking` | **CORRECT** | Passed through as Jinja variable; prompt detection via `is_reasoning_end()` for disabled case ([Section 4](#4-vllm-support-status)) |
+| Reasoning + tool parser handoff | **CORRECT** | Two-phase protocol: reasoning fully consumed before tool parsing begins ([Section 4](#4-vllm-support-status)) |
 | temperature | **Must set manually** | No defaults injected |
 | top_k | **Must set manually** | No defaults injected |
 | top_p | **Must set manually** | No defaults injected |
-| presence_penalty | **Works if set** | vLLM inference server implements it correctly |
+| presence_penalty | **Works if set** | vLLM inference server implements it correctly; not defaulted (model card recommends 1.5) |
 | Tool calling format | **CORRECT** | `qwen3_coder` parser matches model's trained XML format |
 | Tool calling stability | **Buggy** | Multiple open issues ([#21711](https://github.com/vllm-project/vllm/issues/21711), [#20611](https://github.com/vllm-project/vllm/issues/20611), [#19051](https://github.com/vllm-project/vllm/issues/19051), [#29192](https://github.com/vllm-project/vllm/issues/29192)) |
-| Reasoning parser | **Known bug** | Truncated reasoning misclassified as content ([#35221](https://github.com/vllm-project/vllm/issues/35221)) |
+| Reasoning parser | **Known bug** | Truncated reasoning misclassified as content in non-streaming mode only ([#35221](https://github.com/vllm-project/vllm/issues/35221)) |
+| `eval()` security vuln | **FIXED** | Was `eval()`, now `ast.literal_eval()` since v0.10.1.1 ([PR #21396](https://github.com/vllm-project/vllm/pull/21396)) |
 | DeltaNet implementation | **Complete** | Triton kernels, dedicated attention backend |
 | MTP speculative decoding | **Supported** | `Qwen3_5MTP` registered |
+| RTX 5090 Blackwell | **Unstable** | Requires source build with PyTorch 2.9.0+cu128, Flash Attn 2 only |
 
 ### Ollama Inference Framework
 
@@ -1077,24 +1214,27 @@ The CUDA multi-GPU crash fix ([llama.cpp PR #19866](https://github.com/ggml-org/
 
 **For simple chat without tools, the Ollama inference framework works correctly.** The prompt format matches the HuggingFace ground truth template byte-for-byte, the sampling parameters (temperature, top_k, top_p) are correct, and thinking mode works. The bugs are specific to tool calling and penalty sampling.
 
-**The vLLM inference server is the only viable path for agent/tool use** despite requiring a nightly build. It has working penalty sampling, the correct tool call parser (`qwen3_coder` matching the model's XML format), and proper thinking mode. Tool calling has bugs but the format is right — bugs are fixable, wrong format is architectural.
+**The vLLM inference server is the only viable path for agent/tool use** despite requiring a nightly build. It has working penalty sampling, the correct tool call parser (`qwen3_coder` matching the model's XML format), proper thinking mode, and — critically — **uses the HuggingFace Jinja2 chat template verbatim** ([Section 4](#4-vllm-support-status)), guaranteeing template correctness for tool definitions, system message ordering, format instructions, and the `<IMPORTANT>` compliance block. The Ollama inference framework compiles its own Go renderers that must be manually kept in sync — and for Qwen 3.5, they are not. vLLM's approach means the prompt format is always correct by construction. Tool calling has implementation bugs but the format is right — bugs are fixable, wrong format is architectural.
 
-**Neither library auto-applies the Qwen 3.5 model's recommended defaults** — you must set parameters explicitly in both cases.
+**Neither library auto-applies the Qwen 3.5 model's recommended defaults** — you must set parameters explicitly in both cases. The model card recommends `presence_penalty=1.5` for 3 of 4 usage profiles. In vLLM, you can set this per-request or via server defaults. In the Ollama inference framework, it is silently ignored.
 
 **Thinking mode always-on is correct for agent use.** The Qwen 3.5 model's agentic training (1 million reinforcement learning environments, Terminal-Bench 52.5) assumes thinking mode. Disabling it removes the model's strongest capability for multi-step tool use.
 
 ---
 
-## 16. Cloned Repositories
+## 16. Source Code Versions Used
 
-| Repository | Local Path | Version | Commit | Link |
-|------|------|---------|--------|------|
-| vLLM inference server | `/tmp/vllm` | nightly (post-v0.16.1rc0) | `a1f53addb` | [vllm-project/vllm@a1f53ad](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) |
-| Ollama inference framework | `/tmp/ollama` | v0.17.1 | `9bf41969f` | [ollama/ollama@9bf4196](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a) |
-| llama.cpp C++ inference library (upstream) | `/tmp/llama.cpp` | latest | `723c71064` | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
-| llama.cpp C++ inference library (Ollama-pinned) | `/tmp/ollama/ml/backend/ggml/ggml/` | — | `ec98e2002` + 34 patches | [ggml-org/llama.cpp@ec98e2002](https://github.com/ggml-org/llama.cpp/tree/ec98e2002) |
+All source code analysis in this report was performed against locally cloned repositories at the commits listed below. Each commit is linked to its exact tree on GitHub for reproducibility.
 
-Note: `/tmp/llama.cpp` is the latest upstream llama.cpp, NOT the same as the Ollama-pinned version. The Ollama inference framework's vendored copy with patches is at `/tmp/ollama/ml/backend/ggml/ggml/`. The [34 patch files](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/llama/patches) are applied on top of the pinned commit.
+| Repository | Version | Commit | Date | Link |
+|------|---------|--------|------|------|
+| vLLM inference server | nightly (post-v0.16.1rc0) | `a1f53addb` | Feb 26, 2026 | [vllm-project/vllm@a1f53ad](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) |
+| Ollama inference framework (original analysis) | v0.17.1 | `9bf41969f` | Feb 24, 2026 | [ollama/ollama@9bf4196](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a) |
+| Ollama inference framework (re-verification) | post-v0.17.4 | `79917cf` | Feb 26, 2026 | [ollama/ollama@79917cf](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) |
+| llama.cpp C++ inference library (upstream) | post-b5136 | `723c71064` | Feb 26, 2026 | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
+| llama.cpp C++ inference library (Ollama-pinned) | — | `ec98e2002` + [34 Ollama patches](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/llama/patches) | — | [ggml-org/llama.cpp@ec98e2002](https://github.com/ggml-org/llama.cpp/tree/ec98e2002) |
+
+Note: The upstream llama.cpp commit (`723c710`) is NOT the same as the Ollama-pinned version (`ec98e2002`). The Ollama inference framework vendors llama.cpp at a specific commit and applies 34 patches on top (for IMRoPE, Metal GPU backend fixes, etc.).
 
 ---
 
@@ -1111,17 +1251,37 @@ Note: `/tmp/llama.cpp` is the latest upstream llama.cpp, NOT the same as the Oll
 - [Qwen Function Calling Docs](https://qwen.readthedocs.io/en/latest/framework/function_call.html) — covers Qwen3 format; not yet updated for Qwen 3.5
 - [Qwen3.5 Architecture Blog (HuggingFace)](https://huggingface.co/blog/mlabonne/qwen35)
 
-### vLLM Inference Server (pinned to commit [`a1f53ad`](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329))
+### vLLM Inference Server (pinned to commit [`a1f53ad`](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329), nightly post-v0.16.1rc0)
 - [vLLM GitHub repository](https://github.com/vllm-project/vllm)
 - [vLLM GitHub Releases](https://github.com/vllm-project/vllm/releases)
-- [vLLM Qwen3.5 Usage Guide](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3.5.html)
-- [Issue #35391 — Architecture Not Supported in v0.16.0](https://github.com/vllm-project/vllm/issues/35391)
-- [Issue #35221 — Reasoning Parser Bug](https://github.com/vllm-project/vllm/issues/35221)
+- [vLLM Qwen3.5 Usage Guide / Recipe](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3.5.html)
+- [vLLM Tool Calling Documentation](https://docs.vllm.ai/en/latest/features/tool_calling/)
+- [Qwen vLLM Deployment Guide](https://qwen.readthedocs.io/en/latest/deployment/vllm.html)
+- [Issue #35391 — Architecture Not Supported in v0.16.0](https://github.com/vllm-project/vllm/issues/35391) (confirmed by maintainer @Isotr0py)
+- [Issue #35289 — FP8 Shard ID Weight Loading Bug (fixed in nightly)](https://github.com/vllm-project/vllm/issues/35289)
+- [Issue #35221 — Reasoning Parser Truncation Bug](https://github.com/vllm-project/vllm/issues/35221)
+- [Issue #35154 — Optimized Deployment Recipe for Qwen3.5 (backlog)](https://github.com/vllm-project/vllm/issues/35154)
+- [Issue #28234 — Dynamic FP8 Slower Than BF16 on RTX 5090](https://github.com/vllm-project/vllm/issues/28234)
 - [Issue #21711 — Tool Call XML Parsing](https://github.com/vllm-project/vllm/issues/21711)
 - [Issue #20611 — Streaming Tool Calls](https://github.com/vllm-project/vllm/issues/20611)
 - [Issue #19051 — Reasoning + Tool Calling Conflict](https://github.com/vllm-project/vllm/issues/19051)
 - [Issue #29192 — Parser Infinite Stream](https://github.com/vllm-project/vllm/issues/29192)
-- [Security Advisory GHSA-79j6-g2m3-jgfw — `eval()` in qwen3_coder parser](https://github.com/vllm-project/vllm/security/advisories/GHSA-79j6-g2m3-jgfw)
+- [Security Advisory GHSA-79j6-g2m3-jgfw — `eval()` in qwen3_coder parser (fixed in v0.10.1.1)](https://github.com/vllm-project/vllm/security/advisories/GHSA-79j6-g2m3-jgfw)
+- [PR #21396 — Fix `eval()` to `ast.literal_eval()` in qwen3_coder parser](https://github.com/vllm-project/vllm/pull/21396)
+- [vLLM on RTX 5090 Forum Thread](https://discuss.vllm.ai/t/vllm-on-rtx5090-working-gpu-setup-with-torch-2-9-0-cu128/1492)
+
+### vLLM Key Source Files (at commit [`a1f53ad`](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329))
+- [`vllm/renderers/hf.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/renderers/hf.py) — Chat template resolution chain (`resolve_chat_template`, lines 102-149) and application (`safe_apply_chat_template`, lines 442-478)
+- [`vllm/transformers_utils/chat_templates/registry.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/transformers_utils/chat_templates/registry.py) — Fallback template registry (never used for Qwen 3.5)
+- [`vllm/reasoning/qwen3_reasoning_parser.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/reasoning/qwen3_reasoning_parser.py) — Qwen3/3.5 reasoning parser
+- [`vllm/reasoning/basic_parsers.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/reasoning/basic_parsers.py) — Base class with `is_reasoning_end()` (lines 69-78) and streaming extraction
+- [`vllm/tool_parsers/qwen3coder_tool_parser.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3coder_tool_parser.py) — Qwen3-Coder XML tool call parser (recommended for Qwen 3.5)
+- [`vllm/tool_parsers/qwen3xml_tool_parser.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/tool_parsers/qwen3xml_tool_parser.py) — Older XML tool call parser (same format, different implementation)
+- [`vllm/entrypoints/openai/chat_completion/serving.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/chat_completion/serving.py) — Streaming handler with two-phase reasoning+tool protocol (lines 1036-1101)
+- [`vllm/entrypoints/openai/cli_args.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/entrypoints/openai/cli_args.py) — `--default-chat-template-kwargs` (lines 96-101), `--reasoning-parser`, `--tool-call-parser`
+- [`vllm/model_executor/models/qwen3_5.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/models/qwen3_5.py) — Main model implementation (dense + MoE, 880 lines)
+- [`vllm/model_executor/models/qwen3_5_mtp.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/models/qwen3_5_mtp.py) — MTP speculative decoding support
+- [`vllm/model_executor/models/registry.py`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/models/registry.py) — Model registry (`Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration`, `Qwen3_5MTP`, `Qwen3_5MoeMTP`)
 
 ### Ollama Inference Framework (pinned to [`v0.17.1` / `9bf4196`](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a))
 - [Ollama model library — Qwen 3.5](https://ollama.com/library/qwen3.5)
@@ -1161,7 +1321,7 @@ Note: `/tmp/llama.cpp` is the latest upstream llama.cpp, NOT the same as the Oll
 ### llama.cpp C++ Inference Library
 - [llama.cpp GitHub repository](https://github.com/ggml-org/llama.cpp)
 - [Ollama-pinned commit `ec98e2002`](https://github.com/ggml-org/llama.cpp/tree/ec98e2002) with [34 Ollama patches](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/llama/patches)
-- [Upstream commit `723c710` (latest tested)](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd)
+- [Upstream commit `723c710` (Feb 26, 2026, post-b5136)](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd)
 - [llama.cpp PR #19468 — Qwen 3.5 Support (Merged)](https://github.com/ggml-org/llama.cpp/pull/19468)
 - [Issue #19860 — CUDA Multi-GPU Crash (Fixed)](https://github.com/ggml-org/llama.cpp/issues/19860)
 - [PR #19866 — CUDA Multi-GPU Crash Fix](https://github.com/ggml-org/llama.cpp/pull/19866)
