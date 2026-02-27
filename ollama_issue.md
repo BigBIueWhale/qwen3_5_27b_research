@@ -55,6 +55,6 @@ The **parser side** of this was fixed in v0.17.3 ([`d98dda4`](https://github.com
 
 ## Environment
 
-- Ollama v0.17.1 through master (`79917cf`, Feb 26 2026)
+- Ollama v0.17.1 through master (`79917cf`, Feb 26, 2026 UTC)
 - Model: `qwen3.5:27b-q4_K_M`
 - Full report with source-level verification: [qwen3.5_27b_inference_report.md](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md)

@@ -2,8 +2,8 @@ Hey @TommyBoiss — just wanted to give you a heads up since this PR has been si
 
 Official Qwen 3.5 support landed on `main` while this was open:
 
-- [`da70c32`](https://github.com/ollama/ollama/commit/da70c32) (Feb 24) — "model: support for qwen3.5 architecture (#14378)"
-- [`7f9efd5`](https://github.com/ollama/ollama/commit/7f9efd5) (Feb 25) — "model: add support for qwen3.5-27b model (#14415)"
+- [`da70c32`](https://github.com/ollama/ollama/commit/da70c32) (Feb 24, 2026 UTC) — "model: support for qwen3.5 architecture (#14378)"
+- [`7f9efd5`](https://github.com/ollama/ollama/commit/7f9efd5) (Feb 25, 2026 UTC) — "model: add support for qwen3.5-27b model (#14415)"
 
 The implementation lives in the `qwen3next` package. It's more refined than your PR in several areas (V-head reordering, separate alpha/beta projections, MoE support, shared cache via `kvcache.Recurrent`, deepstack vision, SetInplace-based DeltaNet chunking). So in terms of the model architecture and inference engine, `main` supersedes this PR.
 

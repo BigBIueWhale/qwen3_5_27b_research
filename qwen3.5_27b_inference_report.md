@@ -1,6 +1,6 @@
 # Qwen 3.5 27B Dense Language Model — Inference Library Support Report
 
-**Date:** February 27, 2026 (updated from February 26)
+**Date:** February 27, 2026 UTC (updated from February 26, 2026 UTC)
 **Target Hardware:** NVIDIA RTX 5090 graphics card (32 GB VRAM — Video Random Access Memory)
 **Model:** Qwen 3.5 27B dense language model (all 27 billion parameters active every forward pass)
 **Inference Libraries Evaluated:** vLLM inference server, Ollama inference framework (+ llama.cpp C++ backend)
@@ -10,22 +10,103 @@
 | Component | Version | Commit | Link |
 |-----------|---------|--------|------|
 | Ollama inference framework (original analysis) | v0.17.1 | `9bf4196` | [ollama/ollama@9bf4196](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a) |
-| Ollama inference framework (re-verified) | post-v0.17.4 (Feb 26, 2026) | `79917cf` | [ollama/ollama@79917cf](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) |
+| Ollama inference framework (re-verified) | post-v0.17.4 (Feb 26, 2026 UTC) | `79917cf` | [ollama/ollama@79917cf](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) |
 | llama.cpp C++ inference library (Ollama-pinned) | — | `ec98e2002` | [ggml-org/llama.cpp@ec98e2002](https://github.com/ggml-org/llama.cpp/tree/ec98e2002) + [34 Ollama patches](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/llama/patches) |
-| llama.cpp C++ inference library (upstream) | post-b5136 (Feb 26, 2026) | `723c710` | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
-| vLLM inference server (stable) | v0.16.0 (Feb 25, 2026) | — | [vllm-project/vllm v0.16.0](https://github.com/vllm-project/vllm/releases/tag/v0.16.0) — **does NOT support Qwen 3.5** (branch cut Feb 8, before model release Feb 16) |
+| llama.cpp C++ inference library (upstream) | post-b5136 (Feb 26, 2026 UTC) | `723c710` | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
+| vLLM inference server (stable) | v0.16.0 (Feb 25, 2026 UTC) | — | [vllm-project/vllm v0.16.0](https://github.com/vllm-project/vllm/releases/tag/v0.16.0) — **does NOT support Qwen 3.5** (branch cut Feb 8, 2026 UTC, before Qwen 3.5 series launch Feb 16, 2026 UTC / 27B release Feb 24, 2026 UTC) |
 | vLLM inference server (nightly, used in this report) | nightly (post-v0.16.1rc0) | `a1f53ad` | [vllm-project/vllm@a1f53ad](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) |
+| vLLM Docker image (Blackwell + Qwen 3.5) | `vllm/vllm-openai:qwen3_5-cu130` | — | [Docker Hub](https://hub.docker.com/r/vllm/vllm-openai/tags) — CUDA 13.0.1, sm_120 kernels, published Feb 23, 2026 UTC |
+| vLLM Docker image (Blackwell nightly) | `vllm/vllm-openai:cu130-nightly` | — | [Docker Hub](https://hub.docker.com/r/vllm/vllm-openai/tags) — CUDA 13.0.1, sm_120 kernels, updated daily |
+
+---
+
+## Effort Comparison: Fixing Qwen 3.5 27B Support (Ollama vs vLLM)
+
+> **As of February 27, 2026 UTC.** This section compares the engineering effort required to achieve correct, fully-functional Qwen 3.5 27B inference on each framework, measured against the latest stable release of each.
+
+### Baseline
+
+| Framework | Latest Stable (as of Feb 27, 2026 UTC) | Qwen 3.5 Support? |
+|-----------|----------------------------------------|-------------------|
+| **vLLM inference server** | v0.16.0 (branch cut Feb 8, 2026 UTC) | **None** — series launched Feb 16, 27B released Feb 24, both after branch cut |
+| **Ollama inference framework** | v0.17.4 (Feb 26, 2026 UTC) | Yes, but with 3 critical bugs |
+
+### vLLM: Zero Code Fixes Needed — But Nightly-Only With Known Issues
+
+vLLM's stable v0.16.0 has zero Qwen 3.5 support. The nightly (commit [`a1f53ad`](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329)) has full support with **correct code** for all the areas where Ollama is broken:
+
+| Area | Status in vLLM nightly |
+|------|----------------------|
+| Chat template | **Correct** — uses HuggingFace Jinja2 template verbatim (no reimplementation) |
+| Tool calling format | **Correct** — `qwen3_coder` parser handles Qwen3-Coder XML format |
+| Reasoning parser | **Correct** — clean two-phase handoff to tool parser ([Section 4](#4-vllm-support-status)) |
+| Penalty sampling | **Correct** — `presence_penalty`, `frequency_penalty`, `repetition_penalty` all functional |
+| `</think>` closure | **Correct** — handled by HuggingFace template, not framework code |
+| Default parameters | **Not provided** — must set `temperature`, `top_p`, `top_k`, `presence_penalty` per-request (convenience gap, not a correctness bug) |
+| Quantization for 32 GB VRAM | **FP8 is the only well-tested option** (~28 GB model, ~4 GB KV, ~64K tokens). Community AWQ-4bit checkpoints exist but are [barely tested](#deep-dive-quantization-on-32-gb-vram): one TP=2 success, one failure with garbled output, zero single-GPU reports. No official Qwen 4-bit checkpoint exists. |
+
+**However, "correct code" does not mean "production-ready."** The Qwen 3.5 27B model was released February 24, 2026 UTC (as part of the Medium Series, 8 days after the 397B-A17B flagship launched the Qwen 3.5 series on February 16, 2026 UTC) — only 3 days before this report. Known issues as of February 27, 2026 UTC:
+
+| Issue | Severity | Reference |
+|-------|----------|-----------|
+| Reasoning parser truncation (non-streaming): if `max_tokens` cuts generation mid-`<think>`, reasoning text is misclassified as content | Moderate (streaming unaffected) | [#35221](https://github.com/vllm-project/vllm/issues/35221) |
+| `qwen3_coder` parser produces infinite "!" streams with long inputs | Moderate | [#29192](https://github.com/vllm-project/vllm/issues/29192) |
+| Streaming + tool calls fails with `enable_thinking=false` | Moderate | [#20611](https://github.com/vllm-project/vllm/issues/20611) |
+| `tool_choice: required` + reasoning parsing causes 400 errors | Moderate | [#19051](https://github.com/vllm-project/vllm/issues/19051) |
+| `json.loads` fails on XML `<tool_call>` tags in output | Low (use `qwen3_coder` parser, not default) | [#21711](https://github.com/vllm-project/vllm/issues/21711) |
+| **RTX 5090 (Blackwell sm_120): Docker works, pip requires source build** | Low (Docker is available) | See below |
+
+**RTX 5090 readiness:** vLLM v0.15.1 (February 4, 2026 UTC) explicitly fixed sm_120 kernel issues for RTX Blackwell workstation GPUs — NVFP4 MoE kernel support ([#33417](https://github.com/vllm-project/vllm/issues/33416)) and FP8 CUTLASS fallback to Triton on sm_120 ([#33285](https://github.com/vllm-project/vllm/issues/33416)). These fixes are included in v0.16.0. **Official Docker images include sm_120 compiled kernels:** the vLLM team publishes `-cu130` Docker tags (CUDA 13.0.1) that compile for `TORCH_CUDA_ARCH_LIST='7.0 7.5 8.0 8.9 9.0 10.0 12.0'` — the `12.0` entry is sm_120 (Blackwell). A user on [GitHub Issue #35303](https://github.com/vllm-project/vllm/issues/35303) confirmed `vllm/vllm-openai:latest-cu130` running on RTX 5090 (driver 590.48, PyTorch 2.10.0+cu130). The `-cu130` tags are available for stable releases (`v0.16.0-cu130`, `v0.15.1-cu130`) and nightly (`cu130-nightly`). There is also a purpose-built `qwen3_5-cu130` tag published February 23, 2026 UTC. **`pip install vllm` does NOT include sm_120 kernels** — pip requires building from source with `TORCH_CUDA_ARCH_LIST="12.0"` plus manually compiling xFormers and FlashInfer. Docker is the recommended path for RTX 5090. Flash Attention 3 does not work on Blackwell — the Docker images use `VLLM_FLASH_ATTN_VERSION=2` (FA2 runs fine on sm_120, confirmed by the FA maintainer Tri Dao in [flash-attention#1853](https://github.com/Dao-AILab/flash-attention/issues/1853)). Flash Attention 4, designed specifically for Blackwell, targets sm_100 (data center B200/B300), not sm_120 (consumer RTX), and is not released in the `flash-attn` PyPI package as of February 27, 2026 UTC (latest release is v2.8.3 from August 2025). Dynamic FP8 quantization is reported slower than BF16 on RTX 5090 ([#28234](https://github.com/vllm-project/vllm/issues/28234)) — use the pre-quantized [`Qwen/Qwen3.5-27B-FP8`](https://huggingface.co/Qwen/Qwen3.5-27B-FP8) checkpoint instead of online quantization.
+
+**Deployment path for this specific target:** Deploying Qwen 3.5 27B on RTX 5090 via vLLM as of February 27, 2026 UTC requires the nightly build (because stable v0.16.0 doesn't include Qwen 3.5 support). The recommended path is Docker: `vllm/vllm-openai:cu130-nightly` (or the pinned `qwen3_5-cu130` tag from February 23, 2026 UTC). Docker image SHA digests provide reproducible version pins (`docker pull vllm/vllm-openai:cu130-nightly@sha256:<digest>`). The official [Qwen 3.5 recipe](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3.5.html) explicitly recommends `vllm/vllm-openai:cu130-nightly` for Blackwell GPUs with the note "Use vLLM nightly wheel until 0.17.0 is released." Note: the recipe covers only the 397B-A17B MoE model, not the 27B dense model specifically.
+
+**Effort to fix the code: 0 lines.** The template, tool format, penalty sampling, and reasoning parser are all correct in the nightly. The "fix" is waiting for v0.17.0 (the next stable release, which will include both Qwen 3.5 support and the sm_120 kernel fixes). The RTX 5090 packaging gap and open bugs above are real operational concerns but not code-correctness bugs — they affect the deployment environment and edge cases, not the fundamental template/format/sampling pipeline.
+
+### Ollama: ~350–700 Lines of Go Across 3 Bugs + Registry Update
+
+Three verified bugs need fixing, each at a different layer of the Ollama codebase:
+
+**Bug 1 — Missing penalty sampling (~200–400 lines, high blast radius):**
+The Go runner's `Sampler` struct has no penalty fields. `NewSampler()` doesn't accept them. `sample()` doesn't apply them. Implementing this from scratch requires: adding `repeatPenalty`, `presencePenalty`, `frequencyPenalty`, and `repeatLastN` fields to the struct, adding a penalty application step that scans the token history window and adjusts logits before top-k/temperature/softmax, updating all `NewSampler()` call sites (at minimum [`runner/ollamarunner/runner.go:890-897`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/runner/ollamarunner/runner.go#L890-L897)), and writing tests. This touches the hot path of token generation for **every model on the Go runner**, not just Qwen 3.5.
+
+**Bug 2 — Tool calling format mismatch (~150–300 lines, Qwen 3.5-only):**
+The correct `Qwen3CoderRenderer`/`Qwen3CoderParser` pipeline exists but lacks thinking support (`HasThinkingSupport()` returns `false` at [`qwen3coder.go:41-43`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/qwen3coder.go#L41-L43)). Requires either: (a) adding `<think>` prefill + thinking-collection state machine to the existing Coder pipeline, or (b) creating a new composite renderer/parser for `"qwen3.5"`. Also requires updating the switch statements in [`renderer.go`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/renderer.go#L59-L61)/[`parsers.go`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/parsers/parsers.go#L52-L53) and the registry config blob at `registry.ollama.ai`. The commented-out thinking tests in `qwen3vl_thinking_test.go` (lines 119–323) need to be un-commented and adapted.
+
+**Bug 3 — Unclosed `</think>` tag (~5–20 lines, may become moot):**
+One-line logic fix at [`qwen3vl.go:98-99`](https://github.com/ollama/ollama/blob/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/model/renderers/qwen3vl.go#L98-L99) plus test updates. If Bug 2 is fixed by switching `"qwen3.5"` away from `Qwen3VLRenderer` entirely, this becomes moot *for Qwen 3.5* (though it still affects other models using `Qwen3VLRenderer` with thinking + tool calls).
+
+**Registry params blob (trivial, blocked by Bug 1):**
+Should set `presence_penalty: 1.5` per the [model card](https://huggingface.co/Qwen/Qwen3.5-27B), but pointless until Bug 1 is fixed since the Go runner silently ignores the parameter.
+
+### Summary
+
+| Dimension | Ollama (v0.17.1–v0.17.4) | vLLM (v0.16.0) |
+|-----------|--------------------------|-----------------|
+| Model supported at all? | Yes, with 3 critical bugs | No (nightly has full support) |
+| Lines of code to fix | ~350–700 lines of Go | 0 (correct in nightly) |
+| Number of distinct fixes | 3 bugs + 1 registry update | 0 |
+| Highest-stakes fix | Penalty sampling (all Go-runner models) | N/A |
+| Who can fix it? | Only Ollama team (source code + registry) | Already done by vLLM contributors |
+| User workaround available? | None for any of the 3 bugs | Use nightly build |
+| RTX 5090 ready? | Yes (runs today, bugs aside) | Docker `-cu130` images include sm_120 kernels; `pip install` requires source build |
+| Nightly/edge-case bugs? | The 3 bugs above | 5 open issues ([#35221](https://github.com/vllm-project/vllm/issues/35221), [#29192](https://github.com/vllm-project/vllm/issues/29192), [#20611](https://github.com/vllm-project/vllm/issues/20611), [#19051](https://github.com/vllm-project/vllm/issues/19051), [#21711](https://github.com/vllm-project/vllm/issues/21711)) |
+| Architectural root cause | Compiled-in Go renderers must be manually kept in sync per model | HuggingFace Jinja2 template used verbatim — correct by design |
+
+### Bottom Line
+
+**As of February 27, 2026 UTC:** vLLM requires zero code fixes — the template, tool format, and penalty sampling are all correct in the nightly and will land in the next stable release (v0.17.0, per the [official Qwen3.5 recipe](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3.5.html)). Official Docker images with sm_120 (Blackwell) kernels are available: `vllm/vllm-openai:cu130-nightly` for the latest nightly, or the pinned `qwen3_5-cu130` tag from February 23, 2026 UTC. Docker eliminates the source-build requirement — no need to compile vLLM, xFormers, or FlashInfer manually (`pip install` still requires source build). **However, 4-bit quantization on this model is uncharted territory:** no official Qwen 4-bit checkpoint exists, the only community AWQ-4bit checkpoint ([`cyankiwi/Qwen3.5-27B-AWQ-4bit`](https://huggingface.co/cyankiwi/Qwen3.5-27B-AWQ-4bit)) has exactly one success report (dual RTX 3090, TP=2, `vllm/vllm-openai:nightly`) and one failure with garbled output — with zero single-GPU reports and no published quality benchmarks. The official FP8 checkpoint (`Qwen/Qwen3.5-27B-FP8`, ~28 GB) is the only well-tested quantization, leaving ~4 GB for KV cache on 32 GB VRAM. The Qwen 3.5 27B model being only 3 days old means there are still open bugs in streaming, tool parsing edge cases, and reasoning truncation. Ollama requires substantial engineering effort across three separate subsystems (sampler, renderer/parser, registry), with the penalty sampling fix being particularly high-stakes since it affects every Go-runner model. The architectural difference is the root cause: vLLM delegates to the model publisher's Jinja2 template (automatic correctness), while Ollama reimplements each model's template in compiled Go source code (perpetual maintenance burden where every new model family risks these exact kinds of mismatches).
 
 ---
 
 ## Table of Contents
 
+- [Effort Comparison](#effort-comparison-fixing-qwen-35-27b-support-ollama-vs-vllm) — comparative analysis of what it takes to fix each framework
 - [Bug Report Summary](#bug-report-summary) — **start here** for the three verified, bug-report-worthy findings
 
 1. [Model Overview](#1-model-overview)
 2. [VRAM Fit and Quantization Options](#2-vram-fit-and-quantization-options)
 3. [Recommended Inference Parameters](#3-recommended-inference-parameters)
-4. [vLLM Support Status](#4-vllm-support-status) — includes deep dive: chat template architecture, `enable_thinking` passthrough, reasoning+tool parser handoff, tool call parser architecture, special token flags, model implementation
+4. [vLLM Support Status](#4-vllm-support-status) — includes deep dive: quantization on 32 GB VRAM (4-bit checkpoint testing status), chat template architecture, `enable_thinking` passthrough, reasoning+tool parser handoff, tool call parser architecture, special token flags, model implementation
 5. [Ollama Support Status](#5-ollama-support-status)
 6. [Ollama Deep Dive: Parameter Flow Validation](#6-ollama-deep-dive-parameter-flow-validation)
 7. [Ollama Critical Bug: Missing Penalty Sampling](#7-ollama-critical-bug-missing-penalty-sampling)
@@ -46,9 +127,9 @@
 
 The following three bugs in the Ollama inference framework were originally identified against v0.17.1 (commit [`9bf4196`](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a)) and **verified against source code, the Ollama model registry at `registry.ollama.ai`, and the HuggingFace model repository ground truth**. All three are unfixable by end users via API parameters or configuration — they require changes to Ollama's source code or registry model configuration by the Ollama team.
 
-### Re-Verification Against Ollama Master (February 27, 2026)
+### Re-Verification Against Ollama Master (February 27, 2026 UTC)
 
-All three bugs were re-verified against Ollama master at commit [`79917cf`](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) (February 26, 2026, one commit ahead of v0.17.4). Stable releases checked: v0.17.1 through v0.17.4.
+All three bugs were re-verified against Ollama master at commit [`79917cf`](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) (February 26, 2026 UTC, one commit ahead of v0.17.4). Stable releases checked: v0.17.1 through v0.17.4.
 
 | Bug | v0.17.1 | v0.17.2 | v0.17.3 | v0.17.4 | master (`79917cf`) |
 |-----|---------|---------|---------|---------|-------------------|
@@ -57,7 +138,7 @@ All three bugs were re-verified against Ollama master at commit [`79917cf`](http
 | Bug 3: Unclosed `</think>` tag (renderer) | Present | Present | Present | Present | **Present** |
 | Bug 3 (parser-side mitigation) | — | — | **Fixed** | Fixed | Fixed |
 
-**Bug 3 partial fix detail:** Commit [`d98dda4`](https://github.com/ollama/ollama/commit/d98dda4676d44a3882fd38492cc00db257f35974) ("model: fix qwen3 tool calling in thinking", PR [#14477](https://github.com/ollama/ollama/pull/14477), merged February 26, 2026) added parser-side handling so that `Qwen3Parser` and `Qwen3VLParser` now detect `<tool_call>` while still in thinking-collection state, treating it as the end of thinking and transitioning to tool-call parsing. This fix entered the **v0.17.3** stable release. However, the **renderer side** of the bug — the `Qwen3VLRenderer` at [`qwen3vl.go:98-99`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/renderers/qwen3vl.go#L98-L99) still gating `</think>` emission on `content != ""` — remains unfixed. Multi-turn prompts sent to the model still contain unclosed `<think>` tags when an assistant turn has thinking + tool calls + empty content. The tool-call thinking tests in `qwen3vl_thinking_test.go` (lines 119–323) remain commented out.
+**Bug 3 partial fix detail:** Commit [`d98dda4`](https://github.com/ollama/ollama/commit/d98dda4676d44a3882fd38492cc00db257f35974) ("model: fix qwen3 tool calling in thinking", PR [#14477](https://github.com/ollama/ollama/pull/14477), merged February 26, 2026 UTC) added parser-side handling so that `Qwen3Parser` and `Qwen3VLParser` now detect `<tool_call>` while still in thinking-collection state, treating it as the end of thinking and transitioning to tool-call parsing. This fix entered the **v0.17.3** stable release. However, the **renderer side** of the bug — the `Qwen3VLRenderer` at [`qwen3vl.go:98-99`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/renderers/qwen3vl.go#L98-L99) still gating `</think>` emission on `content != ""` — remains unfixed. Multi-turn prompts sent to the model still contain unclosed `<think>` tags when an assistant turn has thinking + tool calls + empty content. The tool-call thinking tests in `qwen3vl_thinking_test.go` (lines 119–323) remain commented out.
 
 ### Bug 1: Ollama Go-Based Runner Silently Ignores All Penalty Sampling Parameters
 
@@ -81,7 +162,7 @@ This bug has two sides — the **renderer** (prompt construction for the model) 
 
 **Renderer (STILL BROKEN):** The `Qwen3VLRenderer` (used for the `"qwen3.5"` renderer) has a bug where the `</think>` closing tag is only emitted when the assistant message has non-empty `Content` (at [`qwen3vl.go:98-99`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/renderers/qwen3vl.go#L98-L99)). When an assistant message has thinking text + tool calls but empty content (the common case for a "think then call a tool" turn), the `<tool_call>` block is rendered **inside an unclosed `<think>` block**, corrupting the conversation structure the model sees in multi-turn history. All tool-call thinking tests in `qwen3vl_thinking_test.go` are commented out (lines 119–323).
 
-**Parser (FIXED in v0.17.3):** Commit [`d98dda4`](https://github.com/ollama/ollama/commit/d98dda4676d44a3882fd38492cc00db257f35974) (PR [#14477](https://github.com/ollama/ollama/pull/14477), February 26, 2026) fixed the `Qwen3Parser` and `Qwen3VLParser` to detect `<tool_call>` tags while still in thinking-collection state, correctly transitioning to tool-call parsing without requiring `</think>` first. This means model output like `<think>reasoning<tool_call>...</tool_call>` is now parsed correctly. This fix entered the v0.17.3 stable release.
+**Parser (FIXED in v0.17.3):** Commit [`d98dda4`](https://github.com/ollama/ollama/commit/d98dda4676d44a3882fd38492cc00db257f35974) (PR [#14477](https://github.com/ollama/ollama/pull/14477), February 26, 2026 UTC) fixed the `Qwen3Parser` and `Qwen3VLParser` to detect `<tool_call>` tags while still in thinking-collection state, correctly transitioning to tool-call parsing without requiring `</think>` first. This means model output like `<think>reasoning<tool_call>...</tool_call>` is now parsed correctly. This fix entered the v0.17.3 stable release.
 
 - **Evidence:** [Section 9](#9-ollama-registry-model-validation-qwen3527b-q4_k_m) (Prompt Template Diff subsection)
 - **Key source files:** [`model/renderers/qwen3vl.go:95-120`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/renderers/qwen3vl.go#L95-L120) (renderer, still broken), [`model/parsers/qwen3.go:207-227`](https://github.com/ollama/ollama/blob/79917cf80bf74538a4ae694e6b61adb908b0f8df/model/parsers/qwen3.go#L207-L227) (parser, fixed)
@@ -95,7 +176,7 @@ This bug has two sides — the **renderer** (prompt construction for the model) 
 
 ## 1. Model Overview
 
-**Released February 24, 2026.** Qwen 3.5 27B is a dense multimodal language model from Alibaba's Qwen team, part of the Qwen 3.5 Medium Model Series.
+**Released February 24, 2026 UTC.** Qwen 3.5 27B is a dense multimodal language model from Alibaba's Qwen team, part of the Qwen 3.5 Medium Model Series.
 
 | Spec | Value |
 |------|-------|
@@ -176,8 +257,11 @@ A 3:1 ratio of linear attention (Gated DeltaNet) to full attention layers. The G
 **Community GGUF from bartowski** ([bartowski/Qwen_Qwen3.5-27B-GGUF](https://huggingface.co/bartowski/Qwen_Qwen3.5-27B-GGUF)):
 Similar spread plus additional imatrix quants (IQ4_XS, IQ3_M, IQ2_M, etc.).
 
-**Community AWQ:**
-- `cyankiwi/Qwen3.5-27B-AWQ-BF16-INT4`, `cyankiwi/Qwen3.5-27B-AWQ-4bit`, `QuantTrio/Qwen3.5-27B-AWQ`
+**Community 4-bit for vLLM (all use `compressed-tensors` or native AWQ format; see [testing details](#4-bit-checkpoint-testing-status) in Section 4):**
+- [`cyankiwi/Qwen3.5-27B-AWQ-4bit`](https://huggingface.co/cyankiwi/Qwen3.5-27B-AWQ-4bit) (20.1 GB, `compressed-tensors`, 10K downloads — **barely tested**: 1 TP=2 success, 1 garbled-output failure, 0 single-GPU reports)
+- [`cyankiwi/Qwen3.5-27B-AWQ-BF16-INT4`](https://huggingface.co/cyankiwi/Qwen3.5-27B-AWQ-BF16-INT4) (28 GB, `compressed-tensors`, untested — too large for practical 32 GB use)
+- [`Kbenkhaled/Qwen3.5-27B-quantized.w4a16`](https://huggingface.co/Kbenkhaled/Qwen3.5-27B-quantized.w4a16) (18.6 GB, `compressed-tensors` / GPTQ, NVIDIA-affiliated author — brand new, untested, claims 100.3% accuracy recovery)
+- [`QuantTrio/Qwen3.5-27B-AWQ`](https://huggingface.co/QuantTrio/Qwen3.5-27B-AWQ) (21.9 GB, native AWQ, untested)
 
 ### NVIDIA RTX 5090 Graphics Card (32 GB VRAM) Fit Table
 
@@ -260,7 +344,7 @@ From the [official Qwen 3.5 27B model card](https://huggingface.co/Qwen/Qwen3.5-
 
 ## 4. vLLM Inference Server Support Status
 
-> **Version note:** Latest stable release is **v0.16.0** (branch cut February 8, 2026). Qwen 3.5 was released February 16, 2026 — eight days after the branch cut. **v0.16.0 does not include Qwen 3.5 support.** All analysis below is pinned to commit [`a1f53ad`](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) (nightly post-v0.16.1rc0). Confirmed by vLLM maintainer @Isotr0py in [Issue #35391](https://github.com/vllm-project/vllm/issues/35391): *"vLLM 0.16.0 doesn't include Qwen3.5 support actually, because it's cut off before model support PR merged."*
+> **Version note:** Latest stable release is **v0.16.0** (branch cut February 8, 2026 UTC). The Qwen 3.5 series launched February 16, 2026 UTC (397B-A17B flagship) and the 27B followed on February 24, 2026 UTC — both after the branch cut. **v0.16.0 does not include Qwen 3.5 support.** All analysis below is pinned to commit [`a1f53ad`](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) (nightly post-v0.16.1rc0). Confirmed by vLLM maintainer @Isotr0py in [Issue #35391](https://github.com/vllm-project/vllm/issues/35391): *"vLLM 0.16.0 doesn't include Qwen3.5 support actually, because it's cut off before model support PR merged."*
 
 ### What Works
 
@@ -277,11 +361,14 @@ From the [official Qwen 3.5 27B model card](https://huggingface.co/Qwen/Qwen3.5-
 
 ### What's Broken / Concerning
 
-1. **Stable vLLM v0.16.0 does NOT support Qwen 3.5** — you must use the **nightly build**:
+1. **Stable vLLM v0.16.0 does NOT support Qwen 3.5** — you must use the **nightly build**. For RTX 5090 (Blackwell), use Docker (recommended):
    ```bash
-   pip install -U vllm --extra-index-url https://wheels.vllm.ai/nightly
+   docker run --gpus all -p 8000:8000 --ipc=host \
+       -v ~/.cache/huggingface:/root/.cache/huggingface \
+       vllm/vllm-openai:cu130-nightly <model-name> [options]
    ```
-   Or Docker: `vllm/vllm-openai:nightly` (or `vllm/vllm-openai:cu130-nightly` for Blackwell GPUs).
+   For non-Blackwell GPUs, pip also works: `pip install -U vllm --extra-index-url https://wheels.vllm.ai/nightly`.
+   Note: v0.16.1rc0 (tagged February 26, 2026 UTC) contains Qwen 3.5 support but is not on PyPI. The [official recipe](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3.5.html) says "Use vLLM nightly wheel until 0.17.0 is released."
    Documented in [Issue #35391](https://github.com/vllm-project/vllm/issues/35391).
 
 2. **Reasoning parser truncation bug ([#35221](https://github.com/vllm-project/vllm/issues/35221)):** If generation is truncated mid-reasoning (before `</think>`), the reasoning text is misclassified as content in non-streaming mode. The code at [`qwen3_reasoning_parser.py:70-73`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/reasoning/qwen3_reasoning_parser.py#L70-L73) returns `(None, model_output)` when no `</think>` is found. The serving layer mitigates this for the `enable_thinking=False` case via `prompt_is_reasoning_end_arr`, but the `max_tokens` truncation case is unhandled. Only affects non-streaming mode — streaming correctly routes pre-`</think>` tokens as reasoning via `extract_reasoning_streaming()` ([`qwen3_reasoning_parser.py:131-133`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/reasoning/qwen3_reasoning_parser.py#L131-L133)).
@@ -296,12 +383,55 @@ From the [official Qwen 3.5 27B model card](https://huggingface.co/Qwen/Qwen3.5-
 
 5. **No default parameter injection:** vLLM's `Qwen3_5TextConfig` defines architecture parameters only — no sampling parameters. You must set `temperature`, `top_p`, `top_k`, `presence_penalty` explicitly in every API request. The model card recommends `presence_penalty=1.5` for 3 of 4 usage profiles — users who don't set it get vLLM's default of `0.0`, risking repetition loops during extended thinking.
 
-6. **RTX 5090 (Blackwell sm_120) not stable yet:** vLLM does not have official RTX 5090 support. Users must build from source with PyTorch 2.9.0+cu128 nightly and CUDA 12.8. Flash Attention 3 does not work on Blackwell yet; `VLLM_FLASH_ATTN_VERSION=2` is required. See [vLLM forum thread](https://discuss.vllm.ai/t/vllm-on-rtx5090-working-gpu-setup-with-torch-2-9-0-cu128/1492). Dynamic FP8 quantization has been reported as slower than BF16 on RTX 5090 ([Issue #28234](https://github.com/vllm-project/vllm/issues/28234)) — use the pre-quantized `Qwen/Qwen3.5-27B-FP8` checkpoint instead of online quantization.
+6. **RTX 5090 (Blackwell sm_120) — Docker works out of the box, pip requires source build:** vLLM v0.15.1 (February 4, 2026 UTC) explicitly fixed sm_120 kernel issues — NVFP4 MoE kernels ([#33417](https://github.com/vllm-project/vllm/issues/33416)) and FP8 CUTLASS fallback to Triton ([#33285](https://github.com/vllm-project/vllm/issues/33416)). The official Docker images compile for `TORCH_CUDA_ARCH_LIST='7.0 7.5 8.0 8.9 9.0 10.0 12.0'` — the `12.0` entry is sm_120 (Blackwell RTX 5090). Available Docker tags for Blackwell: `vllm/vllm-openai:v0.16.0-cu130` (latest stable, CUDA 13.0.1, no Qwen 3.5 support), `vllm/vllm-openai:cu130-nightly` (nightly with Qwen 3.5 support), and `vllm/vllm-openai:qwen3_5-cu130` (purpose-built for Qwen 3.5, published February 23, 2026 UTC). Confirmed working on RTX 5090 (driver 590.48, PyTorch 2.10.0+cu130) by a user in [GitHub Issue #35303](https://github.com/vllm-project/vllm/issues/35303). **`pip install vllm` does NOT include sm_120 kernels** — pip users must build from source (with `TORCH_CUDA_ARCH_LIST="12.0"`) plus manually compile xFormers and FlashInfer. Docker eliminates all of this. Flash Attention 3 does not work on Blackwell; the Docker images use `VLLM_FLASH_ATTN_VERSION=2` (FA2 runs fine on sm_120, confirmed by Tri Dao in [flash-attention#1853](https://github.com/Dao-AILab/flash-attention/issues/1853)). Flash Attention 4 targets sm_100 (data center B200/B300), not sm_120 (consumer RTX), and is not released in the `flash-attn` package (latest is v2.8.3, August 2025). Dynamic FP8 quantization is reported slower than BF16 on RTX 5090 ([Issue #28234](https://github.com/vllm-project/vllm/issues/28234)) — use the pre-quantized `Qwen/Qwen3.5-27B-FP8` checkpoint instead of online quantization.
+
+### Deep Dive: Quantization on 32 GB VRAM
+
+The hybrid Gated DeltaNet architecture creates quantization constraints that differ from standard Transformers. The 48 linear attention layers each contain `in_proj_ba` (beta/alpha projection, output dim = 48) and `conv1d`, which cannot be blockwise FP8 quantized because 48 % 128 != 0 ([`fp8_utils.py:1457`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1457)). These layers must remain in BF16 — but they total only ~47 MB across all 48 GDN layers, so the VRAM impact is negligible.
+
+**Official recommendation: Do NOT quantize GDN layers.** The vLLM project's own llm-compressor examples for both FP8 ([`qwen3_next_example.py`](https://github.com/vllm-project/llm-compressor/blob/main/examples/quantization_w8a8_fp8/qwen3_next_example.py)) and FP4 ([`qwen3_next_example.py`](https://github.com/vllm-project/llm-compressor/blob/main/examples/quantization_w4a4_fp4/qwen3_next_example.py)) explicitly exclude all GDN layers via `ignore=["re:.*linear_attn.*"]`. The cyankiwi team confirmed this in a [HuggingFace discussion](https://huggingface.co/cyankiwi/Qwen3.5-27B-AWQ-BF16-INT4/discussions/1): "linear attention is more prone to quantization errors."
+
+| Method | Checkpoint | Model VRAM (text-only) | Available for KV Cache | Tested on vLLM? |
+|--------|-----------|------|---------|---------|
+| BF16 | [`Qwen/Qwen3.5-27B`](https://huggingface.co/Qwen/Qwen3.5-27B) | ~53 GB | Won't fit | N/A — multi-GPU only |
+| **FP8** | [**`Qwen/Qwen3.5-27B-FP8`**](https://huggingface.co/Qwen/Qwen3.5-27B-FP8) (official Qwen) | **~28 GB** | **~4 GB (~64K tokens)** | **Yes — official checkpoint, FP8 shard_id bug fixed in nightly ([PR #35289](https://github.com/vllm-project/vllm/pull/35289))** |
+| INT4 (compressed-tensors) | [`cyankiwi/Qwen3.5-27B-AWQ-4bit`](https://huggingface.co/cyankiwi/Qwen3.5-27B-AWQ-4bit) (community, 2-person team, 10K downloads) | ~18 GB | ~14 GB (~224K tokens) | **Barely — 1 success on TP=2 (dual RTX 3090), 1 failure with garbled output. Zero single-GPU reports.** See [testing details](#4-bit-checkpoint-testing-status) below. |
+| INT4 (compressed-tensors) | [`cyankiwi/Qwen3.5-27B-AWQ-BF16-INT4`](https://huggingface.co/cyankiwi/Qwen3.5-27B-AWQ-BF16-INT4) (community) | ~26 GB | ~6 GB (~96K tokens) | **Untested** — no community reports |
+| INT4 (compressed-tensors, GPTQ algorithm) | [`Kbenkhaled/Qwen3.5-27B-quantized.w4a16`](https://huggingface.co/Kbenkhaled/Qwen3.5-27B-quantized.w4a16) (NVIDIA-affiliated, 15 downloads) | ~18 GB | ~14 GB (~224K tokens) | **Untested** — published Feb 27, 2026 UTC. Claims 100.3% accuracy recovery (GPQA Diamond, IFEval, MMLU-Redux). Zero community testing. |
+| INT4 (native AWQ) | [`QuantTrio/Qwen3.5-27B-AWQ`](https://huggingface.co/QuantTrio/Qwen3.5-27B-AWQ) (community, 2-person team, 2.5K downloads) | ~20 GB | ~12 GB (~192K tokens) | **Untested** — zero reports. Uses `dtype: float16` instead of BF16. |
+| bitsandbytes | N/A | N/A | N/A | **Broken** — `NotImplementedError` for tuple shard_id in `in_proj_qkv` ([`linear.py:791-795`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/layers/linear.py#L791-L795)) |
+| GGUF | N/A | N/A | N/A | **Not viable** — no Qwen 3.5 tensor name mapping in vLLM's GGUF loader ([`linear.py:738-743`](https://github.com/vllm-project/vllm/blob/a1f53addb132f75704710184f4c1cc4780343329/vllm/model_executor/layers/linear.py#L738-L743)) |
+
+**KV cache math:** Only the 16 full attention layers use per-token KV cache (the 48 GDN layers use fixed-size recurrent state of ~72 MB per sequence, stored in vLLM's "mamba cache"). Full attention KV cost: 16 layers x 4 KV heads x 256 head_dim x 2 (K+V) x 2 bytes (BF16) = **64 KB per token**.
+
+#### 4-Bit Checkpoint Testing Status
+
+**No official Qwen 4-bit checkpoint exists.** [HuggingFace discussion #15](https://huggingface.co/Qwen/Qwen3.5-27B/discussions/15) (February 25, 2026 UTC, 7 upvotes) shows users requesting one with no Qwen team response as of February 27, 2026 UTC.
+
+**The "AWQ" checkpoints are not standard AWQ format.** Despite having "AWQ" in their names, both `cyankiwi` checkpoints use `quant_method: "compressed-tensors"` (created with `llm-compressor` v0.13.1.a20260219), not `"awq"`. vLLM routes them through `CompressedTensorsConfig` and the Marlin WNA16 kernel path. Only `QuantTrio/Qwen3.5-27B-AWQ` uses native `quant_method: "awq"`.
+
+**The cyankiwi team is a 2-person operation** (Ton Cao and Anton Calbert, [cyan.kiwi](https://cyan.kiwi), 200 HuggingFace followers, 227 published models). This is relevant context for assessing checkpoint reliability. The two checkpoints differ in what they quantize:
+- **AWQ-4bit (20.1 GB on disk):** Quantizes GDN layers' large projections (`in_proj_qkv`, `in_proj_z`, `out_proj`, FFN) to INT4, keeping only `in_proj_a`/`in_proj_b` in BF16. This **contradicts the official llm-compressor recommendation** to exclude all GDN layers from quantization. No quality benchmarks published.
+- **AWQ-BF16-INT4 (~28 GB on disk):** Keeps ALL GDN linear attention sub-layers in BF16, only quantizes full attention + FFN to INT4. Follows the official recommendation but at 28 GB on 32 GB VRAM, defeats the purpose of quantization.
+
+**Community testing of `cyankiwi/Qwen3.5-27B-AWQ-4bit` ([HuggingFace discussion #1](https://huggingface.co/cyankiwi/Qwen3.5-27B-AWQ-4bit/discussions/1)):**
+- **Success:** User Pa3kx, dual RTX 3090 (TP=2), `vllm/vllm-openai:nightly` Docker image, 63-65 tok/s decode at 8K context, 150K max context. Working command used `--tensor-parallel-size 2 --max-model-len 150000 --gpu-memory-utilization 0.90`.
+- **Failure:** User thigger, 2x A6000 Ada (WSL2) — "wildly weird outputs" with `UserWarning: Input tensor shape suggests potential format mismatch: seq_len (11) < num_heads (24)`. Same user also reported SGLang crashes with `gptq_marlin_repack` error (dimension 24 not divisible by tile size 64).
+- **No single-GPU reports exist.** The model fits in 32 GB VRAM (~18 GB model + ~14 GB KV) but nobody has confirmed this works on a single GPU.
+
+**The Kbenkhaled/Qwen3.5-27B-quantized.w4a16 checkpoint** (18.6 GB, single safetensors file) is the most promising alternative: published by an NVIDIA-affiliated author, claims 100.3% average accuracy recovery on GPQA Diamond / IFEval / MMLU-Redux, uses GPTQ algorithm with `actorder: static` in compressed-tensors format. Published approximately February 27, 2026 UTC. Zero community testing.
+
+**The FP8 ba_proj exclusion is handled cleanly** by the official checkpoint. The [`config.json`](https://huggingface.co/Qwen/Qwen3.5-27B-FP8) contains a `modules_to_not_convert` list with 651 entries that explicitly excludes `in_proj_a`, `in_proj_b`, and `conv1d` for all 48 GDN layers (plus vision encoder layers, embeddings, and lm_head). The excluded BF16 weights total ~47 MB — negligible. A separate FP8 shard_id weight loading bug ([Issue #35287](https://github.com/vllm-project/vllm/issues/35287) / [PR #35289](https://github.com/vllm-project/vllm/pull/35289)) that caused `NotImplementedError` when loading the FP8 checkpoint was fixed in the nightly (present in the pinned commit).
 
 ### Recommended vLLM Inference Server Launch Command
 
+**For 32 GB VRAM (RTX 5090), use the official FP8 checkpoint — the only well-tested quantization:**
+
 ```bash
-vllm serve Qwen/Qwen3.5-27B-FP8 \
+docker run --gpus all -p 8000:8000 --ipc=host \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    vllm/vllm-openai:cu130-nightly \
+    Qwen/Qwen3.5-27B-FP8 \
     --port 8000 \
     --max-model-len 32768 \
     --language-model-only \
@@ -310,7 +440,25 @@ vllm serve Qwen/Qwen3.5-27B-FP8 \
     --reasoning-parser qwen3
 ```
 
-The `--language-model-only` flag disables the vision encoder, freeing VRAM for KV cache. For text-only deployment on a 32 GB card, this is recommended. The FP8 checkpoint (~28 GB) leaves ~4 GB for KV cache at 32K context; with `--language-model-only`, you gain additional headroom by skipping the 675M-parameter vision encoder.
+The FP8 checkpoint (~28 GB text-only with `--language-model-only`) leaves ~4 GB for KV cache — enough for ~64K tokens single-sequence. The `--language-model-only` flag disables the ~460M-parameter vision encoder, freeing ~0.9 GB of VRAM. `--max-model-len 32768` is a conservative limit that fits comfortably within the 4 GB KV budget.
+
+**Experimental 4-bit alternative (untested on single GPU):** If you need more KV cache headroom and are willing to use an unverified community checkpoint:
+
+```bash
+# EXPERIMENTAL — cyankiwi/Qwen3.5-27B-AWQ-4bit has 1 TP=2 success, 0 single-GPU reports
+docker run --gpus all -p 8000:8000 --ipc=host \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    vllm/vllm-openai:cu130-nightly \
+    cyankiwi/Qwen3.5-27B-AWQ-4bit \
+    --port 8000 \
+    --max-model-len 65536 \
+    --language-model-only \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3
+```
+
+The AWQ-4bit checkpoint (~18 GB text-only) would leave ~14 GB for KV cache (~224K tokens). **Quality is unverified:** this checkpoint quantizes GDN layers to INT4 against the official llm-compressor recommendation, has no published perplexity or benchmark results, and the one successful deployment used tensor parallelism across two GPUs (not single-GPU). Use at your own risk.
 
 ### Deep Dive: Chat Template Architecture — Why vLLM Has No Template Mismatch
 
@@ -1172,7 +1320,7 @@ The CUDA multi-GPU crash fix ([llama.cpp PR #19866](https://github.com/ggml-org/
 | `eval()` security vuln | **FIXED** | Was `eval()`, now `ast.literal_eval()` since v0.10.1.1 ([PR #21396](https://github.com/vllm-project/vllm/pull/21396)) |
 | DeltaNet implementation | **Complete** | Triton kernels, dedicated attention backend |
 | MTP speculative decoding | **Supported** | `Qwen3_5MTP` registered |
-| RTX 5090 Blackwell | **Unstable** | Requires source build with PyTorch 2.9.0+cu128, Flash Attn 2 only |
+| RTX 5090 Blackwell | **Supported (Docker)** | Docker `-cu130` images (CUDA 13.0.1) include sm_120 kernels — confirmed working in [#35303](https://github.com/vllm-project/vllm/issues/35303); `pip install` requires source build; FA2 only (FA3 incompatible, FA4 not released for sm_120); for Qwen 3.5: use `vllm/vllm-openai:cu130-nightly` or `qwen3_5-cu130` |
 
 ### Ollama Inference Framework
 
@@ -1214,7 +1362,7 @@ The CUDA multi-GPU crash fix ([llama.cpp PR #19866](https://github.com/ggml-org/
 
 **For simple chat without tools, the Ollama inference framework works correctly.** The prompt format matches the HuggingFace ground truth template byte-for-byte, the sampling parameters (temperature, top_k, top_p) are correct, and thinking mode works. The bugs are specific to tool calling and penalty sampling.
 
-**The vLLM inference server is the only viable path for agent/tool use** despite requiring a nightly build. It has working penalty sampling, the correct tool call parser (`qwen3_coder` matching the model's XML format), proper thinking mode, and — critically — **uses the HuggingFace Jinja2 chat template verbatim** ([Section 4](#4-vllm-support-status)), guaranteeing template correctness for tool definitions, system message ordering, format instructions, and the `<IMPORTANT>` compliance block. The Ollama inference framework compiles its own Go renderers that must be manually kept in sync — and for Qwen 3.5, they are not. vLLM's approach means the prompt format is always correct by construction. Tool calling has implementation bugs but the format is right — bugs are fixable, wrong format is architectural.
+**The vLLM inference server is the only viable path for agent/tool use** despite requiring a nightly build. It has working penalty sampling, the correct tool call parser (`qwen3_coder` matching the model's XML format), proper thinking mode, and — critically — **uses the HuggingFace Jinja2 chat template verbatim** ([Section 4](#4-vllm-support-status)), guaranteeing template correctness for tool definitions, system message ordering, format instructions, and the `<IMPORTANT>` compliance block. Official Docker images with sm_120 (Blackwell) kernels are available — no source build required. The Ollama inference framework compiles its own Go renderers that must be manually kept in sync — and for Qwen 3.5, they are not. vLLM's approach means the prompt format is always correct by construction. Tool calling has implementation bugs but the format is right — bugs are fixable, wrong format is architectural. **Quantization caveat:** The official FP8 checkpoint is the only well-tested quantization for 32 GB VRAM (~28 GB model, ~4 GB KV cache, ~64K tokens). Community 4-bit checkpoints exist but are unverified on single-GPU deployments — see [quantization deep dive](#deep-dive-quantization-on-32-gb-vram).
 
 **Neither library auto-applies the Qwen 3.5 model's recommended defaults** — you must set parameters explicitly in both cases. The model card recommends `presence_penalty=1.5` for 3 of 4 usage profiles. In vLLM, you can set this per-request or via server defaults. In the Ollama inference framework, it is silently ignored.
 
@@ -1228,10 +1376,10 @@ All source code analysis in this report was performed against locally cloned rep
 
 | Repository | Version | Commit | Date | Link |
 |------|---------|--------|------|------|
-| vLLM inference server | nightly (post-v0.16.1rc0) | `a1f53addb` | Feb 26, 2026 | [vllm-project/vllm@a1f53ad](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) |
-| Ollama inference framework (original analysis) | v0.17.1 | `9bf41969f` | Feb 24, 2026 | [ollama/ollama@9bf4196](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a) |
-| Ollama inference framework (re-verification) | post-v0.17.4 | `79917cf` | Feb 26, 2026 | [ollama/ollama@79917cf](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) |
-| llama.cpp C++ inference library (upstream) | post-b5136 | `723c71064` | Feb 26, 2026 | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
+| vLLM inference server | nightly (post-v0.16.1rc0) | `a1f53addb` | Feb 26, 2026 UTC | [vllm-project/vllm@a1f53ad](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) |
+| Ollama inference framework (original analysis) | v0.17.1 | `9bf41969f` | Feb 24, 2026 UTC | [ollama/ollama@9bf4196](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a) |
+| Ollama inference framework (re-verification) | post-v0.17.4 | `79917cf` | Feb 26, 2026 UTC | [ollama/ollama@79917cf](https://github.com/ollama/ollama/tree/79917cf80bf74538a4ae694e6b61adb908b0f8df) |
+| llama.cpp C++ inference library (upstream) | post-b5136 | `723c71064` | Feb 26, 2026 UTC | [ggml-org/llama.cpp@723c710](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd) |
 | llama.cpp C++ inference library (Ollama-pinned) | — | `ec98e2002` + [34 Ollama patches](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/llama/patches) | — | [ggml-org/llama.cpp@ec98e2002](https://github.com/ggml-org/llama.cpp/tree/ec98e2002) |
 
 Note: The upstream llama.cpp commit (`723c710`) is NOT the same as the Ollama-pinned version (`ec98e2002`). The Ollama inference framework vendors llama.cpp at a specific commit and applies 34 patches on top (for IMRoPE, Metal GPU backend fixes, etc.).
@@ -1321,7 +1469,7 @@ Note: The upstream llama.cpp commit (`723c710`) is NOT the same as the Ollama-pi
 ### llama.cpp C++ Inference Library
 - [llama.cpp GitHub repository](https://github.com/ggml-org/llama.cpp)
 - [Ollama-pinned commit `ec98e2002`](https://github.com/ggml-org/llama.cpp/tree/ec98e2002) with [34 Ollama patches](https://github.com/ollama/ollama/tree/9bf41969f0c23d2ee980d7f092f5f80ea4521d2a/llama/patches)
-- [Upstream commit `723c710` (Feb 26, 2026, post-b5136)](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd)
+- [Upstream commit `723c710` (Feb 26, 2026 UTC, post-b5136)](https://github.com/ggml-org/llama.cpp/tree/723c71064da0908c19683f8c344715fbf6d986fd)
 - [llama.cpp PR #19468 — Qwen 3.5 Support (Merged)](https://github.com/ggml-org/llama.cpp/pull/19468)
 - [Issue #19860 — CUDA Multi-GPU Crash (Fixed)](https://github.com/ggml-org/llama.cpp/issues/19860)
 - [PR #19866 — CUDA Multi-GPU Crash Fix](https://github.com/ggml-org/llama.cpp/pull/19866)
