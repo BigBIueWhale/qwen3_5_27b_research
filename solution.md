@@ -40,84 +40,116 @@ ollama pull qwen3.5:27b-q4_K_M
 
 ### Thinking Mode with Tool Calling
 
-Parameters match the [Qwen 3.5 27B model card](https://huggingface.co/Qwen/Qwen3.5-27B#best-practices) "Thinking — General tasks" profile. The model thinks, then calls tools using the Qwen3-Coder XML format.
+Uses the **OpenAI-compatible endpoint** (`/v1/chat/completions`) — the same endpoint that [Qwen Code CLI](https://github.com/QwenLM/qwen-code) uses to talk to Ollama. The model thinks, then calls tools using the Qwen3-Coder XML format. Tool results are sent back with matching `tool_call_id` references.
 
-```bash
-curl http://localhost:11434/api/chat -d '{
-  "model": "qwen3.5:27b-q4_K_M",
-  "messages": [
-    {"role": "user", "content": "What is the weather in Tokyo?"}
-  ],
-  "tools": [
+```python
+import json, urllib.request
+
+API = "http://localhost:11434/v1/chat/completions"
+HEADERS = {"Content-Type": "application/json", "Authorization": "Bearer ollama"}
+
+TOOLS = [
     {
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get the current weather for a city",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "city": {"type": "string", "description": "City name"}
-          },
-          "required": ["city"]
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "City name"},
+                    "units": {"type": "string", "enum": ["celsius", "fahrenheit"],
+                              "description": "Temperature units"}
+                },
+                "required": ["city"]
+            }
         }
-      }
-    }
-  ],
-  "stream": false,
-  "options": {
-    "num_ctx": 131072,
-    "num_predict": 81920,
-    "temperature": 1.0,
-    "top_k": 20,
-    "top_p": 0.95,
-    "min_p": 0.0,
-    "presence_penalty": 1.5,
-    "repeat_penalty": 1.0
-  }
-}'
-```
-
-When the model calls a tool, send the result back as a `tool` message and continue the conversation:
-
-```bash
-curl http://localhost:11434/api/chat -d '{
-  "model": "qwen3.5:27b-q4_K_M",
-  "messages": [
-    {"role": "user", "content": "What is the weather in Tokyo?"},
-    {"role": "assistant", "thinking": "I should check the weather.", "tool_calls": [
-      {"type": "function", "function": {"index": 0, "name": "get_weather", "arguments": {"city": "Tokyo"}}}
-    ]},
-    {"role": "tool", "tool_name": "get_weather", "content": "{\"temperature\": 22, \"condition\": \"partly cloudy\"}"}
-  ],
-  "tools": [
+    },
     {
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get the current weather for a city",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "city": {"type": "string", "description": "City name"}
-          },
-          "required": ["city"]
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web for information",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "num_results": {"type": "integer", "description": "Number of results to return"}
+                },
+                "required": ["query"]
+            }
         }
-      }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "Evaluate a mathematical expression",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string", "description": "Math expression to evaluate"}
+                },
+                "required": ["expression"]
+            }
+        }
     }
-  ],
-  "stream": false,
-  "options": {
-    "num_ctx": 131072,
-    "num_predict": 81920,
-    "temperature": 1.0,
-    "top_k": 20,
-    "top_p": 0.95,
-    "min_p": 0.0,
-    "presence_penalty": 1.5,
-    "repeat_penalty": 1.0
-  }
-}'
+]
+
+def call_api(messages):
+    payload = json.dumps({
+        "model": "qwen3.5:27b-q4_K_M",
+        "messages": messages,
+        "tools": TOOLS,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "max_tokens": 81920,
+        "stream": False
+    }).encode()
+    req = urllib.request.Request(API, data=payload, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return json.loads(resp.read())
+
+# Simulated tool implementations
+def simulate_tool(name, args):
+    if name == "get_weather":
+        return json.dumps({"city": args.get("city", "?"), "temperature": 14,
+                           "condition": "overcast", "humidity": 72, "wind_kph": 18})
+    elif name == "search_web":
+        return json.dumps({"results": [{"title": "Tel Aviv Marathon 2026",
+            "snippet": "The 2026 Tel Aviv Marathon took place Feb 27. "
+                       "Winner: Eliud Kosgei, time 2:04:31. Over 40,000 participants."}]})
+    elif name == "calculate":
+        return json.dumps({"result": str(eval(args.get("expression", "0")))})
+    return "{}"
+
+# --- Turn 1: User asks a multi-part question ---
+messages = [{"role": "user", "content":
+    "I'm planning to go running in Tel Aviv today. What's the weather like, "
+    "when was the last Tel Aviv marathon and who won, "
+    "and what's 42.195 km in miles?"}]
+
+r1 = call_api(messages)
+choice1 = r1["choices"][0]["message"]
+# finish_reason == "tool_calls", model issued 3 parallel tool calls:
+#   get_weather({"city":"Tel Aviv","units":"celsius"})
+#   search_web({"query":"last Tel Aviv marathon winner date","num_results":3})
+#   calculate({"expression":"42.195 * 0.621371"})
+
+# --- Turn 2: Send simulated tool results back ---
+messages.append(choice1)
+for tc in choice1["tool_calls"]:
+    fn = tc["function"]
+    args = json.loads(fn["arguments"]) if isinstance(fn["arguments"], str) else fn["arguments"]
+    messages.append({
+        "role": "tool",
+        "tool_call_id": tc["id"],
+        "content": simulate_tool(fn["name"], args)
+    })
+
+r2 = call_api(messages)
+# finish_reason == "stop", model synthesizes final answer from all 3 tool results
+print(r2["choices"][0]["message"]["content"])
 ```
 
 ### Thinking Mode without Tools
