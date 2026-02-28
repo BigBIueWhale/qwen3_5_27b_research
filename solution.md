@@ -33,8 +33,10 @@ Upstream Ollama v0.17.4 ships Qwen 3.5 27B with broken agentic tool calling — 
 Pull the model, then call the API. Thinking is enabled by default for Qwen 3.5 — no flag needed.
 
 ```bash
-ollama pull qwen3.5:27b
+ollama pull qwen3.5:27b-q4_K_M
 ```
+
+**VRAM note:** At Q4_K_M with `num_ctx=131072` (128K), the model uses **~32.5 GiB VRAM** — fitting entirely on an RTX 5090 (32 GiB) with zero CPU offload.
 
 ### Thinking Mode with Tool Calling
 
@@ -42,7 +44,7 @@ Parameters match the [Qwen 3.5 27B model card](https://huggingface.co/Qwen/Qwen3
 
 ```bash
 curl http://localhost:11434/api/chat -d '{
-  "model": "qwen3.5:27b",
+  "model": "qwen3.5:27b-q4_K_M",
   "messages": [
     {"role": "user", "content": "What is the weather in Tokyo?"}
   ],
@@ -64,7 +66,7 @@ curl http://localhost:11434/api/chat -d '{
   ],
   "stream": false,
   "options": {
-    "num_ctx": 32768,
+    "num_ctx": 131072,
     "num_predict": 81920,
     "temperature": 1.0,
     "top_k": 20,
@@ -80,7 +82,7 @@ When the model calls a tool, send the result back as a `tool` message and contin
 
 ```bash
 curl http://localhost:11434/api/chat -d '{
-  "model": "qwen3.5:27b",
+  "model": "qwen3.5:27b-q4_K_M",
   "messages": [
     {"role": "user", "content": "What is the weather in Tokyo?"},
     {"role": "assistant", "thinking": "I should check the weather.", "tool_calls": [
@@ -106,7 +108,7 @@ curl http://localhost:11434/api/chat -d '{
   ],
   "stream": false,
   "options": {
-    "num_ctx": 32768,
+    "num_ctx": 131072,
     "num_predict": 81920,
     "temperature": 1.0,
     "top_k": 20,
@@ -122,13 +124,13 @@ curl http://localhost:11434/api/chat -d '{
 
 ```bash
 curl http://localhost:11434/api/chat -d '{
-  "model": "qwen3.5:27b",
+  "model": "qwen3.5:27b-q4_K_M",
   "messages": [
     {"role": "user", "content": "Solve: Find all integers n such that n^2 + 2n + 4 is divisible by 7."}
   ],
   "stream": false,
   "options": {
-    "num_ctx": 32768,
+    "num_ctx": 131072,
     "num_predict": 81920,
     "temperature": 1.0,
     "top_k": 20,
@@ -164,7 +166,7 @@ For agentic tool calling, math, reasoning, creative writing, and general use.
 
 ```json
 "options": {
-  "num_ctx": 32768,
+  "num_ctx": 131072,
   "num_predict": 81920,
   "temperature": 1.0,
   "top_k": 20,
@@ -176,13 +178,13 @@ For agentic tool calling, math, reasoning, creative writing, and general use.
 }
 ```
 
-### Profile 2: Thinking — Precise Coding
+### Profile 2: Thinking — Precise Coding (e.g. WebDev)
 
-For web development, code generation where determinism matters more than exploration.
+For precise coding tasks where determinism matters more than exploration.
 
 ```json
 "options": {
-  "num_ctx": 32768,
+  "num_ctx": 131072,
   "num_predict": 81920,
   "temperature": 0.6,
   "top_k": 20,
@@ -201,7 +203,7 @@ Disables thinking for faster, shorter responses. Must explicitly set `"think": f
 ```json
 "think": false,
 "options": {
-  "num_ctx": 32768,
+  "num_ctx": 131072,
   "num_predict": 32768,
   "temperature": 0.7,
   "top_k": 20,
@@ -220,7 +222,7 @@ For chain-of-thought reasoning without the `<think>` block. Uses aggressive samp
 ```json
 "think": false,
 "options": {
-  "num_ctx": 32768,
+  "num_ctx": 131072,
   "num_predict": 32768,
   "temperature": 1.0,
   "top_k": 40,
@@ -291,14 +293,15 @@ This means you **cannot customize the chat template via a Modelfile `TEMPLATE` d
 
 ### Context Length on RTX 5090
 
-| `num_ctx` | VRAM for KV Cache (approx) | Fits RTX 5090? |
+| `num_ctx` | Total VRAM (model + KV cache) | Fits RTX 5090? |
 |---|---|---|
-| 32,768 (32K, default) | ~4 GB | Yes |
-| 65,536 (64K) | ~8 GB | Yes |
-| 131,072 (128K) | ~16 GB | Tight, may OOM |
-| 262,144 (256K) | ~32 GB | No (exceeds total VRAM) |
+| 32,768 (32K, default) | ~24.8 GiB | Yes |
+| 65,536 (64K) | ~27.4 GiB | Yes |
+| 131,072 (128K) | ~32.5 GiB | **Yes** — confirmed, zero CPU offload, ~118 MiB free |
+| 140,000 | ~34.0 GiB | No — 4.7 GiB spills to CPU |
+| 262,144 (256K) | ~48 GiB | No (far exceeds total VRAM) |
 
-The safe maximum for single-user inference at Q4_K_M is approximately 65,536 (64K). The model card recommends a minimum of 128K "to preserve thinking capabilities."
+The maximum context that fits 100% on GPU at Q4_K_M on RTX 5090 is **131,072 (128K)**. The model card recommends a minimum of 128K "to preserve thinking capabilities."
 
 ### OpenAI-Compatible API
 
@@ -313,7 +316,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="qwen3.5:27b",
+    model="qwen3.5:27b-q4_K_M",
     messages=[{"role": "user", "content": "Hello"}],
     temperature=1.0,
     top_p=0.95,
