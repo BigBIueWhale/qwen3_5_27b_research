@@ -76,3 +76,30 @@ Updated status table:
 | Unclosed `</think>` (renderer) | Present | Present | Present | Present | **Present** |
 | Unclosed `</think>` (parser) | Present | Present | **Fixed** | Fixed | Fixed |
 | Missing generation prompt after tool calls | Present | Present | Present | Present | **Present** |
+
+---
+
+## Note: Vendored llama.cpp version is not a concern
+
+Ollama v0.17.4 vendors llama.cpp at commit `ec98e2002`, which corresponds to **llama.cpp b7437** (December 16, 2025) — two months before Qwen 3.5 was even announced (February 16, 2026). Community recommendations say llama.cpp **b8149+** (February 25, 2026) is required for Qwen 3.5 GGUF support. This sounds alarming but is **not actually a problem** for Ollama. Here's why:
+
+### What llama.cpp b8149 fixes (and why Ollama doesn't need them)
+
+The fixes that landed between b7437 and b8149 in upstream llama.cpp are all in llama.cpp's **own model-level C++ code** — its GGUF loader, architecture registry, and compute graph builder. Ollama **does not use any of these**:
+
+| llama.cpp fix | What it fixes | Why Ollama is unaffected |
+|---|---|---|
+| [PR #19468](https://github.com/ggml-org/llama.cpp/pull/19468): `qwen35`/`qwen35moe` architecture | llama.cpp's C++ model registry didn't recognize the GGUF `general.architecture` field | Ollama registers architectures in Go: `model.Register("qwen35", New)` in [`model/models/qwen3next/model.go:622-626`](https://github.com/ollama/ollama/blob/cc90a035/model/models/qwen3next/model.go#L622) |
+| [PR #19870](https://github.com/ggml-org/llama.cpp/pull/19870): `ftell`/`fseek` overflow on >2GB GGUFs | llama.cpp's C GGUF loader used 32-bit file offsets on Windows | Ollama loads GGUFs entirely in Go via its own `fs/ggml` package |
+| [PR #19866](https://github.com/ggml-org/llama.cpp/pull/19866): multi-GPU graph split ordering | llama.cpp's C++ graph scheduler ordered nodes incorrectly for Qwen 3.5 | Ollama has its own Go graph scheduler |
+| [PR #19324](https://github.com/ggml-org/llama.cpp/pull/19324): `key_gdiff` vectorized calculation | llama.cpp's C++ Delta Net code was missing a `reshape_4d` before multiplying `k * g_diff_exp`, causing wrong broadcasting and degraded output quality past ~5000 tokens | Ollama's Go implementation at [`deltanet.go:434-436`](https://github.com/ollama/ollama/blob/cc90a035/model/models/qwen3next/deltanet.go#L434) independently includes the correct reshape: `gDiffExp.Reshape(ctx, 1, chunkSize, nChunks, ...)` before the multiply |
+
+### What Ollama actually uses from llama.cpp
+
+Ollama only uses the **GGML tensor computation backends** (CUDA, Vulkan, Metal, CPU kernels) from the vendored llama.cpp. These are the low-level math kernels — matrix multiply, softmax, RoPE, etc. Ollama builds the entire compute graph in Go and hands it to GGML for execution.
+
+All of the GGML ops required by Qwen 3.5's Gated Delta Net architecture (`SSM_CONV`, `SOLVE_TRI`, `CUMSUM`, `TRI`, `SOFTPLUS`, `L2_NORM`, `DIAG`, `FILL`) already have CUDA implementations in the vendored b7437 code. These ops were added in [PR #17063](https://github.com/ggml-org/llama.cpp/pull/17063) (merged November 13, 2025) and [PR #17584](https://github.com/ggml-org/llama.cpp/pull/17584) (merged December 4, 2025) — both before b7437.
+
+### What could still be a concern
+
+Generic GGML kernel-level fixes that affect all models (not Qwen 3.5 specifically) have landed after b7437, including flash attention numerical stability improvements and a cuBLAS FP16 overflow fix ([PR #19959](https://github.com/ggml-org/llama.cpp/pull/19959)) that caused degenerate output on V100 and Blackwell GPUs. These are not Qwen 3.5 architecture issues — they would affect any model on those GPU architectures.
