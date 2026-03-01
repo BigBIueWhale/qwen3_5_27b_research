@@ -48,6 +48,15 @@ Ollama natively supports HuggingFace Hub references — no manual download neede
 ```bash
 cat > Modelfile << 'EOF'
 FROM hf.co/unsloth/Qwen3.5-27B-GGUF:Q4_K_M
+
+# Required: Ollama's built-in Qwen 3.5 chat template with tool calling support.
+# Without RENDERER/PARSER, the HuggingFace GGUF gets a bare {{ .Prompt }} template
+# and tool calling silently breaks. The Ollama registry model includes these
+# automatically, but custom models from hf.co/ GGUFs do not.
+TEMPLATE {{ .Prompt }}
+RENDERER qwen3.5
+PARSER qwen3.5
+
 PARAMETER temperature 1.0
 PARAMETER top_k 20
 PARAMETER top_p 0.95
@@ -55,7 +64,7 @@ EOF
 ollama create qwen3.5-unsloth -f Modelfile
 ```
 
-Ollama detects the `qwen35` architecture from the GGUF metadata and uses the `qwen3.5` renderer/parser automatically — no `RENDERER` directive needed. The `hf.co/` prefix works in both CLI commands and Modelfile `FROM` directives ([docs](https://huggingface.co/docs/hub/en/ollama)).
+**Important:** The `TEMPLATE`, `RENDERER`, and `PARSER` directives are mandatory for HuggingFace-sourced GGUFs. Ollama registry models (`ollama pull qwen3.5:...`) bundle these automatically, but `hf.co/` GGUFs do not — without them, the model gets a bare `{{ .Prompt }}` template and tool calling silently breaks. The `hf.co/` prefix works in both CLI commands and Modelfile `FROM` directives ([docs](https://huggingface.co/docs/hub/en/ollama)).
 
 ### Higher Quality Options (if context length allows)
 
