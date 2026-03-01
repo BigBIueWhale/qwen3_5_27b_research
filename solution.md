@@ -14,20 +14,25 @@ For full source-level evidence of each bug, see the [inference report](https://g
 
 **Do not use `ollama pull qwen3.5:27b-q4_K_M`.** The Ollama registry GGUF uses standard llama.cpp Q4_K_M quantization, which treats every layer the same — including the Gated DeltaNet (GDN) layers that are Qwen 3.5's key architectural innovation. These are the most quantization-sensitive components in the model, and quantizing them to 4-bit measurably degrades intelligence.
 
-**Use the [Unsloth GGUF](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) instead.** Unsloth's "Q4_K_M" is not standard Q4_K_M — it systematically protects the GDN/SSM layers at higher precision, and uses a custom chat/tool-calling calibration dataset (imatrix) instead of generic Wikipedia text. Both the Ollama and Unsloth files say "Q4_K_M" on the label. The contents differ in exactly the places that matter.
+**Use [Unsloth's Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) instead.** Unsloth's Q4_K_M protects the GDN/SSM layers at higher precision, and uses a custom chat/tool-calling calibration dataset (imatrix) instead of generic Wikipedia text. Same file size as the Ollama registry GGUF, significantly better quality on the layers that matter.
 
-### What Unsloth Protects (verified from full GGUF download, March 1, 2026 UTC)
+### Why Q4_K_M, not UD-Q4_K_XL?
 
-198 of 803 common tensors differ. Every single difference is in the GDN/SSM layers:
+Both are 16.7 GB from the same Unsloth repo, but they make **opposite tradeoffs** on the quantization-sensitive GDN/SSM layers. We downloaded and compared all three GGUFs tensor-by-tensor (March 1, 2026 UTC):
 
-| Tensor | Ollama registry | Unsloth | What it is |
-|--------|-----------------|---------|------------|
-| **`attn_qkv`** (48 GDN blocks) | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | The GDN linear attention mechanism — this IS the novel architecture |
-| **`ssm_out`** (48 GDN blocks) | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | SSM output projection — "dramatically increases KLD" when quantized |
-| **`ssm_alpha`** (48 GDN blocks) | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | SSM temporal memory decay — tiny tensor, huge sensitivity |
-| **`ssm_beta`** (48 GDN blocks) | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | SSM input gate — same story, nearly free to protect |
+| Tensor (48 GDN blocks each) | Ollama registry | Unsloth Q4_K_M | Unsloth UD-Q4_K_XL |
+|------------------------------|-----------------|----------------|---------------------|
+| **`attn_qkv`** — GDN linear attention | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | **Q5_K (5.5 bpw)** |
+| **`attn_gate`** — attention gate | Q4_K (4.5 bpw) | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** |
+| **`ssm_out`** — SSM output projection | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | Q4_K (4.5 bpw) |
+| **`ssm_alpha`** — SSM temporal decay | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | Q4_K (4.5 bpw) |
+| **`ssm_beta`** — SSM input gate | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | Q4_K (4.5 bpw) |
 
-Qwen's own official [`llm-compressor` guidance](https://huggingface.co/Qwen/Qwen3.5-27B) independently says the same thing: `ignore=["re:.*linear_attn.*"]` — skip all GDN layers during quantization.
+**Q4_K_M wins on the most sensitive layers.** It keeps `ssm_alpha`/`ssm_beta` at Q8_0 (nearly double precision vs Q4_K) and `ssm_out` at Q5_K. UD-Q4_K_XL trades all of that away to upgrade `attn_gate` from Q4_K to Q5_K — a much less impactful tensor.
+
+Qwen's own official [`llm-compressor` guidance](https://huggingface.co/Qwen/Qwen3.5-27B) independently confirms SSM layers are the priority: `ignore=["re:.*linear_attn.*"]` — skip all GDN layers during quantization.
+
+**Note:** As of March 1, 2026, Unsloth has [flagged the 27B UD GGUFs for re-upload](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) ("112B, 27B still converting, re-download once updated") following an [MXFP4 bug fix](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/5) applied to the 35B-A3B. The current 27B files are from Feb 24 (pre-fix). The UD variants may improve after the re-upload, but until then Q4_K_M is the better choice.
 
 ### What You Lose
 
@@ -38,32 +43,27 @@ The Ollama registry GGUF bundles a **vision encoder** (441 tensors, ~450 MB) and
 
 ### Setup
 
-```bash
-# Download the Unsloth GGUF
-curl -L https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf \
-  -o ~/models/Qwen3.5-27B-Q4_K_M.gguf
+Ollama natively supports HuggingFace Hub references — no manual download needed. The GGUF is pulled and cached automatically on first use.
 
-# Create a Modelfile
-cat > ~/models/Qwen3.5-27B.Modelfile << 'EOF'
-FROM ~/models/Qwen3.5-27B-Q4_K_M.gguf
+```bash
+cat > Modelfile << 'EOF'
+FROM hf.co/unsloth/Qwen3.5-27B-GGUF:Q4_K_M
 PARAMETER temperature 1.0
 PARAMETER top_k 20
 PARAMETER top_p 0.95
 EOF
-
-# Import into Ollama
-ollama create qwen3.5-unsloth -f ~/models/Qwen3.5-27B.Modelfile
+ollama create qwen3.5-unsloth -f Modelfile
 ```
 
-Ollama detects the `qwen35` architecture from the GGUF metadata and uses the `qwen3.5` renderer/parser automatically — no `RENDERER` directive needed.
+Ollama detects the `qwen35` architecture from the GGUF metadata and uses the `qwen3.5` renderer/parser automatically — no `RENDERER` directive needed. The `hf.co/` prefix works in both CLI commands and Modelfile `FROM` directives ([docs](https://huggingface.co/docs/hub/en/ollama)).
 
 ### Higher Quality Options (if context length allows)
 
 | Unsloth GGUF | Size | VRAM left for KV cache | When to use |
 |---|---|---|---|
-| **Q4_K_M** | 16.7 GB | ~15.3 GB — maximum context | Default choice. 128K context fits. |
-| **UD-Q5_K_XL** | 19.6 GB | ~12.4 GB | Better quality, still generous context headroom |
-| **UD-Q6_K_XL** | 23.1 GB | ~8.9 GB | Best quality-to-fit ratio if you can live with ~64K context |
+| **Q4_K_M** | 16.7 GB | ~15.3 GB — maximum context | Default choice. 128K context fits. Best SSM layer protection at this size. |
+| **Q5_K_M** | 19.6 GB | ~12.4 GB | Better quality, still generous context headroom |
+| **Q6_K** | 22.5 GB | ~9.5 GB | Best quality-to-fit ratio if you can live with ~64K context |
 | **Q8_0** | 28.6 GB | ~3.4 GB | Maximum quality. Short context only. |
 
 For the full per-tensor comparison methodology and all 198 tensor differences, see the [GGUF Deep Dive](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) in the inference report.

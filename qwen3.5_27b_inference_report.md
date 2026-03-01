@@ -19,7 +19,8 @@
 | vLLM Docker image (Blackwell + Qwen 3.5) | `vllm/vllm-openai:qwen3_5-cu130` | — | [Docker Hub](https://hub.docker.com/r/vllm/vllm-openai/tags) — CUDA 13.0.1, sm_120 kernels, published Feb 23, 2026 UTC |
 | vLLM Docker image (Blackwell nightly) | `vllm/vllm-openai:cu130-nightly` | — | [Docker Hub](https://hub.docker.com/r/vllm/vllm-openai/tags) — CUDA 13.0.1, sm_120 kernels, updated daily |
 | Ollama registry GGUF (full file download) | `qwen3.5:27b-q4_K_M` | `sha256:7935de6e…` | 17,420,420,832 bytes, 1,307 tensors — standard Q4_K_M, includes vision encoder + MTP head |
-| Unsloth GGUF (full file download) | [`Qwen3.5-27B-Q4_K_M.gguf`](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) | — | 16,740,812,160 bytes, 851 tensors — custom imatrix + GDN/SSM layer protection, text-only |
+| Unsloth GGUF Q4_K_M (full file download) | [`Qwen3.5-27B-Q4_K_M.gguf`](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) | — | 16,740,812,160 bytes, 851 tensors — custom imatrix + GDN/SSM layer protection, text-only |
+| Unsloth GGUF UD-Q4_K_XL (full file download) | [`Qwen3.5-27B-UD-Q4_K_XL.gguf`](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) | — | 851 tensors — Unsloth Dynamic 2.0, Feb 24 upload (pre-fix), same size as Q4_K_M but different SSM layer tradeoffs |
 
 ---
 
@@ -114,7 +115,7 @@ Should set `presence_penalty: 1.5` per the [model card](https://huggingface.co/Q
 - [Bug Report Summary](#bug-report-summary) — **start here** for the four verified, bug-report-worthy findings
 
 1. [Model Overview](#1-model-overview)
-2. [VRAM Fit and Quantization Options](#2-vram-fit-and-quantization-options) — includes [GGUF Deep Dive: Ollama Registry vs Unsloth](#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) (per-tensor comparison from full file downloads, GDN/SSM layer protection, vision encoder trade-off, imatrix calibration, Modelfile instructions)
+2. [VRAM Fit and Quantization Options](#2-vram-fit-and-quantization-options) — includes [GGUF Deep Dive: Ollama Registry vs Unsloth](#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) (per-tensor comparison from full file downloads, GDN/SSM layer protection, vision encoder trade-off, imatrix calibration, Modelfile instructions) and [Q4_K_M vs UD-Q4_K_XL analysis](#q4_k_m-vs-ud-q4_k_xl-use-q4_k_m) (three-way tensor comparison showing Q4_K_M better protects SSM layers)
 3. [Recommended Inference Parameters](#3-recommended-inference-parameters)
 4. [vLLM Support Status](#4-vllm-support-status) — includes deep dive: quantization on 32 GB VRAM (4-bit checkpoint testing status), chat template architecture, `enable_thinking` passthrough, reasoning+tool parser handoff, tool call parser architecture, special token flags, model implementation
 5. [Ollama Support Status](#5-ollama-support-status)
@@ -294,7 +295,7 @@ Similar spread plus additional imatrix quants (IQ4_XS, IQ3_M, IQ2_M, etc.).
 | Q5_K_M | 19.4 GB | ~12.6 GB | High | Good for longer context |
 | **Q4_K_M** | **16.5 GB** | **~15.5 GB** | Good | Most context headroom |
 
-**Recommendation:** Start with **UD-Q6_K_XL from Unsloth** (23.1 GB) for best quality-to-fit ratio. If you need maximum context window, use **Q4_K_M from Unsloth** (16.7 GB) — NOT the Ollama registry GGUF. See the [GGUF comparison](#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) below for why.
+**Recommendation:** Use **Q4_K_M from Unsloth** (16.7 GB) for maximum context window with GDN/SSM layer protection — NOT the Ollama registry GGUF and NOT the UD-Q4_K_XL (see [Q4_K_M vs UD-Q4_K_XL analysis](#q4_k_m-vs-ud-q4_k_xl-use-q4_k_m) below). For best quality-to-fit ratio, use **Q6_K from Unsloth** (22.5 GB). See the [GGUF comparison](#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) below for why Unsloth over the Ollama registry.
 
 ### GGUF Deep Dive: Ollama Registry vs Unsloth — Use Unsloth
 
@@ -360,18 +361,12 @@ The Ollama registry GGUF (17.4 GB) contains 504 tensors not present in the Unslo
 
 #### How to Use the Unsloth GGUF With Ollama
 
-Download the Unsloth GGUF and create a model from it:
-
-```bash
-# Download (example for Q4_K_M — substitute UD-Q6_K_XL etc. as needed)
-curl -L https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf \
-  -o ~/models/Qwen3.5-27B-Q4_K_M.gguf
-```
+Ollama natively supports HuggingFace Hub references — no manual download needed. The GGUF is pulled and cached automatically on first use ([docs](https://huggingface.co/docs/hub/en/ollama)).
 
 Create a Modelfile:
 ```
-FROM ~/models/Qwen3.5-27B-Q4_K_M.gguf
-PARAMETER temperature 0.6
+FROM hf.co/unsloth/Qwen3.5-27B-GGUF:Q4_K_M
+PARAMETER temperature 1.0
 PARAMETER top_k 20
 PARAMETER top_p 0.95
 ```
@@ -391,6 +386,26 @@ Both the Ollama and Unsloth GGUFs for the 27B model contain the **same broken Ji
 Unsloth has fixed this template in their 35B-A3B GGUF uploads but **has NOT yet updated the 27B** — their docs page says "Re-download 122B, 27B once they're updated." A user on HuggingFace [asked for the 27B ETA](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/discussions/13) with no response as of March 1, 2026 UTC.
 
 **This is irrelevant to Ollama.** Ollama does not use the GGUF-embedded Jinja2 template — it has hardcoded Go renderers selected by `renderer: "qwen3.5"` in the model config. The Jinja template is only used by `llama-server --jinja` (direct llama.cpp usage). The llama.cpp side has its own fix ([PR #19635](https://github.com/ggml-org/llama.cpp/pull/19635)) that resolves the crash engine-side.
+
+#### Q4_K_M vs UD-Q4_K_XL — Use Q4_K_M
+
+> **Verified March 1, 2026 UTC.** All three GGUF files (Ollama registry, Unsloth Q4_K_M, Unsloth UD-Q4_K_XL) were downloaded and every tensor's quantization type was compared. The UD-Q4_K_XL analysis below is based on the Feb 24, 2026 upload — the only version available as of this writing.
+
+Unsloth's `UD-Q4_K_XL` (Unsloth Dynamic 2.0) and `Q4_K_M` are the same file size (16.7 GB) from the same [Unsloth repository](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF), but they make **opposite tradeoffs** on the GDN/SSM layers. 192 of 851 tensors differ — all in the same four tensor types across all 48 GDN blocks:
+
+| Tensor (48 GDN blocks each) | Ollama registry | Unsloth Q4_K_M | Unsloth UD-Q4_K_XL | What it is |
+|------------------------------|-----------------|----------------|---------------------|------------|
+| **`attn_qkv`** | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | **Q5_K (5.5 bpw)** | GDN linear attention input — both Unsloth variants protect this |
+| **`attn_gate`** | Q4_K (4.5 bpw) | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | Attention gate — UD upgrades this, Q4_K_M leaves it at Q4_K |
+| **`ssm_out`** | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | Q4_K (4.5 bpw) | SSM output projection — Q4_K_M protects, UD does NOT |
+| **`ssm_alpha`** | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | Q4_K (4.5 bpw) | SSM temporal decay — Q4_K_M keeps at nearly 2× precision, UD drops to Q4_K |
+| **`ssm_beta`** | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | Q4_K (4.5 bpw) | SSM input gate — same story as alpha |
+
+**Q4_K_M wins on the most quantization-sensitive layers.** `ssm_alpha` and `ssm_beta` at Q8_0 (8.5 bpw) vs Q4_K (4.5 bpw) is nearly double the precision on the tiny tensors that control the SSM's temporal memory dynamics. `ssm_out` at Q5_K vs Q4_K is a +1 bpw upgrade on the tensor Unsloth's own benchmarks found "dramatically increases KLD" when quantized. UD-Q4_K_XL trades all of this away to upgrade `attn_gate` from Q4_K to Q5_K — a less impactful trade.
+
+Both variants agree on `attn_qkv` (Q5_K) and everything outside the GDN blocks — the difference is purely in how they allocate the bit budget within the SSM layers.
+
+**Note on UD re-upload status:** As of March 1, 2026 UTC, Unsloth has [flagged the 27B UD GGUFs for re-upload](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) ("112B, 27B still converting, re-download once updated") following an [MXFP4 bug fix](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/5) applied to the 35B-A3B MoE model. The MXFP4 bug was about expert routing tensors in MoE models — the dense 27B has no MoE layers, so it likely isn't affected. However, the UD quantization recipe may change after re-upload. Until then, Q4_K_M is the safer and empirically better choice for the SSM-sensitive layers.
 
 ---
 
