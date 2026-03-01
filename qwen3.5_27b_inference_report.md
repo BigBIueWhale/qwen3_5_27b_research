@@ -1,6 +1,6 @@
 # Qwen 3.5 27B Dense Language Model — Inference Library Support Report
 
-**Date:** February 27, 2026 UTC (updated from February 26, 2026 UTC)
+**Date:** March 1, 2026 UTC (GGUF comparison added; original report February 27, 2026 UTC)
 **Target Hardware:** NVIDIA RTX 5090 graphics card (32 GB VRAM — Video Random Access Memory)
 **Model:** Qwen 3.5 27B dense language model (all 27 billion parameters active every forward pass)
 **Inference Libraries Evaluated:** vLLM inference server, Ollama inference framework (+ llama.cpp C++ backend)
@@ -18,6 +18,8 @@
 | vLLM inference server (nightly, used in this report) | nightly (post-v0.16.1rc0) | `a1f53ad` | [vllm-project/vllm@a1f53ad](https://github.com/vllm-project/vllm/tree/a1f53addb132f75704710184f4c1cc4780343329) |
 | vLLM Docker image (Blackwell + Qwen 3.5) | `vllm/vllm-openai:qwen3_5-cu130` | — | [Docker Hub](https://hub.docker.com/r/vllm/vllm-openai/tags) — CUDA 13.0.1, sm_120 kernels, published Feb 23, 2026 UTC |
 | vLLM Docker image (Blackwell nightly) | `vllm/vllm-openai:cu130-nightly` | — | [Docker Hub](https://hub.docker.com/r/vllm/vllm-openai/tags) — CUDA 13.0.1, sm_120 kernels, updated daily |
+| Ollama registry GGUF (full file download) | `qwen3.5:27b-q4_K_M` | `sha256:7935de6e…` | 17,420,420,832 bytes, 1,307 tensors — standard Q4_K_M, includes vision encoder + MTP head |
+| Unsloth GGUF (full file download) | [`Qwen3.5-27B-Q4_K_M.gguf`](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) | — | 16,740,812,160 bytes, 851 tensors — custom imatrix + GDN/SSM layer protection, text-only |
 
 ---
 
@@ -112,7 +114,7 @@ Should set `presence_penalty: 1.5` per the [model card](https://huggingface.co/Q
 - [Bug Report Summary](#bug-report-summary) — **start here** for the four verified, bug-report-worthy findings
 
 1. [Model Overview](#1-model-overview)
-2. [VRAM Fit and Quantization Options](#2-vram-fit-and-quantization-options)
+2. [VRAM Fit and Quantization Options](#2-vram-fit-and-quantization-options) — includes [GGUF Deep Dive: Ollama Registry vs Unsloth](#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) (per-tensor comparison from full file downloads, GDN/SSM layer protection, vision encoder trade-off, imatrix calibration, Modelfile instructions)
 3. [Recommended Inference Parameters](#3-recommended-inference-parameters)
 4. [vLLM Support Status](#4-vllm-support-status) — includes deep dive: quantization on 32 GB VRAM (4-bit checkpoint testing status), chat template architecture, `enable_thinking` passthrough, reasoning+tool parser handoff, tool call parser architecture, special token flags, model implementation
 5. [Ollama Support Status](#5-ollama-support-status)
@@ -292,7 +294,103 @@ Similar spread plus additional imatrix quants (IQ4_XS, IQ3_M, IQ2_M, etc.).
 | Q5_K_M | 19.4 GB | ~12.6 GB | High | Good for longer context |
 | **Q4_K_M** | **16.5 GB** | **~15.5 GB** | Good | Most context headroom |
 
-**Recommendation:** Start with **UD-Q6_K_XL from Unsloth** (23.1 GB) for best quality-to-fit ratio. If you need maximum context window, use Q4_K_M (16.5 GB).
+**Recommendation:** Start with **UD-Q6_K_XL from Unsloth** (23.1 GB) for best quality-to-fit ratio. If you need maximum context window, use **Q4_K_M from Unsloth** (16.7 GB) — NOT the Ollama registry GGUF. See the [GGUF comparison](#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) below for why.
+
+### GGUF Deep Dive: Ollama Registry vs Unsloth — Use Unsloth
+
+> **Verified March 1, 2026 UTC.** Both full GGUF files were downloaded and every tensor's quantization type was extracted and compared. This is not inference from documentation — it is ground truth from the actual model files.
+>
+> - Ollama registry: `sha256:7935de6e…` (17,420,420,832 bytes, 1,307 tensors)
+> - Unsloth Q4_K_M: [`Qwen3.5-27B-Q4_K_M.gguf`](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) (16,740,812,160 bytes, 851 tensors)
+
+**The Ollama registry GGUF uses standard llama.cpp Q4_K_M quantization. Unsloth's "Q4_K_M" is not standard — it systematically protects the GDN/SSM layers that define Qwen 3.5's novel hybrid architecture.** Both files say "Q4_K_M" on the label. The contents are meaningfully different in exactly the places that matter for model intelligence.
+
+#### Per-Tensor Quantization Differences (198 of 803 common tensors differ)
+
+| Tensor | Blocks | Ollama Q4_K_M | Unsloth Q4_K_M | What it does | Why it matters |
+|--------|--------|---------------|----------------|--------------|----------------|
+| **`attn_qkv`** | all 48 GDN blocks | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | Input projection for Gated DeltaNet linear attention | This IS the GDN mechanism. Quantizing it to 4-bit degrades the novel architecture that makes Qwen 3.5 different from a standard transformer. **+300 MB well spent.** |
+| **`ssm_out`** | all 48 GDN blocks | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | Output projection from GDN state-space layer | Unsloth's KL divergence benchmarks found this tensor "dramatically increases KLD" when aggressively quantized. **+180 MB well spent.** |
+| **`ssm_alpha`** | all 48 GDN blocks | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | State-space decay parameter (controls how fast SSM memory fades) | Tiny tensor (245K params) but controls the SSM's temporal memory dynamics. Negligible size cost for 2× the precision. **+5.6 MB.** |
+| **`ssm_beta`** | all 48 GDN blocks | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | State-space input gate (controls what enters SSM memory) | Same story as `ssm_alpha` — tiny, sensitive, nearly free to protect. **+5.6 MB.** |
+| `attn_v` | 6 of 16 attention blocks (35,39,47,51,59,63) | Q6_K (6.6 bpw) | Q4_K (4.5 bpw) | Value projection in standard attention layers | Unsloth downgrades 6 late attention blocks to partially fund the GDN upgrades. **-7.7 MB.** Acceptable trade — these are standard transformer attention layers, not the novel architecture. |
+
+**Net size cost: +484 MB for the text model.** Unsloth's Q4_K_M is 484 MB larger than standard Q4_K_M *in text model weight alone*, because the GDN/SSM layers are kept at higher precision.
+
+#### Tensors Never Quantized (F32 in both files, correctly)
+
+Both files keep these at full 32-bit precision — as they should:
+
+| Tensor | Count | Why F32 is correct |
+|--------|-------|--------------------|
+| All `*_norm.weight` | 128 | RMSNorm weights — tiny, quantization destroys layer normalization |
+| `ssm_a` | 48 | State-space diagonal matrix — 48 params per block, quantization is pointless |
+| `ssm_conv1d` | 48 | 1D convolution kernel — small, critical for SSM temporal processing |
+| `ssm_dt` / `ssm_dt.bias` | 48 | Delta-time step bias — 48 params per block |
+
+#### Independent Corroboration: Qwen's Own Guidance Says the Same Thing
+
+Unsloth arrived at this recipe through KL divergence benchmarking of 150+ configurations. The official Qwen team's [`llm-compressor` guidance](https://huggingface.co/Qwen/Qwen3.5-27B) for vLLM quantization independently recommends: **`ignore=["re:.*linear_attn.*"]`** — skip all GDN layers during quantization entirely. Same conclusion, different methodology. The GDN layers are the most quantization-sensitive components in this architecture, and the standard Q4_K_M recipe in llama.cpp has no awareness of this.
+
+#### Unsloth Also Uses a Custom Imatrix (Chat/Tool-Calling Calibration)
+
+Standard GGUF quantization uses no importance matrix. Unsloth calibrates with a proprietary ~901K-token dataset (`unsloth_calibration_Qwen3.5-27B.txt`) focused on chat and tool-calling, not Wikipedia. This weights the quantization process toward conversational accuracy rather than generic perplexity, benefiting ALL tensors — not just the ones with explicit type overrides. The imatrix is available at [`imatrix_unsloth.gguf_file`](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/imatrix_unsloth.gguf_file) in the Unsloth repository.
+
+#### What Ollama's GGUF Has That Unsloth's Doesn't
+
+The Ollama registry GGUF (17.4 GB) contains 504 tensors not present in the Unsloth file (16.7 GB):
+
+| Component | Extra tensors | Type | Size | Worth it? |
+|-----------|---------------|------|------|-----------|
+| **Vision encoder** | 441 | F16 weights, F32 biases | ~450 MB | **No.** Qwen 3.5 27B vision is a bolt-on ViT — it works, but on a 32 GB card every MB of VRAM spent on vision weights is a MB NOT available for KV cache. If you need vision, use a dedicated multimodal model or run vLLM with the separate mmproj file. For text intelligence, the vision encoder is dead weight. |
+| **MTP head** | 15 | Q4_K/Q6_K/F32 | ~80 MB | **Marginal.** Multi-Token Prediction enables speculative decoding (faster inference, not smarter). Ollama does not use MTP as of v0.17.4. The tensors exist in the GGUF but are ignored by the runner. |
+| **`ssm_dt` naming** | 48 | F32 | negligible | Naming difference: Ollama has `ssm_dt`, Unsloth has `ssm_dt.bias`. Functionally equivalent. |
+
+**Verdict: The 648 MB size premium of the Ollama GGUF buys you an unused vision encoder and an unused MTP head. The 484 MB size premium of the Unsloth GGUF buys you measurably better GDN/SSM layer quality — the exact layers that define this model's intelligence advantage over standard transformers.**
+
+#### Additional GGUF Metadata Differences
+
+| Metadata | Ollama GGUF | Unsloth GGUF | Impact |
+|----------|-------------|--------------|--------|
+| `head_count_kv` | Per-layer array (64 values, 0 for GDN, 4 for attention) | Single value: 4 | Ollama's encoding is more correct for the hybrid architecture. llama.cpp resolves this via `full_attention_interval=4` — both work. |
+| `ssm.v_head_reordered` | `True` | Missing | Indicates optimized SSM value head layout. Present in newer conversions. Verify inference output is coherent when using Unsloth GGUF. |
+| `rope.mrope_interleaved` | `True` | Missing | Multi-scale RoPE interleaving flag. Again, should be inferred from architecture, but explicitly present only in Ollama's GGUF. |
+| `eos_token_ids` | `[248046, 248044]` | `248046` only | Ollama's includes both `<\|im_end\|>` and `<\|endoftext\|>` as EOS. Unsloth only lists `<\|im_end\|>`. Not a problem in practice since the Go-based runner reads this from the GGUF directly. |
+| Sampling defaults | Not embedded | `temp=0.6, top_k=20, top_p=0.95` | Unsloth embeds Qwen's "precise coding" defaults. Ollama's params blob overrides these anyway. |
+
+#### How to Use the Unsloth GGUF With Ollama
+
+Download the Unsloth GGUF and create a model from it:
+
+```bash
+# Download (example for Q4_K_M — substitute UD-Q6_K_XL etc. as needed)
+curl -L https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf \
+  -o ~/models/Qwen3.5-27B-Q4_K_M.gguf
+```
+
+Create a Modelfile:
+```
+FROM ~/models/Qwen3.5-27B-Q4_K_M.gguf
+PARAMETER temperature 0.6
+PARAMETER top_k 20
+PARAMETER top_p 0.95
+```
+
+Import into Ollama:
+```bash
+ollama create qwen3.5-unsloth -f Modelfile
+ollama run qwen3.5-unsloth
+```
+
+Ollama will detect the `qwen35` architecture from the GGUF metadata and use the `qwen3.5` renderer/parser (or your fixed versions if running the patched fork). No `RENDERER` directive needed in the Modelfile — the architecture detection handles it automatically.
+
+#### Upstream Chat Template Bug in Both GGUFs (Irrelevant to Ollama)
+
+Both the Ollama and Unsloth GGUFs for the 27B model contain the **same broken Jinja2 chat template** (7,756 bytes, byte-for-byte identical) from upstream [Qwen/Qwen3.5-27B `tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json). The bug: `tool_call.arguments|items` crashes llama.cpp's minja engine when arguments arrive as a JSON string instead of a parsed dict ([llama.cpp issue #19872](https://github.com/ggml-org/llama.cpp/issues/19872), [Qwen/Qwen3.5-35B-A3B discussion #4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/discussions/4)).
+
+Unsloth has fixed this template in their 35B-A3B GGUF uploads but **has NOT yet updated the 27B** — their docs page says "Re-download 122B, 27B once they're updated." A user on HuggingFace [asked for the 27B ETA](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/discussions/13) with no response as of March 1, 2026 UTC.
+
+**This is irrelevant to Ollama.** Ollama does not use the GGUF-embedded Jinja2 template — it has hardcoded Go renderers selected by `renderer: "qwen3.5"` in the model config. The Jinja template is only used by `llama-server --jinja` (direct llama.cpp usage). The llama.cpp side has its own fix ([PR #19635](https://github.com/ggml-org/llama.cpp/pull/19635)) that resolves the crash engine-side.
 
 ---
 
@@ -1216,67 +1314,9 @@ With approximately 14 GB available after recurrent state overhead, the theoretic
 
 ## 11. Ollama Inference Framework Per-Use-Case Parameter Settings
 
-### Thinking Mode — General (default, model bakes these in)
+The four sampling profiles from the [Qwen 3.5 27B model card](https://huggingface.co/Qwen/Qwen3.5-27B#best-practices) are documented in [Section 3](#3-recommended-inference-parameters) above. For complete, copy-paste-ready Ollama API request bodies with all necessary overrides (`repeat_penalty`, `presence_penalty`, `num_ctx`, `num_predict`), see [`solution.md`](solution.md#all-four-parameter-profiles).
 
-```json
-{
-  "options": {
-    "temperature": 1.0,
-    "top_k": 20,
-    "top_p": 0.95,
-    "num_ctx": 32768
-  }
-}
-```
-
-Already baked in to the Ollama model registry params blob — no need to set unless overriding. Note: `presence_penalty=1.5` is recommended by the Qwen 3.5 model card on HuggingFace but **cannot be applied** (the Ollama Go-based runner silently ignores it — see [Bug 1](#7-ollama-critical-bug-missing-penalty-sampling)).
-
-### Thinking Mode — Precise Coding
-
-```json
-{
-  "options": {
-    "temperature": 0.6,
-    "top_k": 20,
-    "top_p": 0.95,
-    "num_ctx": 32768
-  }
-}
-```
-
-Override temperature from 1.0 to 0.6. The Qwen 3.5 model card says `presence_penalty=0.0` for precise coding, which is the effective value anyway (since the Ollama Go-based runner ignores it).
-
-### Non-Thinking Mode — General
-
-```json
-{
-  "options": {
-    "temperature": 0.7,
-    "top_k": 20,
-    "top_p": 0.8,
-    "num_ctx": 32768
-  },
-  "think": false
-}
-```
-
-Override temperature and top_p. **Warning:** `think: false` is reportedly broken ([Ollama issue #14418](https://github.com/ollama/ollama/issues/14418)), but as noted, thinking-always-on is desirable for agentic use. The Qwen 3.5 model card recommends `presence_penalty=1.5` — impossible to apply in the Ollama inference framework (see [Bug 1](#7-ollama-critical-bug-missing-penalty-sampling)).
-
-### Non-Thinking Mode — Heavy Reasoning
-
-```json
-{
-  "options": {
-    "temperature": 1.0,
-    "top_k": 40,
-    "top_p": 1.0,
-    "num_ctx": 32768
-  },
-  "think": false
-}
-```
-
-The Qwen 3.5 model card recommends `presence_penalty=2.0` — impossible to apply in the Ollama inference framework (see [Bug 1](#7-ollama-critical-bug-missing-penalty-sampling)).
+**Key notes for upstream Ollama (without the fork fixes):** The parameter profiles in Section 3 include `presence_penalty` values (1.5 for general, 0.0 for precise coding, 2.0 for hard reasoning). These are **silently ignored** by upstream Ollama's Go-based runner — see [Bug 1](#7-ollama-critical-bug-missing-penalty-sampling). The [fork](https://github.com/BigBIueWhale/ollama) fixes this.
 
 ---
 
@@ -1573,6 +1613,19 @@ Note: The upstream llama.cpp commit (`723c710`) is NOT the same as the Ollama-pi
 - [Issue #19869 — Chat Parsing Crash](https://github.com/ggml-org/llama.cpp/issues/19869)
 - [Issue #19872 — Template `arguments|items` Filter Failure](https://github.com/ggml-org/llama.cpp/issues/19872)
 - [PR #19635 — Template Detection Fix](https://github.com/ggml-org/llama.cpp/pull/19635)
+
+### Unsloth GGUF Quantization (per-tensor analysis, March 1, 2026 UTC)
+- [unsloth/Qwen3.5-27B-GGUF](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) — full file downloaded (16,740,812,160 bytes, 851 tensors) for per-tensor comparison
+- [Unsloth Qwen3.5 GGUF Benchmarks](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) — KL divergence per-tensor analysis, MXFP4 retirement
+- [Unsloth Dynamic 2.0 Documentation](https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs) — per-layer quantization methodology
+- [Unsloth Dynamic v2.0 Blog Post](https://unsloth.ai/blog/dynamic-v2) — calibration dataset, optimization goals
+- [Unsloth Qwen3.5 How-to Guide](https://unsloth.ai/docs/models/qwen3.5) — tool-calling template fix announcement, "Re-download 122B, 27B once they're updated"
+- [HuggingFace discussion: Qwen3.5-35B-A3B Feb 27 GGUF update + template diff](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/10)
+- [HuggingFace discussion: Upstream Qwen tool calling template is broken](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/discussions/4) — `|items` filter bug, NOT fixed upstream as of March 1, 2026 UTC
+- [HuggingFace discussion: 27B update ETA inquiry (unanswered)](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/discussions/13)
+- [HuggingFace discussion: Bug in UD-Q4_K_XL recipe using MXFP4 for attn tensors](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/5)
+- [llama.cpp `--tensor-type` per-tensor override discussion](https://github.com/ggml-org/llama.cpp/discussions/12741)
+- [Ollama GitHub Issue #10222 — Support Jinja chat templates](https://github.com/ollama/ollama/issues/10222) — OPEN since April 2025, no PRs, no timeline
 
 ### News Coverage
 - [MarkTechPost — Qwen 3.5 Medium Series](https://www.marktechpost.com/2026/02/24/alibaba-qwen-team-releases-qwen-3-5-medium-model-series-a-production-powerhouse-proving-that-smaller-ai-models-are-smarter/)
