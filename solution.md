@@ -10,78 +10,43 @@ For full source-level evidence of each bug, see the [inference report](https://g
 
 ---
 
-## Use the Unsloth GGUF, Not `ollama pull`
+## Use the Ollama Registry Model
 
-**Do not use `ollama pull qwen3.5:27b-q4_K_M`.** The Ollama registry GGUF uses standard llama.cpp Q4_K_M quantization, which treats every layer the same — including the Gated DeltaNet (GDN) layers that are Qwen 3.5's key architectural innovation. These are the most quantization-sensitive components in the model, and quantizing them to 4-bit measurably degrades intelligence.
-
-**Use [Unsloth's Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) instead.** Unsloth's Q4_K_M protects the GDN/SSM layers at higher precision, and uses a custom chat/tool-calling calibration dataset (imatrix) instead of generic Wikipedia text. Same file size as the Ollama registry GGUF, significantly better quality on the layers that matter.
-
-### Why Q4_K_M, not UD-Q4_K_XL?
-
-Both are 16.7 GB from the same Unsloth repo, but they make **opposite tradeoffs** on the quantization-sensitive GDN/SSM layers. We downloaded and compared all three GGUFs tensor-by-tensor (March 1, 2026 UTC):
-
-| Tensor (48 GDN blocks each) | Ollama registry | Unsloth Q4_K_M | Unsloth UD-Q4_K_XL |
-|------------------------------|-----------------|----------------|---------------------|
-| **`attn_qkv`** — GDN linear attention | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | **Q5_K (5.5 bpw)** |
-| **`attn_gate`** — attention gate | Q4_K (4.5 bpw) | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** |
-| **`ssm_out`** — SSM output projection | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | Q4_K (4.5 bpw) |
-| **`ssm_alpha`** — SSM temporal decay | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | Q4_K (4.5 bpw) |
-| **`ssm_beta`** — SSM input gate | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | Q4_K (4.5 bpw) |
-
-**Q4_K_M wins on the most sensitive layers.** It keeps `ssm_alpha`/`ssm_beta` at Q8_0 (nearly double precision vs Q4_K) and `ssm_out` at Q5_K. UD-Q4_K_XL trades all of that away to upgrade `attn_gate` from Q4_K to Q5_K — a much less impactful tensor.
-
-Qwen's own official [`llm-compressor` guidance](https://huggingface.co/Qwen/Qwen3.5-27B) independently confirms SSM layers are the priority: `ignore=["re:.*linear_attn.*"]` — skip all GDN layers during quantization.
-
-**Note:** As of March 1, 2026, Unsloth has [flagged the 27B UD GGUFs for re-upload](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) ("112B, 27B still converting, re-download once updated") following an [MXFP4 bug fix](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/5) applied to the 35B-A3B. The current 27B files are from Feb 24 (pre-fix). The UD variants may improve after the re-upload, but until then Q4_K_M is the better choice.
-
-### What You Lose
-
-The Ollama registry GGUF bundles a **vision encoder** (441 tensors, ~450 MB) and **MTP head** (15 tensors, ~80 MB) inside the main GGUF that the Unsloth text GGUF doesn't have. Neither is worth keeping:
-
-- **Vision:** On a 32 GB card, every MB of VRAM spent on vision weights is a MB not available for KV cache. If you need vision, use a dedicated multimodal model or vLLM with the separate mmproj file. For text intelligence, the vision encoder is dead weight. Note: the Unsloth HF repo does include a separate 927 MB CLIP vision projector GGUF, but using it via `FROM hf.co/...` is what causes the fatal loading failure (see Setup above) — downloading just the text GGUF avoids this entirely.
-- **MTP (Multi-Token Prediction):** Enables speculative decoding (faster inference, not smarter). Ollama doesn't use it as of v0.17.4. The tensors exist in the GGUF but are ignored.
+**Use `ollama pull qwen3.5:27b-q4_K_M`.** The Ollama registry model works out of the box — correct GGUF metadata, built-in chat template with tool calling, and no setup complications. Testing on AIME-level math and a hard geometry/number-theory proof problem showed **no observable quality difference** between the registry GGUF and [Unsloth's Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF). On the hardest problem tested (existence of a constrained decagon — requiring algebraic number theory), the registry model actually produced a stronger proof, correctly invoking the Lam-Leung theorem for a tight impossibility bound.
 
 ### Setup
 
-**Do not use `FROM hf.co/unsloth/Qwen3.5-27B-GGUF:Q4_K_M` in your Modelfile.** Ollama's HuggingFace pull uses the OCI registry manifest, and Unsloth's manifest for the `Q4_K_M` tag bundles both the 16.7 GB text model GGUF and a 927 MB CLIP vision projector GGUF (`general.type = "mmproj"`). The text-only Unsloth GGUF has no vision capability, but the projector gets packaged into the model manifest as an `application/vnd.ollama.image.projector` layer. This causes a fatal loading failure: the Go engine refuses to load models with projectors (`"split vision models aren't supported"` in `llm/server.go`), falls back to the llama.cpp C++ backend, which doesn't recognize the `qwen35` architecture at all — dead end.
-
-Download just the text GGUF directly and point the Modelfile at it:
-
 ```bash
-# Download the text-only GGUF (skips the vision projector that breaks ollama):
-wget -O /tmp/Qwen3.5-27B-Q4_K_M.gguf \
-  https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf
+ollama pull qwen3.5:27b-q4_K_M
 
 cat > Modelfile << 'EOF'
-FROM /tmp/Qwen3.5-27B-Q4_K_M.gguf
+FROM qwen3.5:27b-q4_K_M
 
-# Required: Ollama's built-in Qwen 3.5 chat template with tool calling support.
-# Without RENDERER/PARSER, the HuggingFace GGUF gets a bare {{ .Prompt }} template
-# and tool calling silently breaks. The Ollama registry model includes these
-# automatically, but custom models from local GGUFs do not.
-TEMPLATE {{ .Prompt }}
-RENDERER qwen3.5
-PARSER qwen3.5
-
+PARAMETER num_ctx 131072
+PARAMETER num_predict 81920
 PARAMETER temperature 1.0
 PARAMETER top_k 20
 PARAMETER top_p 0.95
+PARAMETER repeat_penalty 1.0
+PARAMETER presence_penalty 1.5
 EOF
-ollama create qwen3.5-unsloth -f Modelfile
+ollama create qwen3.5-custom -f Modelfile
 ```
 
-**Important:** The `TEMPLATE`, `RENDERER`, and `PARSER` directives are mandatory for non-registry GGUFs. Ollama registry models (`ollama pull qwen3.5:...`) bundle these automatically, but local GGUFs do not — without them, the model gets a bare `{{ .Prompt }}` template and tool calling silently breaks.
+The registry model includes `TEMPLATE`, `RENDERER qwen3.5`, and `PARSER qwen3.5` automatically — no need to specify them in the Modelfile. The Modelfile only overrides sampling parameters that Ollama gets wrong by default (see [Parameters You Must Override](#parameters-you-must-override)).
 
-### Higher Quality Options (if context length allows)
+### Why Not Unsloth?
 
-| Unsloth GGUF | Size | VRAM left for KV cache | When to use |
-|---|---|---|---|
-| **Q4_K_M** | 16.7 GB | ~15.3 GB — maximum context | Default choice. 128K context fits. Best SSM layer protection at this size. |
-| **Q5_K_M** | 19.6 GB | ~12.4 GB | Better quality, still generous context headroom |
-| **Q6_K** | 22.5 GB | ~9.5 GB | Best quality-to-fit ratio if you can live with ~64K context |
-| **Q8_0** | 28.6 GB | ~3.4 GB | Maximum quality. Short context only. |
+[Unsloth's Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) protects the GDN/SSM layers at higher precision (Q8_0 for `ssm_alpha`/`ssm_beta` vs Q4_K in the registry GGUF) and uses a chat/tool-calling calibration dataset. On paper this should matter — Qwen's own [`llm-compressor` guidance](https://huggingface.co/Qwen/Qwen3.5-27B) says to skip GDN layers during quantization. In practice, we tested both GGUFs on the same problems and could not measure a difference.
 
-For the full per-tensor comparison methodology and all 198 tensor differences, see the [GGUF Deep Dive](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) in the inference report.
+The Unsloth GGUF also has significant setup friction:
+- **`FROM hf.co/...` is broken** — Unsloth's OCI manifest bundles a 927 MB CLIP vision projector alongside the text GGUF, causing a fatal `"split vision models aren't supported"` error in Ollama's Go engine. Must use `wget` to download the text GGUF directly.
+- **Missing GGUF metadata** — third-party GGUFs lack `ssm.v_head_reordered` and store `head_count_kv` as a scalar instead of a per-layer array. Requires [this fork's compatibility fixes](third_party_gguf_compatibility.md) or the model produces garbage output.
+- **No chat template** — must manually add `TEMPLATE {{ .Prompt }}`, `RENDERER qwen3.5`, `PARSER qwen3.5` or tool calling silently breaks.
+
+The registry model has none of these issues.
+
+For the full per-tensor comparison (all 198 tensor differences between the three GGUFs), see the [GGUF Deep Dive](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) in the inference report.
 
 ---
 
@@ -179,7 +144,7 @@ TOOLS = [
 
 def call_api(messages):
     payload = json.dumps({
-        "model": "qwen3.5-unsloth",
+        "model": "qwen3.5-custom",
         "messages": messages,
         "tools": TOOLS,
         "temperature": 1.0,
@@ -237,7 +202,7 @@ print(r2["choices"][0]["message"]["content"])
 
 ```bash
 curl http://localhost:11434/api/chat -d '{
-  "model": "qwen3.5-unsloth",
+  "model": "qwen3.5-custom",
   "messages": [
     {"role": "user", "content": "Solve: Find all integers n such that n^2 + 2n + 4 is divisible by 7."}
   ],
@@ -373,7 +338,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="qwen3.5-unsloth",
+    model="qwen3.5-custom",
     messages=[{"role": "user", "content": "Hello"}],
     temperature=1.0,
     top_p=0.95,
@@ -390,7 +355,7 @@ response = client.chat.completions.create(
 
 - [Qwen 3.5 27B Model Card](https://huggingface.co/Qwen/Qwen3.5-27B) — parameter profiles, output length recommendations
 - [Qwen 3.5 27B Chat Template](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json) — ground truth Qwen3-Coder XML tool calling format
-- [unsloth/Qwen3.5-27B-GGUF](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) — recommended GGUF with GDN/SSM layer protection
+- [unsloth/Qwen3.5-27B-GGUF](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) — alternative GGUF with GDN/SSM layer protection (not recommended, see [Why Not Unsloth?](#why-not-unsloth))
 - [Unsloth Qwen3.5 GGUF Benchmarks](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) — per-tensor KL divergence analysis
 - [Inference Report — GGUF Deep Dive](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) — full per-tensor comparison from downloaded files
 - [Inference Report — Full Bug Analysis](https://github.com/BigBIueWhale/qwen3_5_27b_research/blob/master/qwen3.5_27b_inference_report.md) — source-level evidence for all four bugs
