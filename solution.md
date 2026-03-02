@@ -36,23 +36,29 @@ Qwen's own official [`llm-compressor` guidance](https://huggingface.co/Qwen/Qwen
 
 ### What You Lose
 
-The Ollama registry GGUF bundles a **vision encoder** (441 tensors, ~450 MB) and **MTP head** (15 tensors, ~80 MB) that the Unsloth GGUF doesn't have. Neither is worth keeping:
+The Ollama registry GGUF bundles a **vision encoder** (441 tensors, ~450 MB) and **MTP head** (15 tensors, ~80 MB) inside the main GGUF that the Unsloth text GGUF doesn't have. Neither is worth keeping:
 
-- **Vision:** On a 32 GB card, every MB of VRAM spent on vision weights is a MB not available for KV cache. If you need vision, use a dedicated multimodal model or vLLM with the separate mmproj file. For text intelligence, the vision encoder is dead weight.
+- **Vision:** On a 32 GB card, every MB of VRAM spent on vision weights is a MB not available for KV cache. If you need vision, use a dedicated multimodal model or vLLM with the separate mmproj file. For text intelligence, the vision encoder is dead weight. Note: the Unsloth HF repo does include a separate 927 MB CLIP vision projector GGUF, but using it via `FROM hf.co/...` is what causes the fatal loading failure (see Setup above) — downloading just the text GGUF avoids this entirely.
 - **MTP (Multi-Token Prediction):** Enables speculative decoding (faster inference, not smarter). Ollama doesn't use it as of v0.17.4. The tensors exist in the GGUF but are ignored.
 
 ### Setup
 
-Ollama natively supports HuggingFace Hub references — no manual download needed. The GGUF is pulled and cached automatically on first use.
+**Do not use `FROM hf.co/unsloth/Qwen3.5-27B-GGUF:Q4_K_M` in your Modelfile.** Ollama's HuggingFace pull uses the OCI registry manifest, and Unsloth's manifest for the `Q4_K_M` tag bundles both the 16.7 GB text model GGUF and a 927 MB CLIP vision projector GGUF (`general.type = "mmproj"`). The text-only Unsloth GGUF has no vision capability, but the projector gets packaged into the model manifest as an `application/vnd.ollama.image.projector` layer. This causes a fatal loading failure: the Go engine refuses to load models with projectors (`"split vision models aren't supported"` in `llm/server.go`), falls back to the llama.cpp C++ backend, which doesn't recognize the `qwen35` architecture at all — dead end.
+
+Download just the text GGUF directly and point the Modelfile at it:
 
 ```bash
+# Download the text-only GGUF (skips the vision projector that breaks ollama):
+wget -O /tmp/Qwen3.5-27B-Q4_K_M.gguf \
+  https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf
+
 cat > Modelfile << 'EOF'
-FROM hf.co/unsloth/Qwen3.5-27B-GGUF:Q4_K_M
+FROM /tmp/Qwen3.5-27B-Q4_K_M.gguf
 
 # Required: Ollama's built-in Qwen 3.5 chat template with tool calling support.
 # Without RENDERER/PARSER, the HuggingFace GGUF gets a bare {{ .Prompt }} template
 # and tool calling silently breaks. The Ollama registry model includes these
-# automatically, but custom models from hf.co/ GGUFs do not.
+# automatically, but custom models from local GGUFs do not.
 TEMPLATE {{ .Prompt }}
 RENDERER qwen3.5
 PARSER qwen3.5
@@ -64,7 +70,7 @@ EOF
 ollama create qwen3.5-unsloth -f Modelfile
 ```
 
-**Important:** The `TEMPLATE`, `RENDERER`, and `PARSER` directives are mandatory for HuggingFace-sourced GGUFs. Ollama registry models (`ollama pull qwen3.5:...`) bundle these automatically, but `hf.co/` GGUFs do not — without them, the model gets a bare `{{ .Prompt }}` template and tool calling silently breaks. The `hf.co/` prefix works in both CLI commands and Modelfile `FROM` directives ([docs](https://huggingface.co/docs/hub/en/ollama)).
+**Important:** The `TEMPLATE`, `RENDERER`, and `PARSER` directives are mandatory for non-registry GGUFs. Ollama registry models (`ollama pull qwen3.5:...`) bundle these automatically, but local GGUFs do not — without them, the model gets a bare `{{ .Prompt }}` template and tool calling silently breaks.
 
 ### Higher Quality Options (if context length allows)
 

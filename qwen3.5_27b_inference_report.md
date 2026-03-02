@@ -361,11 +361,19 @@ The Ollama registry GGUF (17.4 GB) contains 504 tensors not present in the Unslo
 
 #### How to Use the Unsloth GGUF With Ollama
 
-Ollama natively supports HuggingFace Hub references — no manual download needed. The GGUF is pulled and cached automatically on first use ([docs](https://huggingface.co/docs/hub/en/ollama)).
+**Do not use `FROM hf.co/unsloth/Qwen3.5-27B-GGUF:Q4_K_M` in your Modelfile.** Ollama's HuggingFace pull uses the OCI registry manifest, and Unsloth's manifest for the `Q4_K_M` tag bundles both the 16.7 GB text model GGUF and a 927 MB CLIP vision projector GGUF (`general.type = "mmproj"`, `clip.vision.block_count = 27`, `clip.projector_type = "qwen3vl_merger"`). The text-only Unsloth GGUF has no vision capability, but the projector gets packaged into the model manifest as an `application/vnd.ollama.image.projector` layer. This causes a fatal loading failure: the Go engine refuses to load models with projectors (`"split vision models aren't supported"` in `llm/server.go:152`), falls back to the llama.cpp C++ backend, which doesn't recognize the `qwen35` architecture — dead end.
+
+Download just the text GGUF directly and point the Modelfile at it:
+
+```bash
+# Download the text-only GGUF (skips the vision projector that breaks ollama):
+wget -O /tmp/Qwen3.5-27B-Q4_K_M.gguf \
+  https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf
+```
 
 Create a Modelfile:
 ```
-FROM hf.co/unsloth/Qwen3.5-27B-GGUF:Q4_K_M
+FROM /tmp/Qwen3.5-27B-Q4_K_M.gguf
 
 # Required: Ollama's built-in Qwen 3.5 chat template with tool calling support.
 # Without RENDERER/PARSER, the HuggingFace GGUF gets a bare {{ .Prompt }} template
@@ -385,7 +393,7 @@ ollama create qwen3.5-unsloth -f Modelfile
 ollama run qwen3.5-unsloth
 ```
 
-**Important:** The `TEMPLATE`, `RENDERER`, and `PARSER` directives are mandatory for `hf.co/` GGUFs. Ollama registry models (`ollama pull qwen3.5:...`) include these in their config blob automatically, but raw HuggingFace GGUFs do not — without them, the model gets a bare `{{ .Prompt }}` template and tool calling silently breaks. The GGUF metadata does contain a `qwen35` architecture tag, but Ollama does not auto-wire the renderer/parser from it for custom Modelfile-created models.
+**Important:** The `TEMPLATE`, `RENDERER`, and `PARSER` directives are mandatory for non-registry GGUFs. Ollama registry models (`ollama pull qwen3.5:...`) include these in their config blob automatically, but local GGUFs do not — without them, the model gets a bare `{{ .Prompt }}` template and tool calling silently breaks. The GGUF metadata does contain a `qwen35` architecture tag, but Ollama does not auto-wire the renderer/parser from it for custom Modelfile-created models.
 
 #### Upstream Chat Template Bug in Both GGUFs (Irrelevant to Ollama)
 
