@@ -96,6 +96,8 @@ For the full per-tensor comparison methodology and all 198 tensor differences, s
 | [Prefill excludes tool calls](https://github.com/BigBIueWhale/ollama/blob/main/model/renderers/qwen3coder.go#L148) — generation prompt emitted after tool call turns | `qwen3.5`, `qwen3-coder`, `qwen3-vl-*` | Medium |
 | [Tool call whitespace](https://github.com/BigBIueWhale/ollama/blob/main/model/renderers/qwen3coder.go#L163) matches HuggingFace template | `qwen3.5`, `qwen3-coder` | Low |
 | [`</think>` always closed](https://github.com/BigBIueWhale/ollama/blob/main/model/renderers/qwen3vl.go#L98) in VL renderer | `qwen3-vl-thinking` | Low |
+| [Third-party GGUF compatibility](third_party_gguf_compatibility.md) — architecture-based defaults for `ssm.v_head_reordered`, `rope.mrope_interleaved`, and `isRecurrent` computation | `qwen3.5`, `qwen35moe`, `qwen3next` | **High** — wrong defaults caused garbage output and wrong RoPE on all third-party GGUFs |
+| [`ssm_dt.bias` tensor name](https://github.com/BigBIueWhale/ollama/blob/main/model/models/qwen3next/deltanet.go#L44) supported as alias for `ssm_dt` | `qwen3.5`, `qwen3next` | Low |
 | [Binary search truncation](https://github.com/BigBIueWhale/ollama/blob/main/server/prompt.go#L33) — O(log N) instead of O(N) tokenize calls | All models | Low |
 | [`strings.Contains` early-out](https://github.com/BigBIueWhale/ollama/blob/main/tokenizer/special.go#L28) + [`slices.Replace`](https://github.com/BigBIueWhale/ollama/blob/main/tokenizer/special.go#L53) | All models | Low |
 | [Stack-allocated `Merge()` key](https://github.com/BigBIueWhale/ollama/blob/main/tokenizer/vocabulary.go#L107) avoids heap allocation per BPE lookup | All models | Low |

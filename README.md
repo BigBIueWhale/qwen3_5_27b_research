@@ -6,5 +6,6 @@ Source-level analysis of four critical bugs in Ollama's Qwen 3.5 27B integration
 
 - [**Solution**](solution.md) — Working fork with all fixes, change table, API examples, and recommended parameter profiles. Start here.
 - [**Inference Report**](qwen3.5_27b_inference_report.md) — Full source-level analysis of four bugs: wrong tool calling format (with missing thinking support in the correct pipeline), silently ignored repetition penalties, unclosed `</think>` tags in multi-turn prompts, and missing generation prompt after tool call turns.
+- [**Third-Party GGUF Compatibility**](third_party_gguf_compatibility.md) — Three ollama-internal GGUF metadata keys (`ssm.v_head_reordered`, `rope.mrope_interleaved`, `isRecurrent` computation) that broke inference on Unsloth/bartowski/llama.cpp-generated GGUFs. Includes cross-reference of ollama Go, llama.cpp C++, and HuggingFace Python implementations confirming DeltaNet numerics are correct.
 - [**Ollama Issue**](ollama_issue.md) — GitHub issue text filed against ollama/ollama ([#14493](https://github.com/ollama/ollama/issues/14493)).
 - [**PR #14167 Comment**](tommy_pr_comment.md) — Comment on [TommyBoiss's unmerged PR](https://github.com/ollama/ollama/pull/14167), noting that his implementation correctly wired the tool calling format where the official `main` branch got it wrong.
