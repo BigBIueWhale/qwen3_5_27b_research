@@ -1,6 +1,6 @@
 # Qwen 3.5 27B Dense Language Model — Inference Library Support Report
 
-**Date:** March 1, 2026 UTC (GGUF comparison added; original report February 27, 2026 UTC)
+**Date:** March 3, 2026 UTC (UD-Q4_K_XL iteration 2 analysis; GGUF comparison March 1; original report February 27, 2026 UTC)
 **Target Hardware:** NVIDIA RTX 5090 graphics card (32 GB VRAM — Video Random Access Memory)
 **Model:** Qwen 3.5 27B dense language model (all 27 billion parameters active every forward pass)
 **Inference Libraries Evaluated:** vLLM inference server, Ollama inference framework (+ llama.cpp C++ backend)
@@ -20,7 +20,7 @@
 | vLLM Docker image (Blackwell nightly) | `vllm/vllm-openai:cu130-nightly` | — | [Docker Hub](https://hub.docker.com/r/vllm/vllm-openai/tags) — CUDA 13.0.1, sm_120 kernels, updated daily |
 | Ollama registry GGUF (full file download) | `qwen3.5:27b-q4_K_M` | `sha256:7935de6e…` | 17,420,420,832 bytes, 1,307 tensors — standard Q4_K_M, includes vision encoder + MTP head |
 | Unsloth GGUF Q4_K_M (full file download) | [`Qwen3.5-27B-Q4_K_M.gguf`](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) | — | 16,740,812,160 bytes, 851 tensors — custom imatrix + GDN/SSM layer protection, text-only |
-| Unsloth GGUF UD-Q4_K_XL (full file download) | [`Qwen3.5-27B-UD-Q4_K_XL.gguf`](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) | — | 851 tensors — Unsloth Dynamic 2.0, Feb 24 upload (pre-fix), same size as Q4_K_M but different SSM layer tradeoffs |
+| **Unsloth GGUF UD-Q4_K_XL (recommended)** | [`Qwen3.5-27B-UD-Q4_K_XL.gguf`](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) | — | **17,621,125,024 bytes, 851 tensors — Unsloth Dynamic 2.0, March 2 re-upload (iteration 2, MXFP4 fixed), F16 on ssm_alpha/beta, Q8_0 on ssm_out** |
 
 ---
 
@@ -265,12 +265,14 @@ A 3:1 ratio of linear attention (Gated DeltaNet) to full attention layers. The G
 |--------|------|-------|
 | BF16 | 53.8 GB | Full precision baseline |
 | Q8_0 | 28.6 GB | Extremely high quality |
-| UD-Q8_K_XL | 32.4 GB | Unsloth Dynamic optimized |
-| UD-Q6_K_XL | 23.1 GB | Unsloth Dynamic |
+| UD-Q8_K_XL | 35.5 GB | Unsloth Dynamic optimized |
+| Q8_0 | 28.6 GB | Extremely high quality |
+| UD-Q6_K_XL | 25.7 GB | Unsloth Dynamic |
 | Q6_K | 22.5 GB | Near-original quality |
-| UD-Q5_K_XL | 19.6 GB | Unsloth Dynamic optimized |
+| UD-Q5_K_XL | 20.2 GB | Unsloth Dynamic optimized |
 | Q5_K_M | 19.6 GB | High quality |
-| Q4_K_M | 16.7 GB | Good quality, default for most |
+| **UD-Q4_K_XL** | **17.6 GB** | **Unsloth Dynamic — recommended (F16 on ssm_alpha/beta, Q8_0 on ssm_out)** |
+| Q4_K_M | 16.7 GB | Good quality, standard imatrix GDN protection |
 | Q4_K_S | 15.8 GB | Good quality |
 | Q3_K_M | 13.5 GB | Lower quality |
 | Q2_K | 10.5 GB | Very low quality |
@@ -295,7 +297,7 @@ Similar spread plus additional imatrix quants (IQ4_XS, IQ3_M, IQ2_M, etc.).
 | Q5_K_M | 19.4 GB | ~12.6 GB | High | Good for longer context |
 | **Q4_K_M** | **16.5 GB** | **~15.5 GB** | Good | Most context headroom |
 
-**Recommendation:** Use **Q4_K_M from Unsloth** (16.7 GB) for maximum context window with GDN/SSM layer protection — NOT the Ollama registry GGUF and NOT the UD-Q4_K_XL (see [Q4_K_M vs UD-Q4_K_XL analysis](#q4_k_m-vs-ud-q4_k_xl-use-q4_k_m) below). For best quality-to-fit ratio, use **Q6_K from Unsloth** (22.5 GB). See the [GGUF comparison](#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) below for why Unsloth over the Ollama registry.
+**Recommendation:** Use **UD-Q4_K_XL from Unsloth** (17.6 GB, [March 2 re-upload](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/discussions/13)). Full F16 on `ssm_alpha`/`ssm_beta`, Q8_0 on `ssm_out` — nothing else comes close on the layers that define this architecture (see [UD-Q4_K_XL analysis](#ud-q4_k_xl-iteration-2-march-2-2026--use-ud-q4_k_xl) below). See the [GGUF comparison](#gguf-deep-dive-ollama-registry-vs-unsloth-use-unsloth) for why Unsloth over the Ollama registry.
 
 ### GGUF Deep Dive: Ollama Registry vs Unsloth — Use Unsloth
 
@@ -367,13 +369,13 @@ Download just the text GGUF directly and point the Modelfile at it:
 
 ```bash
 # Download the text-only GGUF (skips the vision projector that breaks ollama):
-wget -O /tmp/Qwen3.5-27B-Q4_K_M.gguf \
-  https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf
+wget -O /tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf \
+  https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-UD-Q4_K_XL.gguf
 ```
 
 Create a Modelfile:
 ```
-FROM /tmp/Qwen3.5-27B-Q4_K_M.gguf
+FROM /tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf
 
 # Required: Ollama's built-in Qwen 3.5 chat template with tool calling support.
 # Without RENDERER/PARSER, the HuggingFace GGUF gets a bare {{ .Prompt }} template
@@ -382,15 +384,19 @@ TEMPLATE {{ .Prompt }}
 RENDERER qwen3.5
 PARSER qwen3.5
 
+PARAMETER num_ctx 131072
+PARAMETER num_predict 81920
 PARAMETER temperature 1.0
 PARAMETER top_k 20
 PARAMETER top_p 0.95
+PARAMETER repeat_penalty 1.0
+PARAMETER presence_penalty 1.5
 ```
 
 Import into Ollama:
 ```bash
-ollama create qwen3.5-unsloth -f Modelfile
-ollama run qwen3.5-unsloth
+ollama create qwen3.5-custom -f Modelfile
+ollama run qwen3.5-custom
 ```
 
 **Important:** The `TEMPLATE`, `RENDERER`, and `PARSER` directives are mandatory for non-registry GGUFs. Ollama registry models (`ollama pull qwen3.5:...`) include these in their config blob automatically, but local GGUFs do not — without them, the model gets a bare `{{ .Prompt }}` template and tool calling silently breaks. The GGUF metadata does contain a `qwen35` architecture tag, but Ollama does not auto-wire the renderer/parser from it for custom Modelfile-created models.
@@ -399,29 +405,27 @@ ollama run qwen3.5-unsloth
 
 Both the Ollama and Unsloth GGUFs for the 27B model contain the **same broken Jinja2 chat template** (7,756 bytes, byte-for-byte identical) from upstream [Qwen/Qwen3.5-27B `tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/tokenizer_config.json). The bug: `tool_call.arguments|items` crashes llama.cpp's minja engine when arguments arrive as a JSON string instead of a parsed dict ([llama.cpp issue #19872](https://github.com/ggml-org/llama.cpp/issues/19872), [Qwen/Qwen3.5-35B-A3B discussion #4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/discussions/4)).
 
-Unsloth has fixed this template in their 35B-A3B GGUF uploads but **has NOT yet updated the 27B** — their docs page says "Re-download 122B, 27B once they're updated." A user on HuggingFace [asked for the 27B ETA](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/discussions/13) with no response as of March 1, 2026 UTC.
+Unsloth re-uploaded all 27B GGUFs on March 2, 2026 ([iteration 2](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/discussions/13)), which includes the fixed Jinja2 template alongside the [MXFP4 quantization fix](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/5).
 
 **This is irrelevant to Ollama.** Ollama does not use the GGUF-embedded Jinja2 template — it has hardcoded Go renderers selected by `renderer: "qwen3.5"` in the model config. The Jinja template is only used by `llama-server --jinja` (direct llama.cpp usage). The llama.cpp side has its own fix ([PR #19635](https://github.com/ggml-org/llama.cpp/pull/19635)) that resolves the crash engine-side.
 
-#### Q4_K_M vs UD-Q4_K_XL — Use Q4_K_M
+#### UD-Q4_K_XL Iteration 2 (March 2, 2026) — Use UD-Q4_K_XL
 
-> **Verified March 1, 2026 UTC.** All three GGUF files (Ollama registry, Unsloth Q4_K_M, Unsloth UD-Q4_K_XL) were downloaded and every tensor's quantization type was compared. The UD-Q4_K_XL analysis below is based on the Feb 24, 2026 upload — the only version available as of this writing.
+> **Verified March 3, 2026 UTC.** The UD-Q4_K_XL was re-downloaded after Unsloth's March 2 re-upload ([iteration 2](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/discussions/13)) and every tensor's quantization type was extracted and compared against Q4_K_M and the Ollama registry GGUF. The Feb 24 UD-Q4_K_XL had an [MXFP4 bug](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/5) that degraded SSM layers — that analysis is obsolete. This section replaces it.
 
-Unsloth's `UD-Q4_K_XL` (Unsloth Dynamic 2.0) and `Q4_K_M` are the same file size (16.7 GB) from the same [Unsloth repository](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF), but they make **opposite tradeoffs** on the GDN/SSM layers. 192 of 851 tensors differ — all in the same four tensor types across all 48 GDN blocks:
+The new UD-Q4_K_XL (17.6 GB, 851 tensors) dominates both Q4_K_M and the Ollama registry on every GDN/SSM tensor:
 
-| Tensor (48 GDN blocks each) | Ollama registry | Unsloth Q4_K_M | Unsloth UD-Q4_K_XL | What it is |
-|------------------------------|-----------------|----------------|---------------------|------------|
-| **`attn_qkv`** | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | **Q5_K (5.5 bpw)** | GDN linear attention input — both Unsloth variants protect this |
-| **`attn_gate`** | Q4_K (4.5 bpw) | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | Attention gate — UD upgrades this, Q4_K_M leaves it at Q4_K |
-| **`ssm_out`** | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | Q4_K (4.5 bpw) | SSM output projection — Q4_K_M protects, UD does NOT |
-| **`ssm_alpha`** | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | Q4_K (4.5 bpw) | SSM temporal decay — Q4_K_M keeps at nearly 2× precision, UD drops to Q4_K |
-| **`ssm_beta`** | Q4_K (4.5 bpw) | **Q8_0 (8.5 bpw)** | Q4_K (4.5 bpw) | SSM input gate — same story as alpha |
+| Tensor (48 GDN blocks each) | Ollama registry | Unsloth Q4_K_M | **Unsloth UD-Q4_K_XL (Mar 2)** | What it is |
+|------------------------------|-----------------|----------------|----------------------------------|------------|
+| **`ssm_alpha`** | Q4_K (4.5 bpw) | Q8_0 (8.5 bpw) | **F16 (16.0 bpw)** | SSM temporal decay — controls how fast SSM memory fades. Full half-precision on these tiny critical tensors. |
+| **`ssm_beta`** | Q4_K (4.5 bpw) | Q8_0 (8.5 bpw) | **F16 (16.0 bpw)** | SSM input gate — controls what enters SSM memory. Same story as alpha. |
+| **`ssm_out`** | Q4_K (4.5 bpw) | Q5_K (5.5 bpw) | **Q8_0 (8.5 bpw)** | SSM output projection — the tensor Unsloth's own benchmarks found "dramatically increases KLD" when quantized. Now at nearly double the precision of Q4_K_M. |
+| **`attn_gate`** | Q4_K (4.5 bpw) | Q4_K (4.5 bpw) | **Q5_K (5.5 bpw)** | GDN attention gate — UD upgrades, both others leave at Q4_K. |
+| **`attn_qkv`** | Q4_K (4.5 bpw) | Q5_K (5.5 bpw) | **Q5_K (5.5 bpw)** | GDN linear attention input — both Unsloth variants protect this. |
 
-**Q4_K_M wins on the most quantization-sensitive layers.** `ssm_alpha` and `ssm_beta` at Q8_0 (8.5 bpw) vs Q4_K (4.5 bpw) is nearly double the precision on the tiny tensors that control the SSM's temporal memory dynamics. `ssm_out` at Q5_K vs Q4_K is a +1 bpw upgrade on the tensor Unsloth's own benchmarks found "dramatically increases KLD" when quantized. UD-Q4_K_XL trades all of this away to upgrade `attn_gate` from Q4_K to Q5_K — a less impactful trade.
+The extra ~0.9 GB (17.6 vs 16.7 GB) is funded by selective IQ4_XS on 6 of 64 FFN gate/up blocks — generic transformer layers where quality impact is minimal. Zero MXFP4 tensors remain (the Feb 24 bug is fully resolved). `attn_v` is 14×Q6_K + 2×Q5_K (vs 10×Q6_K + 6×Q4_K in Q4_K_M) — also an improvement.
 
-Both variants agree on `attn_qkv` (Q5_K) and everything outside the GDN blocks — the difference is purely in how they allocate the bit budget within the SSM layers.
-
-**Note on UD re-upload status:** As of March 1, 2026 UTC, Unsloth has [flagged the 27B UD GGUFs for re-upload](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) ("112B, 27B still converting, re-download once updated") following an [MXFP4 bug fix](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/5) applied to the 35B-A3B MoE model. The MXFP4 bug was about expert routing tensors in MoE models — the dense 27B has no MoE layers, so it likely isn't affected. However, the UD quantization recipe may change after re-upload. Until then, Q4_K_M is the safer and empirically better choice for the SSM-sensitive layers.
+**The UD-Q4_K_XL is the clear winner.** Use it.
 
 ---
 
@@ -1645,16 +1649,16 @@ Note: The upstream llama.cpp commit (`723c710`) is NOT the same as the Ollama-pi
 - [Issue #19872 — Template `arguments|items` Filter Failure](https://github.com/ggml-org/llama.cpp/issues/19872)
 - [PR #19635 — Template Detection Fix](https://github.com/ggml-org/llama.cpp/pull/19635)
 
-### Unsloth GGUF Quantization (per-tensor analysis, March 1, 2026 UTC)
-- [unsloth/Qwen3.5-27B-GGUF](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) — full file downloaded (16,740,812,160 bytes, 851 tensors) for per-tensor comparison
+### Unsloth GGUF Quantization (per-tensor analysis, updated March 3, 2026 UTC)
+- [unsloth/Qwen3.5-27B-GGUF](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) — Q4_K_M (16,740,812,160 bytes) and **UD-Q4_K_XL iteration 2** (17,621,125,024 bytes, March 2 re-upload) both downloaded and per-tensor compared
 - [Unsloth Qwen3.5 GGUF Benchmarks](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) — KL divergence per-tensor analysis, MXFP4 retirement
 - [Unsloth Dynamic 2.0 Documentation](https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs) — per-layer quantization methodology
 - [Unsloth Dynamic v2.0 Blog Post](https://unsloth.ai/blog/dynamic-v2) — calibration dataset, optimization goals
-- [Unsloth Qwen3.5 How-to Guide](https://unsloth.ai/docs/models/qwen3.5) — tool-calling template fix announcement, "Re-download 122B, 27B once they're updated"
+- [Unsloth Qwen3.5 How-to Guide](https://unsloth.ai/docs/models/qwen3.5) — tool-calling template fix announcement
 - [HuggingFace discussion: Qwen3.5-35B-A3B Feb 27 GGUF update + template diff](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/10)
 - [HuggingFace discussion: Upstream Qwen tool calling template is broken](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/discussions/4) — `|items` filter bug, NOT fixed upstream as of March 1, 2026 UTC
-- [HuggingFace discussion: 27B update ETA inquiry (unanswered)](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/discussions/13)
-- [HuggingFace discussion: Bug in UD-Q4_K_XL recipe using MXFP4 for attn tensors](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/5)
+- [HuggingFace discussion: 27B update — iteration 2 confirmed March 2](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/discussions/13) — danielhanchen: "27B for now is updating, but it's iteration 2 for now"
+- [HuggingFace discussion: MXFP4 bug in UD-Q4_K_XL recipe (now fixed)](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/discussions/5) — MXFP4 incorrectly applied to attn tensors, retired from all XL quants
 - [llama.cpp `--tensor-type` per-tensor override discussion](https://github.com/ggml-org/llama.cpp/discussions/12741)
 - [Ollama GitHub Issue #10222 — Support Jinja chat templates](https://github.com/ollama/ollama/issues/10222) — OPEN since April 2025, no PRs, no timeline
 
