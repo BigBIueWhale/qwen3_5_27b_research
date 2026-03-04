@@ -10,9 +10,11 @@ Qwen3-Coder reference: `Qwen/Qwen3-Coder-30B-A3B-Instruct` Jinja2 template ([ver
 
 ## Part 1: What the Fork Should Fix
 
-### 1.1 CRITICAL: `SetInplace` in deltanet.go — crashes Apple Silicon & Vulkan on Ollama's vendored GGML
+### 1.1 ~~CRITICAL~~ FIXED: `SetInplace` in deltanet.go — crashes Apple Silicon & Vulkan on Ollama's vendored GGML
 
-**Fault: Ollama's stale GGML vendor, not the fork's algorithm.** The fork author used `ggml_set_inplace()` — the same approach llama.cpp uses in its canonical GatedDeltaNet implementation (`delta-net-base.cpp:262` in `d969e933`). llama.cpp master has since added `GGML_OP_SET` support to Metal (`ggml-metal-device.m:1162`, `ggml-metal-ops.cpp:429`) and Vulkan (`ggml-vulkan.cpp:9037-9041`). But Ollama vendors an older GGML snapshot that only has `GGML_OP_SET_ROWS` on these backends — confirmed by searching Ollama's `ml/backend/ggml/ggml/src/ggml-metal/`: zero hits for `GGML_OP_SET`, only `GGML_OP_SET_ROWS`. The upstream Ollama developers worked around this by replacing `SetInplace` with a balanced concat tree (commit `3490e959`).
+**FIXED in fork.** Replaced `v.SetInplace()` chunk assembly with upstream's balanced binary concat tree (`GGML_OP_CONCAT`), which is supported on all backends. Chunk outputs are now collected into a slice and merged pairwise, giving O(log N) graph depth. This matches upstream commit `3490e959`.
+
+~~**Fault: Ollama's stale GGML vendor, not the fork's algorithm.** The fork author used `ggml_set_inplace()` — the same approach llama.cpp uses in its canonical GatedDeltaNet implementation (`delta-net-base.cpp:262` in `d969e933`). llama.cpp master has since added `GGML_OP_SET` support to Metal (`ggml-metal-device.m:1162`, `ggml-metal-ops.cpp:429`) and Vulkan (`ggml-vulkan.cpp:9037-9041`). But Ollama vendors an older GGML snapshot that only has `GGML_OP_SET_ROWS` on these backends — confirmed by searching Ollama's `ml/backend/ggml/ggml/src/ggml-metal/`: zero hits for `GGML_OP_SET`, only `GGML_OP_SET_ROWS`. The upstream Ollama developers worked around this by replacing `SetInplace` with a balanced concat tree (commit `3490e959`).~~
 
 **File**: `model/models/qwen3next/deltanet.go:466-473`
 
@@ -525,9 +527,11 @@ Every subsection below explains: what the correct behavior is, who implemented i
 
 ---
 
-### 6.1 GatedDeltaNet Chunk Assembly: SetInplace (from llama.cpp) vs Balanced Concat Tree (Ollama workaround)
+### 6.1 ~~GatedDeltaNet Chunk Assembly: SetInplace (from llama.cpp) vs Balanced Concat Tree (Ollama workaround)~~ FIXED
 
-**Who got it right**: llama.cpp (`d969e933`) and the fork both use `ggml_set_inplace()` (`delta-net-base.cpp:262` and `deltanet.go:466`). The upstream Ollama developers used a balanced concat tree (commit `3490e959`) as a **workaround** for their stale GGML vendor.
+**FIXED in fork.** The fork now uses upstream's balanced concat tree approach. See section 1.1.
+
+~~**Who got it right**: llama.cpp (`d969e933`) and the fork both use `ggml_set_inplace()` (`delta-net-base.cpp:262` and `deltanet.go:466`). The upstream Ollama developers used a balanced concat tree (commit `3490e959`) as a **workaround** for their stale GGML vendor.~~
 
 **The core issue**: Ollama vendors GGML from llama.cpp but does not track llama.cpp master closely. llama.cpp master has added `GGML_OP_SET` support to Metal (`ggml-metal-device.m:1162`, `ggml-metal-ops.cpp:429`) and Vulkan (`ggml-vulkan.cpp:9037-9041`). Ollama's vendored GGML does NOT have these kernels — confirmed: searching Ollama's `ml/backend/ggml/ggml/src/ggml-metal/` finds only `GGML_OP_SET_ROWS`, not `GGML_OP_SET`.
 
@@ -874,7 +878,7 @@ These optimizations do not affect correctness — they affect speed. The `Qwen3.
 
 | Priority | Item | Effort | Section |
 |----------|------|--------|---------|
-| **P0** | Replace `SetInplace` with balanced concat tree (workaround for Ollama's stale GGML vendor — llama.cpp master supports `GGML_OP_SET` on Metal/Vulkan) | Small | 1.1 |
+| ~~**P0**~~ | ~~Replace `SetInplace` with balanced concat tree (workaround for Ollama's stale GGML vendor — llama.cpp master supports `GGML_OP_SET` on Metal/Vulkan)~~ | ~~Small~~ | ~~1.1~~ FIXED |
 | **P0** | Use JSON tool definitions for qwen3.5 (keep XML for qwen3-coder) | Medium | 1.2 |
 | **P0** | Swap system+tools ordering for qwen3.5 | Small | 1.3 |
 | **P1** | Fix `formatToolCallArgument` to use spaced JSON for objects/arrays | Small | 2.2 |
