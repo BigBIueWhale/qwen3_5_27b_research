@@ -101,15 +101,17 @@ This matters for attention patterns — tools-first means the model's attention 
 
 **Fix**: For `qwen3.5`, emit tools block first, append system message content after `</IMPORTANT>`.
 
-### 1.4 MEDIUM: Missing `repeatPenalty <= 0` guard
+### 1.4 ~~MEDIUM~~ FIXED: Missing `repeatPenalty <= 0` guard
 
-**Fault: Fork (oversight).** The fork redesigned the sampler from scratch (see 3.1) and added guards for `temperature`, `topP`, `minP`, and `repeatLastN` in `NewSampler` (lines 159-179) but simply missed `repeatPenalty`. The upstream Ollama developers included it at `samplers.go:186-188`. This is a straightforward omission, not a design disagreement.
+**FIXED in fork.** Added `if repeatPenalty <= 0 { repeatPenalty = 1.0 }` guard in `NewSampler` at `sample/samplers.go:181-183`, matching upstream's guard at `samplers.go:186-188`. All sample package tests pass.
 
-**File**: `sample/samplers.go`
+~~**Fault: Fork (oversight).** The fork redesigned the sampler from scratch (see 3.1) and added guards for `temperature`, `topP`, `minP`, and `repeatLastN` in `NewSampler` (lines 159-179) but simply missed `repeatPenalty`. The upstream Ollama developers included it at `samplers.go:186-188`. This is a straightforward omission, not a design disagreement.~~
 
-The API (`api/types.go` `FromMap()`) accepts any float64 for `repeat_penalty` with no range validation. With `repeatPenalty = 0`: division by zero produces `+Inf` logits. With negative: penalty inverts, boosting repeated tokens.
+~~**File**: `sample/samplers.go`~~
 
-**Fix**: `if repeatPenalty <= 0 { repeatPenalty = 1.0 }`
+~~The API (`api/types.go` `FromMap()`) accepts any float64 for `repeat_penalty` with no range validation. With `repeatPenalty = 0`: division by zero produces `+Inf` logits. With negative: penalty inverts, boosting repeated tokens.~~
+
+~~**Fix**: `if repeatPenalty <= 0 { repeatPenalty = 1.0 }`~~
 
 ### 1.5 MEDIUM: Missing nil checks + Validate() for third-party GGUFs
 
