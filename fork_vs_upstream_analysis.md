@@ -2,41 +2,34 @@
 
 Fork: `BigBIueWhale/ollama` @ `9ec17fc1` (7 commits atop `v0.17.4` merge)
 Upstream: `ollama/ollama` master @ `82848a78`
-Official reference: Qwen 3.5 Jinja2 template from `Qwen/Qwen3.5-35B-A3B` ([publicly accessible on HuggingFace](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/raw/main/tokenizer_config.json)).
-Qwen3-Coder reference: Upstream's `Qwen3CoderRenderer` as proxy (HuggingFace repo is gated/401).
+llama.cpp: `ggml-org/llama.cpp` master @ `d969e933` — the canonical C++ inference engine. Ollama vendors GGML (the tensor math library) from llama.cpp but reimplements everything else in Go: chat template rendering is hardcoded Go renderers instead of llama.cpp's Jinja2 engine, sampling is a Go rewrite instead of llama.cpp's `llama-sampler.cpp`, and the model runner is `ollamarunner` instead of llama.cpp's server. This means llama.cpp bugs in GGML affect Ollama, but llama.cpp's correct Jinja2 template handling does NOT help Ollama — Ollama must reimplement the same logic in Go renderers/parsers.
+Official reference: Qwen 3.5 Jinja2 template from `Qwen/Qwen3.5-35B-A3B` ([publicly accessible on HuggingFace](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/raw/main/tokenizer_config.json)). **Also verified** against `Qwen/Qwen3.5-27B` ([publicly accessible](https://huggingface.co/Qwen/Qwen3.5-27B/raw/main/tokenizer_config.json)) — both repos contain byte-identical `chat_template` fields.
+Qwen3-Coder reference: `Qwen/Qwen3-Coder-30B-A3B-Instruct` Jinja2 template ([verified via public access](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct)) — confirms XML tool definitions, system-first ordering. Upstream's `Qwen3CoderRenderer` faithfully matches it.
 
 ---
 
 ## Part 1: What the Fork Should Fix
 
-### 1.1 CRITICAL: `SetInplace` in deltanet.go — crashes Apple Silicon & Vulkan
+### 1.1 CRITICAL: `SetInplace` in deltanet.go — crashes Apple Silicon & Vulkan on Ollama's vendored GGML
+
+**Fault: Ollama's stale GGML vendor, not the fork's algorithm.** The fork author used `ggml_set_inplace()` — the same approach llama.cpp uses in its canonical GatedDeltaNet implementation (`delta-net-base.cpp:262` in `d969e933`). llama.cpp master has since added `GGML_OP_SET` support to Metal (`ggml-metal-device.m:1162`, `ggml-metal-ops.cpp:429`) and Vulkan (`ggml-vulkan.cpp:9037-9041`). But Ollama vendors an older GGML snapshot that only has `GGML_OP_SET_ROWS` on these backends — confirmed by searching Ollama's `ml/backend/ggml/ggml/src/ggml-metal/`: zero hits for `GGML_OP_SET`, only `GGML_OP_SET_ROWS`. The upstream Ollama developers worked around this by replacing `SetInplace` with a balanced concat tree (commit `3490e959`).
 
 **File**: `model/models/qwen3next/deltanet.go:466-473`
 
-The fork uses `v.SetInplace()` to assemble chunk outputs in `deltaNetChunked`. This maps to `GGML_OP_SET` via `C.ggml_set_inplace()` -> `ggml_set_impl(..., true)` -> `result->op = GGML_OP_SET`. Backend support:
+The fork uses `v.SetInplace()` to assemble chunk outputs in `deltaNetChunked`. This maps to `GGML_OP_SET` via `C.ggml_set_inplace()` -> `ggml_set_impl(..., true)` -> `result->op = GGML_OP_SET`. Backend support **in Ollama's vendored GGML** vs **llama.cpp master (`d969e933`)**:
 
-| Backend | `GGML_OP_SET` | `GGML_OP_CONCAT` |
-|---------|---------------|-------------------|
-| CPU     | Yes           | Yes               |
-| CUDA    | Yes           | Yes               |
-| Metal   | **No**        | Yes               |
-| Vulkan  | **No**        | Yes               |
+| Backend | Ollama's GGML `GGML_OP_SET` | llama.cpp master `GGML_OP_SET` | `GGML_OP_CONCAT` (both) |
+|---------|---------------------------|-------------------------------|------------------------|
+| CPU     | Yes                       | Yes                           | Yes                    |
+| CUDA    | Yes                       | Yes                           | Yes                    |
+| Metal   | **No**                    | **Yes** (`ggml-metal-device.m:1162`) | Yes           |
+| Vulkan  | **No**                    | **Yes** (`ggml-vulkan.cpp:9037`) | Yes               |
 
-Verified: Metal and Vulkan backends reference only `GGML_OP_SET_ROWS` (a completely different scatter-by-index operation for KV cache updates), not `GGML_OP_SET`. CPU (`ggml-cpu.c:1820`) and CUDA (`ggml-cuda.cu:2577`) both dispatch `GGML_OP_SET` fully.
+The fork's approach is algorithmically correct and matches llama.cpp's reference implementation. The problem is purely that Ollama's vendored GGML is behind llama.cpp master. Until Ollama updates its GGML vendor (or backports the `GGML_OP_SET` Metal/Vulkan kernels), the concat tree workaround is necessary.
 
-`SetInplace` is the **only call to `GGML_OP_SET` in the entire codebase** — confirmed by searching all three hit locations: `ml/backend.go:198` (interface), `ml/backend/ggml/ggml.go:1348` (binding), `model/models/qwen3next/deltanet.go:466` (the only call site). No other model uses it.
-
-On Apple Silicon (the primary Mac inference path), recurrent layers offloaded to Metal will fail. This is the default execution path on every Mac. Under partial GPU offload, the tensor `v` (a `Mulmat` result at line 405) may be a buffer-less intermediate — `SET` on such a tensor is undefined behavior. Upstream's commit comment at line 457-458 is explicit: *"Avoids SET on buffer-less intermediates under partial offload."*
-
-Beyond backend support, `SetInplace` is semantically dangerous in a compute graph: it performs in-place mutation of `v`'s underlying storage (the `inplace=true` flag in `ggml_set_impl` creates a *view* rather than a copy). If the graph scheduler reorders or parallelizes the N successive `SET` nodes targeting the same tensor, results are incorrect. The concat tree creates purely functional (non-mutating) graph nodes.
-
-**What upstream does instead (commit `3490e959`)**: Collects chunk outputs into a slice, then merges via a balanced binary concat tree:
+**What upstream does instead (commit `3490e959`)**: A balanced binary concat tree using `GGML_OP_CONCAT` (supported on all backends in all GGML versions):
 
 ```go
-// Line 459: Pre-allocate
-chunks := make([]ml.Tensor, nChunks)
-// Line 482 (in loop): Store each chunk
-chunks[chunk] = coreAttnOutChunk
 // Lines 496-507: Balanced pairwise reduction
 for len(chunks) > 1 {
     merged := make([]ml.Tensor, 0, (len(chunks)+1)/2)
@@ -51,20 +44,24 @@ for len(chunks) > 1 {
 }
 ```
 
-The tree has **O(log N) graph depth** (maximum dependency chain length), which matters for the compute graph scheduler. Total concat operations are N-1 (same as a linear chain), but the data movement profile differs: a naive left-to-right linear concat creates O(N^2) total data copying (the i-th concat copies i*chunkSize elements), while the balanced tree does O(N log N) — each of the log2(N) levels does O(N) work. For a 2048-token prompt with chunkSize=64, that's 32 chunks and only 5 levels of merging.
+The tree has **O(log N) graph depth** vs the linear chain of `SET` operations. For a 2048-token prompt with chunkSize=64, that's 32 chunks and 5 levels of merging.
 
-**Fix**: Replace with upstream's balanced concat tree. Direct port — the surrounding code is structurally identical.
+**Fix**: Replace with upstream's balanced concat tree until Ollama updates its GGML vendor to include Metal/Vulkan `GGML_OP_SET` support. Alternatively, if Ollama updates GGML first, the fork's current approach would work as-is.
 
 ### 1.2 CRITICAL: Tool definition format — Qwen3.5 was trained on JSON, not XML
 
+**Fault: Fork, but with a mitigating factor that is Alibaba Qwen's fault.** The fork author's commit `fbae6976` explicitly states: *"Qwen 3.5 was wired to the Qwen3VL JSON tool pipeline but was trained on the Qwen3-Coder XML format."* This is factually wrong — the Qwen3.5 official template uses JSON tool definitions (`{{ tool | tojson }}`), not XML. But the mistake is understandable because **Alibaba Qwen made the tool CALL format identical** between Qwen3-Coder and Qwen3.5 (both use `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>` XML). A developer seeing XML tool calls would reasonably infer XML tool definitions — this is a confusing design choice by the Qwen team. The upstream Ollama developers got this right by creating a dedicated `Qwen35Renderer` that uses JSON definitions with `marshalWithSpaces`. **llama.cpp (`d969e933`) sidesteps this entirely** by executing the Jinja2 template from the GGUF directly (`chat.cpp:631-639`), passing tools as JSON objects to the template context (`chat.cpp:813-820`). The template's `{{ tool | tojson }}` produces correct JSON output with llama.cpp's native `tojson` filter (`value.cpp:157-183`). Ollama cannot benefit from this because it reimplements template rendering in Go instead of using llama.cpp's Jinja2 engine.
+
 **File**: `model/renderers/qwen3coder.go:91-135`
 
-There are **two different official templates** from Qwen:
+Alibaba Qwen publishes **two different official templates** with a hybrid format split that is easy to miss:
 
-| Template | Tool definitions | System+tools order |
-|----------|-----------------|-------------------|
-| **Qwen3-Coder** | XML `<function><name>...` | System first, tools second |
-| **Qwen3.5**     | JSON `{{ tool | tojson }}` | Tools first, system appended after |
+| Template | Tool definitions | Tool calls (model output) | System+tools order |
+|----------|-----------------|--------------------------|-------------------|
+| **Qwen3-Coder** | XML `<function><name>...` | XML `<tool_call><function=...>` | System first, tools second |
+| **Qwen3.5**     | JSON `{{ tool | tojson }}` | XML `<tool_call><function=...>` **(same!)** | Tools first, system appended after |
+
+The tool call format is character-for-character identical. Only the tool *definition* rendering and system message ordering differ. This is **Alibaba Qwen's confusing design decision** — it's the reason the fork author made the wrong call. Verified by fetching both official templates: `Qwen/Qwen3.5-27B/tokenizer_config.json` uses `{{ tool | tojson }}`; `Qwen/Qwen3-Coder-30B-A3B-Instruct/tokenizer_config.json` uses the XML decomposition (`<function>\n<name>...`).
 
 The fork routes `qwen3.5` through `Qwen3CoderRenderer` (at `renderer.go:59-60`: `case "qwen3.5": return &Qwen3CoderRenderer{isThinking: true, emitEmptyThinkOnNoThink: true}`), which uses Qwen3-Coder XML format for **both** models. Correct for `qwen3-coder`, wrong for `qwen3.5`. The model sees a completely different token sequence than what it was trained on:
 
@@ -77,11 +74,11 @@ Fork:      <function>\n<name>get_weather</name>\n<description>Get weather</descr
 
 The HTML-escaping behavior is identical: both Go's `json.Marshal` and tojson produce `\u003c`/`\u003e`/`\u0026` for `<`/`>`/`&`.
 
-Note: the **tool call format** (`<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`) and the **instruction text** are character-for-character identical across both official templates, the fork, and upstream. Only the tool definition rendering differs.
-
 **Fix**: Either create a dedicated `Qwen35Renderer` (upstream's approach) or parameterize `Qwen3CoderRenderer` to emit JSON tool definitions when serving qwen3.5. Use `marshalWithSpaces` for the JSON serialization.
 
 ### 1.3 CRITICAL: System+tools ordering reversed for Qwen3.5
+
+**Fault: Fork (collateral damage from 1.2).** This is a direct consequence of sharing the `Qwen3CoderRenderer` between both models. The Qwen3-Coder template genuinely does system-first — the fork author implemented the Coder format correctly, then applied it to the wrong model. The upstream Ollama developers got the ordering right in `Qwen35Renderer` because they created a dedicated renderer from the official Qwen3.5 template. llama.cpp (`d969e933`) gets this right automatically via Jinja2 template execution. Note: **Alibaba Qwen's decision to reverse the ordering between two models in the same family** (Coder = system first; 3.5 = tools first) is an unusual design choice that compounds the confusion from 1.2.
 
 **File**: `model/renderers/qwen3coder.go:80-138`
 
@@ -106,20 +103,17 @@ This matters for attention patterns — tools-first means the model's attention 
 
 ### 1.4 MEDIUM: Missing `repeatPenalty <= 0` guard
 
+**Fault: Fork (oversight).** The fork redesigned the sampler from scratch (see 3.1) and added guards for `temperature`, `topP`, `minP`, and `repeatLastN` in `NewSampler` (lines 159-179) but simply missed `repeatPenalty`. The upstream Ollama developers included it at `samplers.go:186-188`. This is a straightforward omission, not a design disagreement.
+
 **File**: `sample/samplers.go`
 
 The API (`api/types.go` `FromMap()`) accepts any float64 for `repeat_penalty` with no range validation. With `repeatPenalty = 0`: division by zero produces `+Inf` logits. With negative: penalty inverts, boosting repeated tokens.
 
-Upstream has this guard at `sample/samplers.go:186-188`:
-```go
-if repeatPenalty <= 0 {
-    repeatPenalty = 1.0
-}
-```
-
 **Fix**: `if repeatPenalty <= 0 { repeatPenalty = 1.0 }`
 
 ### 1.5 MEDIUM: Missing nil checks + Validate() for third-party GGUFs
+
+**Fault: Fork (incomplete defensive coding).** The fork author contributed 3 commits specifically fixing third-party GGUF compatibility (ssm_dt.bias tensor name, head_count_kv scalar broadcast, architecture-based defaults) — all correct and valuable. But the fork lacks the defensive validation layer that would catch *other* third-party GGUF problems at load time rather than at inference time. The upstream Ollama developers added this in commit `8da09b1e`. llama.cpp (`d969e933`) achieves equivalent protection differently: `create_tensor()` at `llama-model.cpp:6779` uses flag `0` (REQUIRED), so missing tensors fail at model load time. No runtime nil checks needed — the loader refuses to proceed.
 
 **Files**: `model/models/qwen3next/deltanet.go`, `model/models/qwen3next/model.go`
 
@@ -139,29 +133,50 @@ Without these, a missing tensor in a third-party GGUF causes a nil-pointer panic
 
 ### 1.6 MEDIUM: No image/vision support for Qwen3.5
 
-**File**: `model/renderers/qwen3coder.go`
+**Fault: Fork (regression introduced in commit `fbae6976`).** Qwen3.5-27B is a **native multimodal early-fusion model** — it has a 27-layer vision encoder (1152 hidden size, 16 heads, patch size 16) built directly into its architecture, confirmed by `vision_config` in the [official config.json](https://huggingface.co/Qwen/Qwen3.5-27B/raw/main/config.json) with dedicated `vision_start_token_id` (248053), `vision_end_token_id` (248054), and `image_token_id` (248056). The official Ollama `qwen3.5:27b` tag (17GB, Q4_K_M) includes the vision encoder and supports image input. llama.cpp (`d969e933`) has full vision support via `tools/mtmd/models/qwen3vl.cpp` (193 lines) including dual-conv patch embedding, M-RoPE, deepstack feature merging, and multimodal projection.
 
-Qwen3.5-27B is **natively multimodal**. Verified from upstream's `model.go`: vision support is conditionally initialized at lines 663-668 (`if c.Uint("vision.block_count", 0) > 0`), `EncodeMultimodal` is implemented at lines 297-313, vision tokens are configured at lines 695-700 (image_token_id=151655, vision_start=151652, vision_end=151653), and `qwen35` is listed alongside `qwen3vl` in `sched.go:448` as requiring `numParallel = 1` (the multimodal pattern).
+**The fork actively broke image support that already existed.** At the merge base (`cc90a035`, Ollama `v0.17.4`), `qwen3.5` was routed to `Qwen3VLRenderer` with `useImgTags: RenderImgTags` — this renderer has a `renderContent()` method (lines 17-35 of `qwen3vl.go`) that iterates `content.Images` and inserts `[img-N]` tags or `<|vision_start|><|image_pad|><|vision_end|>` tokens. Image support **worked** at that point.
 
-The fork's `Qwen3CoderRenderer` has no `renderContent` method — it writes `message.Content` as a plain string. Upstream's `Qwen35Renderer.renderContent()` (lines 47-62) iterates over `content.Images` and inserts `<|vision_start|><|image_pad|><|vision_end|>` tokens per image.
+Commit `fbae6976` (diff to `renderer.go`) rewired `qwen3.5` from `Qwen3VLRenderer` to `Qwen3CoderRenderer`:
+```diff
+-  renderer := &Qwen3VLRenderer{isThinking: true, emitEmptyThinkOnNoThink: true, useImgTags: RenderImgTags}
+-  return renderer
++  return &Qwen3CoderRenderer{isThinking: true, emitEmptyThinkOnNoThink: true}
+```
+The commit message states: *"Qwen 3.5 was wired to the Qwen3VL JSON tool pipeline but was trained on the Qwen3-Coder XML format."* The tool format fix was necessary (see 1.2), but the collateral damage was total loss of image support: `Qwen3CoderRenderer` has **no** `useImgTags` field, **no** `renderContent()` method, and **zero** references to `message.Images` (confirmed: 0 hits for `useImgTags`, `.Images`, and `renderContent` in `qwen3coder.go`). Images sent to a vision-capable Qwen3.5 GGUF through the fork are silently discarded.
 
-The official template handles three content types: `image` items (with `<|vision_start|><|image_pad|><|vision_end|>` and optional `Picture N:` prefix), `video` items (with `<|vision_start|><|video_pad|><|vision_end|>`), and `text` items. It also validates that system messages cannot contain images (raises exception). Upstream's `Qwen35Renderer` supports images but not videos; the fork supports neither.
+**Upstream took the correct approach.** Commit `82848a78` also replaced `Qwen3VLRenderer` for `qwen3.5` — but with a **dedicated** `Qwen35Renderer` that fixes tool definitions (JSON via `marshalWithSpaces`) and system+tools ordering (tools-first) while **preserving** image support via its own `renderContent()` (lines 47-62 of `qwen35.go`). The `qwen3next` model (`model.go:665-668`) conditionally loads the vision encoder when `vision.block_count > 0` in the GGUF, and `EncodeMultimodal()` (`model.go:297-318`) processes images through `qwen3vl.VisionModel` — this works correctly for vision-capable GGUFs. For text-only GGUFs (where `Vision == nil`), `EncodeMultimodal` returns `ErrNoVisionModel` (`model.go:298-299`).
 
-The fork silently drops all image content. Users who pass images get no error, just no visual understanding.
+**File**: `model/renderers/qwen3coder.go` (fork), `model/renderers/renderer.go:59-60` (routing)
 
-**Fix**: Add image rendering to the qwen3.5 code path, matching the official template's `<|vision_start|><|image_pad|><|vision_end|>` format.
+The official template handles three content types: `image` items (with `<|vision_start|><|image_pad|><|vision_end|>` and optional `Picture N:` prefix), `video` items (with `<|vision_start|><|video_pad|><|vision_end|>`), and `text` items. It also validates that system messages cannot contain images (raises exception). Upstream's `Qwen35Renderer` supports images but not videos (line 58: `// TODO: support videos`); the fork supports neither.
+
+**Unsloth text-only GGUFs and the split-vision problem.** Ollama and llama.cpp take opposite approaches to vision packaging:
+- **Ollama** bundles vision tensors into the main GGUF. The official `qwen3.5:27b` blob has 1307 tensors and `vision.block_count = 27` — the 27-layer vision encoder is embedded alongside the 64-layer text model. The `qwen3next` model loads it via struct tag `Vision *qwen3vl.VisionModel \`gguf:"v"\`` at `model.go:237`.
+- **llama.cpp** uses a separate mmproj GGUF loaded via `--mmproj`. Unsloth follows this convention: text-only main GGUFs (851 tensors, no `vision.block_count`) plus separate `mmproj-{BF16,F16,F32}.gguf` files.
+- **Ollama's Go engine explicitly rejects split vision**: `llm/server.go:149-152` checks `if len(projectors) == 0` and returns `errors.New("split vision models aren't supported")` when projectors are present. When pulling from HuggingFace (e.g., `FROM hf.co/unsloth/Qwen3.5-27B-GGUF:Q4_K_XL`), Ollama auto-downloads the mmproj alongside the main GGUF, classifies it as `"application/vnd.ollama.image.projector"` at `create.go:653` (because it has `vision.block_count > 0` and `block_count == 0`), adds it to `ProjectorPaths` at `images.go:319`, and then the Go engine rejects the entire load. This is the error the custom Modelfile works around — by using `FROM /tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` (manually downloaded text-only GGUF), the mmproj is never pulled, `ProjectorPaths` stays empty, and the model loads successfully as text-only.
+
+For text-only Unsloth GGUFs, the model layer behaves correctly: `model.go:572` checks `vision.block_count` (absent → 0), skips `NewVisionModel`, sets `Vision = nil`. If a user somehow sends an image, `EncodeMultimodal` returns `ErrNoVisionModel` at line 298. The renderer is irrelevant for text-only usage — neither the fork's `Qwen3CoderRenderer` (drops images) nor upstream's `Qwen35Renderer` (inserts tokens for images that would fail in `EncodeMultimodal` anyway) affects text-only inference.
+
+**Upstream has secondary architectural issues** (not bugs, but design debt):
+- The chat handler (`routes.go`) never checks `CapabilityVision` before accepting images — the error surfaces late in `EncodeMultimodal()` rather than at the API boundary. By contrast, llama.cpp's server validates `allow_image` at the API entry point (`server-common.cpp:970`: `"image input is not supported - hint: you may need to provide the mmproj"`) and advertises vision capability in its `/models` metadata (`server-context.cpp:3414`: `"modalities": {"vision": true}`). This missing capability advertisement is why [issue #14508](https://github.com/ollama/ollama/issues/14508) exists — third-party tools (Dify) can't detect that `qwen3.5:27b` supports vision.
+- `sched.go:448` forces `numParallel = 1` for all `qwen35` models. This restriction exists because the hybrid recurrent architecture (GatedDeltaNet) is not safe with concurrent requests (ref: issue #4165), not because of vision — the same restriction applies to non-vision architectures like `lfm2`. However, it applies indiscriminately to text-only GGUFs that might otherwise be safe.
+
+**Fix**: Add a `useImgTags` field and `renderContent()` method to `Qwen3CoderRenderer` (or create a dedicated `Qwen35Renderer` like upstream), and pass `RenderImgTags` when constructing the renderer at `renderer.go:60`. The model layer (`qwen3next/model.go`) already handles vision correctly — only the renderer routing is broken. For text-only Unsloth GGUFs this is a non-issue since no images will be processed.
 
 ### 1.7 LOW: Default system message injected when not provided
 
+**Fault: Fork (collateral damage from sharing the Qwen3-Coder renderer).** The Qwen3-Coder official template genuinely injects this default. The Qwen3.5 official template does not — when no system message is provided, the system block contains only the tools text and instructions. The fork inherited the Coder behavior by routing both models through `Qwen3CoderRenderer`. Upstream's `Qwen35Renderer` correctly omits the default. llama.cpp (`d969e933`) gets this right via Jinja2 template execution — no injection.
+
 **File**: `model/renderers/qwen3coder.go:83-85`
 
-The fork injects `"You are Qwen, a helpful AI assistant that can interact with a computer to solve tasks."` when tools are present but no system message given. Neither the official Qwen3.5 template nor upstream's `Qwen35Renderer` do this. The official template simply omits the system message portion — the system block contains only the tools text.
-
-Note: upstream's `Qwen3CoderRenderer` (used for `qwen3-coder`) has the **identical injection** at the same lines — so this is correct behavior for qwen3-coder. The problem is only that the fork shares this code path with qwen3.5.
+The fork injects `"You are Qwen, a helpful AI assistant that can interact with a computer to solve tasks."` when tools are present but no system message given. The official Qwen3.5 template simply omits the system message portion — the system block contains only the tools text.
 
 **Fix**: Don't inject a default system message for qwen3.5.
 
 ### 1.8 LOW: `</think>` rendering for empty reasoning differs from training template
+
+**Fault: Fork (minor template fidelity gap), partially mitigated by the fork's own `emitEmptyThinkOnNoThink` flag.** The fork does handle the generation-prompt case correctly — when `emitEmptyThinkOnNoThink: true` (set for qwen3.5 at `renderer.go:60`), the final generation prompt emits `<think>\n\n</think>\n\n` when thinking is disabled. The gap is only for **historical assistant messages** in multi-turn conversations where `message.Thinking == ""` — those don't get the empty think wrapper. The official template always emits it unconditionally for all assistant messages after `lastQueryIndex`. llama.cpp (`d969e933`) handles this correctly via the Jinja2 template, which unconditionally emits the think block.
 
 **File**: `model/renderers/qwen3coder.go:163-166`
 
@@ -182,12 +197,13 @@ if isThinking && i > lastQueryIndex {
 The official template also always emits `<think>\n{reasoning}\n</think>\n\n` — unconditionally — for assistant messages after `last_query_index` in the current round. An empty reasoning produces `<think>\n\n</think>\n\n`.
 
 Low practical impact — assistant messages with empty reasoning content are unusual in practice. But for exact template fidelity, the fork should emit the think block unconditionally.
+### 1.9 ~~LOW~~ NON-ISSUE: `lastQueryIndex` doesn't check for tool_response wrappers
 
-### 1.9 LOW: `lastQueryIndex` doesn't check for tool_response wrappers
+**Fault: Nobody — the fork's simpler approach is correct for Ollama's protocol.** The official Qwen3.5 Jinja2 template checks for `<tool_response>` wrappers inside user messages because HuggingFace's `transformers` library represents tool results as `role: "user"` messages with `<tool_response>...</tool_response>` content. But Ollama's API uses a distinct `role: "tool"` (confirmed: `api/types.go` line 243 normalizes `"TOOl"` → `"tool"`). The `lastQueryIndex` loop operates on **original `api.Message` roles before rendering** — tool messages have `Role == "tool"`, never `Role == "user"`, so the loop naturally skips them. The `<tool_response>` content check in upstream's `Qwen35Renderer` (`82848a78`, `qwen35.go:121`) and the fork's own `qwen3vl.go` (lines 61-74) is **redundant defensive code** — it guards against a scenario that Ollama's protocol makes impossible. Both the fork (`9ec17fc1`) and upstream (`82848a78`) renderers convert `role: "tool"` → rendered `<|im_start|>user\n<tool_response>...</tool_response><|im_end|>` in the output (fork: `qwen3coder.go:199-215`; upstream: `qwen35.go:172-179`), but this conversion happens AFTER `lastQueryIndex` is already computed.
 
 **File**: `model/renderers/qwen3coder.go:149-155`
 
-The fork's `lastQueryIndex` search simply finds the last `role == "user"` message:
+The fork's `lastQueryIndex` search finds the last `role == "user"` message, which correctly excludes `role == "tool"` messages without needing to inspect content:
 ```go
 for i := len(filteredMessages) - 1; i >= 0; i-- {
     if filteredMessages[i].Role == "user" {
@@ -196,15 +212,15 @@ for i := len(filteredMessages) - 1; i >= 0; i-- {
 }
 ```
 
-The official template walks backward and **skips user messages whose content is a `<tool_response>...</tool_response>` wrapper** (with `|trim` before checking). Upstream's `Qwen35Renderer` (lines 114-127) faithfully replicates this with `strings.TrimSpace(content)` before checking `strings.HasPrefix(content, "<tool_response>")`.
-
-In Ollama's protocol, tool responses typically use `role: "tool"` (not `role: "user"`), so this divergence is partially mitigated. But it's not fully safe — a client could send a user message with literal `<tool_response>` content. Upstream's approach is more robust.
+The official template walks backward and **skips user messages whose content is a `<tool_response>...</tool_response>` wrapper** (with `|trim` before checking). This is necessary for the HuggingFace `transformers` protocol where tool results are user messages. It is unnecessary for Ollama's protocol where tool results are `role: "tool"` messages.
 
 ---
 
 ## Part 2: What Upstream Should Fix
 
 ### 2.1 CRITICAL: Prefill triggers on assistant messages with tool calls
+
+**Fault: Upstream Ollama (`82848a78`).** All three upstream renderers — `qwen35.go`, `qwen3coder.go`, `qwen3vl.go` — have this bug. The fork (`9ec17fc1`) correctly fixed it in commit `fbae6976` by adding `&& len(message.ToolCalls) == 0` to the prefill condition. This is one of the fork's most valuable contributions. llama.cpp (`d969e933`) does not have this bug — it uses `add_generation_prompt` as a separate parameter passed to the Jinja2 template, which never conflates message closure with generation prompt skipping. Prefill is an Ollama-specific concept that llama.cpp does not need.
 
 **Files**: `model/renderers/qwen35.go:136`, `model/renderers/qwen3coder.go:140`, `model/renderers/qwen3vl.go:82`
 
@@ -232,6 +248,8 @@ The fork correctly adds `&& len(message.ToolCalls) == 0` in `qwen3coder.go:159` 
 
 ### 2.2 HIGH: `formatToolCallArgument` uses compact JSON for object/array parameters
 
+**Fault: Both upstream Ollama (`82848a78`) and the fork (`9ec17fc1`).** The `marshalWithSpaces` function already exists (upstream: `json.go:8-45`; fork: same file) and is used for tool **definitions**, but neither codebase uses it for tool call **arguments**. The fork acknowledged this at `qwen3coder.go:42-44` with a TODO comment but didn't fix it. Upstream never addressed it either. llama.cpp (`d969e933`) gets this right because the Jinja2 template uses `tojson` for tool call arguments too (e.g., `args_value | tojson | safe` for mappings/sequences), producing spaced JSON automatically.
+
 **File**: `model/renderers/qwen3coder.go:235-257` (shared by all renderers via tool call rendering)
 
 When a tool call parameter value is a map, slice, or array, `formatToolCallArgument` uses `json.Marshal()`, which produces **compact JSON**:
@@ -244,15 +262,15 @@ The official template uses Jinja2's `tojson` (via `args_value | tojson | safe` f
 Python:   {"key": "value", "nested": [1, 2, 3]}
 ```
 
-This was verified empirically: Python's `json.dumps()` default separators are `(', ', ': ')`, and `tojson` uses these defaults. The codebase already has `marshalWithSpaces` (used for tool **definitions**) but does NOT use it for tool call **arguments**. The fork even has a TODO at `qwen3coder.go:42-44` acknowledging this.
-
-This primarily matters for complex argument values (objects/arrays as tool call parameter values). Simple string/number arguments render identically. Both the fork and upstream have this bug.
+This was verified empirically: Python's `json.dumps()` default separators are `(', ', ': ')`, and `tojson` uses these defaults. Simple string/number arguments render identically. Both the fork and upstream have this bug.
 
 ### ~~2.3~~ RETRACTED: Go's `json.Marshal` HTML-escaping
 
 **Previous claim was WRONG.** Both Go's `json.Marshal` and Jinja2's `tojson` (which calls `json.htmlsafe_dumps`) produce the same `\u003c`/`\u003e`/`\u0026` unicode escapes for `<`, `>`, `&`. Verified empirically. The only real format differences are spacing (section 2.2) and key ordering (section 1.2 note).
 
 ### 2.4 MEDIUM: `</think>` not closed when content is empty in Qwen3VLRenderer
+
+**Fault: Upstream Ollama (`82848a78`).** The fork (`9ec17fc1`) correctly fixed this in commit `fbae6976` — the `</think>` tag is always emitted after thinking content. Upstream's `Qwen3VLRenderer` conditionally gates it on `content != ""`, leaving an unclosed `<think>` tag for thinking-only responses. llama.cpp (`d969e933`) always closes `</think>` — the parser at `chat-parser-xml-toolcall.cpp:756` enforces closure, and the Jinja2 template itself always emits the closing tag.
 
 **File**: `model/renderers/qwen3vl.go:96-100`
 
@@ -279,6 +297,8 @@ This no longer affects qwen3.5 (which now uses `Qwen35Renderer`, which always cl
 
 ### 2.5 MEDIUM: `repeat_last_n` API parameter silently ignored in Go runner
 
+**Fault: Upstream Ollama (`82848a78`).** The Go runner's `NewSampler` simply doesn't accept the parameter — the API field exists, the default exists (`api/types.go:1065`: `RepeatLastN: 64`), but nothing connects it to the sampler. The fork (`9ec17fc1`, commit `ab234955`) fixed this by adding `repeatLastN` as the 9th parameter to `NewSampler` and wiring `req.Options.RepeatLastN` through at `runner.go:899`. llama.cpp (`d969e933`) correctly wires `penalty_last_n` as a user-configurable parameter (`common.h:195`: `int32_t penalty_last_n = 64`) that flows through to `llama_sampler_init_penalties()`.
+
 **File**: `sample/samplers.go`
 
 Upstream's `NewSampler` signature (`sample/samplers.go:159`):
@@ -294,9 +314,9 @@ A user setting `repeat_last_n: 128` in the API has **zero effect** — the value
 
 **Caveat**: The value IS respected in the legacy C++ `llamarunner` at `runner/llamarunner/runner.go:651` (`RepeatLastN: req.Options.RepeatLastN`), which passes it to llama.cpp's C sampler. So this is a Go-runner-only regression, not a universal API lie. But the Go runner is the default for all new model architectures including qwen3next.
 
-The fork's `NewSampler` accepts `repeatLastN` (10th parameter) and sizes the ring buffer accordingly. The runner passes `req.Options.RepeatLastN` at line 899.
-
 ### 2.6 MEDIUM: `mropeInterleaved` defaults to `false` — wrong for third-party qwen35 GGUFs
+
+**Fault: Upstream Ollama (`82848a78`).** The fork (`9ec17fc1`, commit `9ec17fc1`) correctly defaults to `c.Architecture() != "qwen3next"` at `model.go:548`, which evaluates to `true` for qwen35 — matching llama.cpp's approach. llama.cpp (`d969e933`) **hardcodes** the RoPE type per architecture in `llama_model_rope_type()` at `llama-model.cpp:9109-9113`: `case LLM_ARCH_QWEN35: return LLAMA_ROPE_TYPE_IMROPE` (value 40). No GGUF metadata lookup needed — the architecture enum determines the RoPE type at model load. This is a **silent data corruption bug** in upstream Ollama: the model loads, runs, and produces text, but the positional encoding is wrong in every full-attention layer. Users would blame the model quality, not the inference engine.
 
 **File**: `model/models/qwen3next/model.go:641`
 
@@ -318,63 +338,56 @@ Third-party GGUFs (llama.cpp converter, Unsloth) do not write the ollama-interna
 
 With upstream's `false` default, all 16 full-attention layers in Qwen 3.5 27B use RoPE type 8 (MROPE) instead of 40 (IMROPE). These are completely different dimensional interleaving patterns for position encoding across the time/height/width sections. The model **silently produces wrong output** — it still runs, but attention patterns are misaligned across every full-attention layer.
 
-The fork correctly defaults to `c.Architecture() != "qwen3next"` — `true` for qwen35/qwen35moe (correct: interleaved MRoPE), `false` for legacy qwen3next (irrelevant: `mropeSections` is empty, so code falls through to `rope.WithTypeNeoX()`).
-
 Note: `ssm.v_head_reordered` defaults are functionally equivalent between fork (`c.Architecture() != "qwen3next"`) and upstream (`defaultVHeadReordered` which positively matches `"qwen35" || "qwen35moe"`). Both produce `true` for qwen35/qwen35moe and `false` for qwen3next.
 
 ### 2.7 LOW: `lastQueryIndex` initialization edge case + upstream Qwen3VL inconsistency
+
+**Fault: Upstream Ollama (`82848a78`).** Two minor bugs in upstream's renderers. Neither the fork nor upstream validates the "no user messages" edge case that the official Qwen3.5 template explicitly rejects with `raise_exception('No user query found in messages.')`.
 
 **File**: `model/renderers/qwen35.go:115`
 
 Upstream initializes `lastQueryIndex := len(messages) - 1`. If there are zero user messages (e.g., `[system, assistant]`), it stays at the last index. The check `i > lastQueryIndex` on line 143 is never true, so no assistant message gets `<think>` blocks.
 
-The official template raises an exception: `raise_exception('No user query found in messages.')`, so the edge case is explicitly rejected. Upstream silently produces incorrect output.
-
 Low practical impact — conversations without user messages are extremely unusual.
 
-**Additional finding**: Upstream has an inconsistency between its two `lastQueryIndex` implementations. `Qwen35Renderer` (qwen35.go:121) calls `strings.TrimSpace(content)` before checking tool-response prefixes, but `Qwen3VLRenderer` (qwen3vl.go:66) does NOT trim. This means whitespace-padded tool responses would be misclassified in the VL renderer but correctly handled in the 3.5 renderer.
+**Additional finding**: Upstream has an inconsistency between its two `lastQueryIndex` implementations. `Qwen35Renderer` (qwen35.go:121) calls `strings.TrimSpace(content)` before checking tool-response prefixes, but `Qwen3VLRenderer` (qwen3vl.go:66) does NOT trim. As established in section 1.9, the tool_response content check is redundant in Ollama's protocol anyway (tool responses use `role: "tool"`, not `role: "user"`), so this inconsistency has zero practical impact.
 
-### 2.8 LOW: `repeat_penalty` defaults to 1.0 — penalty system is dead code in Go runner
+### 2.8 LOW: `repeat_penalty` defaults to 1.0 — penalty system has zero effect with defaults
 
-With `repeatPenalty = 1.0` (identity), `frequencyPenalty = 0.0`, `presencePenalty = 0.0`: the penalty math is a complete no-op. `logit / 1.0 = logit`, `logit - 0.0*count = logit`, `logit - 0.0 = logit`. The entire `Accept()`/`Reset()` machinery in runner.go runs but has **zero effect on output**.
+**Fault: Both upstream Ollama (`82848a78`) and llama.cpp (`d969e933`).** Both inherited the same design of feeding prompt tokens into the penalty window. Ollama does it via `Accept()` (`runner.go:700` and `runner.go:956`). llama.cpp does it via `common_sampler_accept()` on all prompt tokens during `init_sampler()` (`server-context.cpp:208-212`). Both default to `repeat_penalty = 1.0` (Ollama: `api/types.go:1066`; llama.cpp: `common.h:196`), making the penalty system a no-op. This is a **known anti-pattern**: the original repetition penalty paper (Keskar et al. 2019, CTRL, arXiv:1909.05858) defines the penalty over *"generated tokens g"* — not prompt tokens. HuggingFace's `transformers` library had the same bug and [acknowledged it as problematic](https://github.com/huggingface/transformers/issues/36642) (users reported *"weird strings"* and false penalization of phrases like *"let's think step by step"*), adding an opt-in fix in [PR #37625](https://github.com/huggingface/transformers/pull/37625) (April 2025). llama.cpp users reported the [same problem](https://github.com/ggml-org/llama.cpp/issues/331): *"the repetition penalty is affecting the anti-prompt and response prefix."* OpenAI's `frequency_penalty` and `presence_penalty` almost certainly apply to completion tokens only (community consensus, never officially contradicted).
 
-The fork sets `RepeatPenalty: 1.1` (at `api/types.go:1066`, same line number in both codebases), making penalties actually functional — a ~9% logit reduction for repeated tokens (exact: `1 - 1/1.1 = 1/11 ~= 9.09%`).
+Both upstream Ollama and llama.cpp are **trapped by this design**: any `repeatPenalty > 1.0` would penalize the model for generating tokens that appeared in the prompt — tool names, parameter names, JSON keys. For Qwen3.5 tool calling, where the system prompt says `get_weather` and the model must generate `get_weather` verbatim, this would actively degrade tool selection. So both default to `1.0` (identity), making the entire penalty infrastructure dead work: `Accept()`/`Reset()` run every forward pass, `applyPenalty()` computes `logit / 1.0 = logit`, zero effect. llama.cpp even comments this explicitly: `float penalty_repeat = 1.00f; // 1.0 = disabled` (`common.h:196`).
 
-This is not just a preference. Upstream's 1.0 default is forced by a design constraint: upstream feeds prompt tokens into the penalty window via `Accept()`, so a non-trivial penalty would degrade tool calling by penalizing the model for using terms from the prompt. The fork avoids this problem by recording only generated tokens, making a non-trivial default safe. See section 3.1.
+The fork (`9ec17fc1`, commit `ab234955`) removed the `Accept()` calls and records only generated tokens via the private `recordToken()` method (called from `Sample()` at lines 62 and 84). This matches the original paper's intent and makes the `1.1` default (`api/types.go:1066`) safe. One remaining nuance: the fork **does** penalize the model's own thinking tokens (they're generated), so if `<think>I need to call get_weather</think>` is shorter than 64 tokens, the `get_weather` tokens are still in the penalty window when the model emits the actual tool call. At `1.1` this is mild (~9% logit reduction), but users who raise the penalty to `1.5+` would break tool calling even with the fork's architecture.
 
 ---
 
 ## Part 3: Things That Look Neutral But Are Actually Critical
 
-### 3.1 Prompt tokens excluded from penalty — CORRECT for agentic use, not a design choice
+### 3.1 Prompt tokens excluded from penalty — the fork matches the original paper, upstream matches llama.cpp's mistake
 
-**Why the fork removed `sampler.Accept()` from runner.go:**
+**Fault: Both upstream Ollama (`82848a78`) and llama.cpp (`d969e933`). The fork (`9ec17fc1`, commit `ab234955`) is the only one correct per the original academic formulation.**
 
-Upstream feeds prompt tokens into the penalty history via `Accept()` at **two call sites**:
+The repetition penalty was introduced by Keskar et al. (2019) in the CTRL paper (arXiv:1909.05858). The paper's formula operates over *"generated tokens g"* — the set of tokens the model has produced during inference. Prompt tokens are not in `g`. This is not ambiguous; the paper explicitly distinguishes the generation set from the conditioning context.
+
+**Upstream Ollama** feeds prompt tokens into the penalty history via `Accept()` at **two call sites**:
 
 1. **Sequence load** (`runner.go:951-957`): `seq.sampler.Reset()` (line 951) then loops through ALL cached inputs calling `seq.sampler.Accept(inp.Token)` (line 956). The last 64 prompt tokens become part of the penalty window.
 2. **Batch processing** (`runner.go:694-701`): As pending input tokens are committed to the cache, each token is `Accept()`-ed (line 700). Both prompt tokens and generated tokens flow through this path (the generated token becomes an input for the next forward pass).
 
-With `repeatPenalty > 1.0`, this means the model is **penalized for generating any token that appeared in the prompt**. Concrete example: if the user's prompt ends with the word "hello" (token 15339), that token is in the penalty window and gets penalized during generation.
+**llama.cpp** (`d969e933`) has the same behavior. The server's `init_sampler()` at `server-context.cpp:208-212` loops through ALL prompt tokens and calls `common_sampler_accept(smpl.get(), id, false)` on each one. This feeds prompt tokens into the penalty ring buffer (`llama-sampler.cpp:2644-2656`), same as Ollama upstream.
 
-In an agentic CLI context:
-- User prompt contains tool names (`get_weather`, `run_command`), function names, parameter names, code constructs
-- The model MUST reproduce these exactly in tool calls
-- Upstream's approach actively discourages this — the model is penalized for generating the exact tokens it needs
+This is the same mistake HuggingFace `transformers` made (and [acknowledged as a bug](https://github.com/huggingface/transformers/issues/36642) — users reported *"weird strings"* and false penalization of common phrases, fixed in [PR #37625](https://github.com/huggingface/transformers/pull/37625), April 2025). llama.cpp users reported the [same problem](https://github.com/ggml-org/llama.cpp/issues/331): *"the repetition penalty is affecting the anti-prompt and response prefix."* All three projects (Ollama upstream, llama.cpp, HuggingFace) feed prompt tokens into the penalty window because it's the simplest implementation — you just call `accept()` on every token. The correct implementation requires distinguishing prompt tokens from generated tokens, which is what the fork does.
 
-The fork's `runner.go` has **neither call site**. The equivalent sequence-load code (lines 937-945) does NOT call `Reset()`/`Accept()`. The equivalent batch-processing code (lines 693-696) just commits pending inputs to the cache without calling `Accept()`. Instead, the sampler records tokens internally via `recordToken()` (a private method called only from `Sample()` at lines 62 and 84).
-
-The fork's decision to record only generated tokens is not a "design choice" — it is a **correctness requirement** for agentic tool-calling models. This also explains why upstream defaults `repeatPenalty` to 1.0 — with prompt tokens in the history, any non-trivial penalty would degrade tool calling. The fork can safely default to 1.1 because only generated tokens are penalized.
+The fork's `runner.go` has **neither call site**. The sampler records tokens internally via the private `recordToken()` method (called only from `Sample()` at lines 62 and 84). No external code can feed prompt tokens into the penalty window because there is no public API to do so. This matches the original paper's intent and is the **correct** behavior for agentic tool-calling models where the prompt contains tool names the model must reproduce verbatim. The fork is the only implementation among all four (Ollama upstream, llama.cpp, HuggingFace pre-fix, Ollama fork) that gets this right by default.
 
 ### 3.2 Ring buffer is independent of KV cache state — this is a correctness property
 
-The fork's self-contained ring buffer in `Sample()` is not just "a different approach." It has a critical architectural property: **the penalty window is a property of the generation session, not a mirror of the KV cache.**
+**Fault: Upstream Ollama (`82848a78`) couples penalty state to KV cache operations; the fork (`9ec17fc1`) correctly decouples them.**
 
-**Fork's architecture** (`sample/samplers.go:19-32`): The `Sampler` struct contains `recentTokens []int32` (the ring buffer slice), `recentTokenPos int` (write cursor), and `repeatLastN int` (window size from API). `recordToken()` (lines 196-206) implements a classic circular buffer with grow-then-wrap semantics:
-- **Phase 1 (grow)**: While `len(recentTokens) < repeatLastN`, tokens are appended to the slice.
-- **Phase 2 (wrap)**: Once full, new tokens overwrite at `recentTokenPos`, cursor advances via `(pos + 1) % repeatLastN`.
+**Fork's architecture** (`sample/samplers.go:19-32`): The `Sampler` struct contains `recentTokens []int32` (ring buffer), `recentTokenPos int` (write cursor), and `repeatLastN int` (window size from API, user-configurable). `recordToken()` (lines 196-206) implements a classic circular buffer: O(1) per token, zero allocations after warmup, permanently bounded at `repeatLastN` entries. The runner's only interaction is `seq.sampler.Sample(logits)` at line 760 — it never touches internal state.
 
-O(1) per token, zero allocations after warmup, permanently bounded at `repeatLastN` entries. The runner's only interaction is `seq.sampler.Sample(logits)` at line 760 — it never touches internal state.
+**llama.cpp's architecture** (`d969e933`, `llama-sampler.cpp:23-132`): Uses a proper `ring_buffer<llama_token>` template class with the same design — fixed capacity, O(1) push, modular arithmetic. The ring buffer is initialized with `penalty_last_n` capacity at `llama-sampler.cpp:2763`. The key difference: llama.cpp's `llama_sampler_penalties_accept()` is a **public** function called by external code (the server feeds prompt tokens through it), while the fork's `recordToken()` is **private** and called only from `Sample()`. Both use ring buffers, but the fork's encapsulation prevents the prompt-token contamination problem (see 3.1).
 
 **Upstream's architecture** (`sample/samplers.go:21-32`): The `Sampler` struct contains `history []int32` (an append-then-truncate slice). `Accept()` (lines 38-43) appends the token, then if `len(history) > DefaultPenaltyLookback`, copies the last 64 entries to the front of the slice and truncates — a **slide-and-truncate** pattern (O(n) per trim, allocates on growth). `Reset()` (line 36) sets history to nil. The runner calls these externally at 3 separate call sites (cache load at line 951+956, pending inputs at line 700, reprocess error at line 565).
 
@@ -386,17 +399,19 @@ An earlier version of this report listed "ring buffer not cleared on cache shift
 
 ### 3.3 Default RepeatPenalty 1.1 vs 1.0 — enables the penalty system to actually work
 
-This is not a policy preference. With upstream's 1.0 default:
+This is not a policy preference. With upstream Ollama's and llama.cpp's 1.0 default:
 - The penalty math is identity (no effect on any logit)
 - The Accept/Reset bookkeeping is wasted work
-- The `repeat_last_n` API parameter is doubly useless (hardcoded to 64, AND the penalty is 1.0)
+- The `repeat_last_n` API parameter is doubly useless (hardcoded to 64 in upstream, AND the penalty is 1.0)
+- llama.cpp explicitly comments: `float penalty_repeat = 1.00f; // 1.0 = disabled` (`common.h:196`)
 
 With the fork's 1.1 default:
 - Repeated positive logits are divided by 1.1 (~9% reduction); negative logits are multiplied by 1.1 (10% further suppression)
 - The ring buffer actually serves a purpose
 - The `repeat_last_n` parameter controls something real
+- This is safe ONLY because the fork excludes prompt tokens (see 3.1) — with prompt tokens in the window (as in llama.cpp and upstream), 1.1 would degrade tool calling
 
-The exact penalty math in both codebases (fork `transforms.go:134-139`, upstream `transforms.go:50-57`) is identical:
+The exact penalty math in all three codebases (fork `transforms.go:134-139`, upstream `transforms.go:50-57`, llama.cpp `llama-sampler.cpp:2690-2696`) is identical:
 ```
 if logit > 0: logit /= repeatPenalty
 if logit < 0: logit *= repeatPenalty
@@ -420,7 +435,7 @@ if q.shouldReorderVHeads() { kv["ssm.v_head_reordered"] = true }              //
 
 For `rope.mrope_interleaved`: upstream's conditional emission is fine for Ollama-converted GGUFs (the converter writes `true` for qwen35, which is correct). The risk is for third-party GGUFs that omit the key — upstream defaults to `false` (wrong for qwen35), the fork defaults based on architecture (correct). See section 2.6.
 
-Note: `ssm.v_head_reordered` and `rope.mrope_interleaved` are **ollama-internal conventions**. They do not exist in llama.cpp's GGUF constants (`gguf-py/gguf/constants.py`). llama.cpp infers the equivalent behavior by hardcoding per-architecture decisions in C++. Third-party GGUFs from Unsloth, bartowski, or llama.cpp's converter will **never** contain these keys.
+Note: `ssm.v_head_reordered` and `rope.mrope_interleaved` are **ollama-internal conventions**. They do not exist in llama.cpp's GGUF constants (`gguf-py/gguf/constants.py`, confirmed in `d969e933`). llama.cpp sidesteps the problem entirely: RoPE type is hardcoded per architecture in `llama_model_rope_type()` (`llama-model.cpp:9109-9113`), and V-head reordering is done **physically during GGUF conversion** by `_LinearAttentionVReorderBase` (`convert_hf_to_gguf.py:4782-4791`) — the converter permutes tensor weights so no runtime flag is needed. Third-party GGUFs from Unsloth, bartowski, or llama.cpp's converter will **never** contain these keys.
 
 For `ssm.v_head_reordered`: the runtime defaults are equivalent between fork and upstream (`true` for qwen35/qwen35moe, `false` for qwen3next). The unconditional emission is defense-in-depth.
 
@@ -435,7 +450,7 @@ for i := range numLayers {
 }
 ```
 
-This formula `(i+1)%interval != 0` is identical to llama.cpp's `((int(il) + 1) % full_attention_interval != 0)` at `llama-model.cpp:2291`, with the same comment: `// TODO: extract the magic 4 from "full_attention_interval"`. However, the fork does NOT replicate llama.cpp's outer guard (`if (recurrent_layer_arr.empty())`) — llama.cpp only falls back to interval computation if the per-layer array wasn't already populated from GGUF metadata.
+This formula `(i+1)%interval != 0` is identical to llama.cpp's (`d969e933`) `((i + 1) % full_attn_interval != 0)` at `llama-model.cpp:2526` (for `LLM_ARCH_QWEN35`). llama.cpp reads `full_attention_interval` from GGUF metadata via `ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false)` with a default of 4, then populates `hparams.recurrent_layer_arr[i]` with the same formula. The fork does NOT replicate llama.cpp's outer guard (`if (recurrent_layer_arr.empty())`) — llama.cpp only falls back to interval computation if the per-layer array wasn't already populated from GGUF metadata.
 
 Upstream's `inferRecurrentLayers()` (52 lines, `model.go:497-549`) is closer to llama.cpp's complete behavior:
 1. **Primary**: If `headCountKV` is a per-layer array with a mix of zero (recurrent) and non-zero (full attention) values, use it directly.
@@ -492,6 +507,8 @@ The `Qwen35Renderer` includes image support via `renderContent()`, correct tools
 
 **Assessment**: The upstream's strategy is architecturally cleaner and results in each model getting exactly the right behavior. The fork's strategy shares improvements but creates template-specific bugs for qwen3.5. For the ideal implementation, create a dedicated `Qwen35Renderer` and `Qwen35Parser` that take the best from both.
 
+**The llama.cpp contrast**: llama.cpp (`d969e933`) avoids this entire problem class by executing the Jinja2 template from the GGUF file directly (`chat.cpp:631-639`). Each model carries its own template, so there is no renderer routing, no shared renderer bugs, no format mismatches. Qwen3-Coder gets XML definitions because its template says so; Qwen3.5 gets JSON definitions because its template says so. The entire Part 1 sections 1.2, 1.3, 1.7, 1.8 — all collateral damage from Ollama's Go renderer architecture — simply do not exist in llama.cpp. Ollama chose to reimplement template rendering in Go (presumably for performance and control), but the cost is exactly this class of bugs: every model that deviates from the Qwen3-Coder format needs a new dedicated renderer. llama.cpp's Jinja2 approach trades some performance for correctness-by-construction.
+
 ---
 
 ## Part 6: The Ideal Implementation — Best of Both Worlds
@@ -502,43 +519,38 @@ The `Qwen35Renderer` includes image support via `renderContent()`, correct tools
 
 **Goal**: An Ollama implementation that produces inference output **identical** to what the Qwen 3.5 27B model would produce if run through its official HuggingFace Jinja2 chat template with correct RoPE configuration, correct layer type classification, correct V-head ordering, correct penalty sampling semantics, and correct thinking/tool-call parsing — taking the best components from both the `BigBIueWhale/ollama` fork (commit `9ec17fc1`) and the `ollama/ollama` upstream (commit `82848a78`).
 
-Every subsection below explains: what the correct behavior is, who implemented it correctly (the fork author or the upstream Ollama developers), why the alternative is wrong, and what breaks if you get it wrong — all grounded in the specific metadata and tensor layout of the `Qwen3.5-27B-UD-Q4_K_XL.gguf` file.
+Every subsection below explains: what the correct behavior is, who implemented it correctly (the fork author, the upstream Ollama developers, or llama.cpp `d969e933`), why the alternative is wrong, and what breaks if you get it wrong — all grounded in the specific metadata and tensor layout of the `Qwen3.5-27B-UD-Q4_K_XL.gguf` file.
 
 ---
 
-### 6.1 GatedDeltaNet Chunk Assembly: Balanced Concat Tree (from Upstream)
+### 6.1 GatedDeltaNet Chunk Assembly: SetInplace (from llama.cpp) vs Balanced Concat Tree (Ollama workaround)
 
-**Who got it right**: The upstream Ollama developers, in commit `3490e959`.
-**Who got it wrong**: The fork, which uses `SetInplace` at `deltanet.go:466-473`.
+**Who got it right**: llama.cpp (`d969e933`) and the fork both use `ggml_set_inplace()` (`delta-net-base.cpp:262` and `deltanet.go:466`). The upstream Ollama developers used a balanced concat tree (commit `3490e959`) as a **workaround** for their stale GGML vendor.
 
-**What the Unsloth Qwen 3.5 27B GGUF requires**: The `Qwen3.5-27B-UD-Q4_K_XL.gguf` has 64 layers (`qwen35.block_count = 64`) with `full_attention_interval = 4`. This means 48 of those 64 layers are GatedDeltaNet recurrent layers (layers 0, 1, 2, 4, 5, 6, 8, ... — every layer where `(i+1) % 4 != 0`). Each GatedDeltaNet layer's `deltaNetChunked` function splits the input sequence into chunks of 64 tokens (the constant `chunkSize = 64` at `deltanet.go:12`). For a 2048-token prompt, that's 32 chunks per layer, across 48 recurrent layers — 1,536 chunk assembly operations total.
+**The core issue**: Ollama vendors GGML from llama.cpp but does not track llama.cpp master closely. llama.cpp master has added `GGML_OP_SET` support to Metal (`ggml-metal-device.m:1162`, `ggml-metal-ops.cpp:429`) and Vulkan (`ggml-vulkan.cpp:9037-9041`). Ollama's vendored GGML does NOT have these kernels — confirmed: searching Ollama's `ml/backend/ggml/ggml/src/ggml-metal/` finds only `GGML_OP_SET_ROWS`, not `GGML_OP_SET`.
 
-**Why SetInplace crashes on Apple Silicon Macs**: The `SetInplace` method maps to the GGML C operation `GGML_OP_SET` (via `C.ggml_set_inplace()` → `ggml_set_impl(..., true)` → `result->op = GGML_OP_SET`). This operation is only implemented in two of GGML's four compute backends:
+**Backend support comparison**:
 
-| GGML Compute Backend | `GGML_OP_SET` Support | `GGML_OP_CONCAT` Support |
-|-----|-----|-----|
-| CPU backend (`ggml-cpu.c:1820`) | **Yes** — dispatches to `ggml_compute_forward_set()` | Yes |
-| NVIDIA CUDA backend (`ggml-cuda.cu:2577`) | **Yes** — dispatches to `ggml_cuda_op_set()` | Yes |
-| Apple Metal backend (`ggml-metal-device.m:929-1186`) | **No** — falls through to `default: return false` | **Yes** (line 987) |
-| Vulkan backend (`ggml-vulkan.cpp`) | **No** — only `GGML_OP_SET_ROWS` is implemented | **Yes** |
+| GGML Backend | Ollama's GGML `GGML_OP_SET` | llama.cpp master `GGML_OP_SET` | `GGML_OP_CONCAT` (both) |
+|-----|-----|-----|-----|
+| CPU | Yes | Yes | Yes |
+| CUDA | Yes | Yes | Yes |
+| Metal | **No** | **Yes** (`ggml-metal-device.m:1162`) | Yes |
+| Vulkan | **No** | **Yes** (`ggml-vulkan.cpp:9037`) | Yes |
 
-Note: `GGML_OP_SET_ROWS` (supported by Metal at line 1159) is a completely different operation — it scatters rows from a source tensor into a destination tensor at positions specified by an index tensor, purpose-built for KV cache updates. `GGML_OP_SET` copies a smaller tensor into an arbitrary byte-offset region of a larger tensor. They share a name prefix but have entirely different semantics and implementations.
+The fork author followed the llama.cpp reference implementation. On Ollama's vendored GGML, this breaks Apple Silicon and Vulkan. The upstream Ollama developers' concat tree workaround is necessary until Ollama updates its GGML vendor.
 
-On any Apple Silicon Mac (MacBook Air M1/M2/M3/M4, MacBook Pro, Mac Mini, Mac Studio, Mac Pro, iMac — all of which use the Metal backend for GPU inference), the GatedDeltaNet layers will fail when `GGML_OP_SET` is dispatched. The Metal backend's `ggml_metal_device_supports_op` function returns `false` for this operation. What happens next depends on the GGML scheduler's fallback behavior: it may attempt to run the operation on CPU, but the tensor `v` that `SetInplace` writes into is a `Mulmat` result (line 405: `v = vBetaT.Mulmat(ctx, attn)`) whose data buffer was allocated in Metal GPU memory (an `MTLBuffer`). The CPU backend's implementation at `ggml-cpu/ops.cpp:4380-4451` directly dereferences `dst->data` as a CPU memory pointer — writing to a Metal GPU buffer this way causes a crash (`EXC_BAD_ACCESS`), silent data corruption, or a "buffer-less intermediate" failure where the GGML scheduler cannot find any backend willing to execute the operation with the given buffer types.
+**What breaks on Ollama's current GGML**: On any Apple Silicon Mac, the Metal backend's `ggml_metal_device_supports_op` returns `false` for `GGML_OP_SET`. The GGML scheduler may fall back to CPU, but the tensor buffer is in Metal GPU memory (`MTLBuffer`). Attempting to dereference it as a CPU pointer causes `EXC_BAD_ACCESS`, silent data corruption, or a "buffer-less intermediate" failure.
 
-The upstream Ollama developers' comment at `deltanet.go:457-458` is explicit about this: *"Avoids SET on buffer-less intermediates under partial offload."*
+**What the balanced concat tree does instead**: Upstream collects chunk outputs into a slice, merges via balanced binary `Concat` tree (lines 496-507). `GGML_OP_CONCAT` is supported on all backends in all GGML versions. O(log N) graph depth vs linear SET chain.
 
-**What the balanced concat tree does instead**: Instead of mutating tensor `v` in-place 32 times (for a 2048-token prompt), the upstream collects each chunk's result tensor into a Go slice (`chunks[chunk] = coreAttnOutChunk` at line 482), then merges them via a balanced binary tree of `Concat` operations along dimension 2 (lines 496-507). `GGML_OP_CONCAT` IS supported by the Metal backend (line 987 of `ggml-metal-device.m`), so all operations stay on the GPU. The tree has O(log N) depth — for 32 chunks, that's 5 levels of merging (16 + 8 + 4 + 2 + 1 = 31 concat operations), versus a linear chain of 32 `SET` operations. Beyond correctness, the balanced tree also prevents O(N^2) data movement that would occur with a naive left-to-right sequential concat chain — each level does O(N) work, for O(N log N) total.
-
-`SetInplace` is the **only** call to `GGML_OP_SET` in the entire Ollama codebase — confirmed by searching all hits: `ml/backend.go:198` (interface declaration), `ml/backend/ggml/ggml.go:1348` (Go binding), `model/models/qwen3next/deltanet.go:466` (the sole call site). No other model architecture uses it.
-
-**What breaks if you don't fix this**: The Qwen 3.5 27B model is completely unusable on any Apple Silicon Mac. Since Macs are the single largest segment of Ollama's user base, this is a showstopper. It also fails on any system using the Vulkan GPU backend (common on Linux with AMD GPUs). Only CPU-only inference and NVIDIA CUDA systems would work.
+**Fix for the fork**: Either (a) replace with upstream's concat tree until Ollama updates GGML, or (b) backport the `GGML_OP_SET` Metal/Vulkan kernels from llama.cpp into Ollama's vendored GGML. Option (a) is simpler and safer.
 
 ---
 
-### 6.2 Tool Definition Format: Spaced JSON Objects (from Upstream)
+### 6.2 Tool Definition Format: Spaced JSON Objects (from llama.cpp and Upstream)
 
-**Who got it right**: The upstream Ollama developers, in commit `82848a78`, who created a dedicated `Qwen35Renderer` with `marshalWithSpaces(tool)` for tool definitions.
+**Who got it right**: llama.cpp (`d969e933`) gets this right automatically by executing the Jinja2 template from the GGUF (`chat.cpp:631-639`), passing tools as JSON objects to the template context (`chat.cpp:813-820`). The upstream Ollama developers, in commit `82848a78`, manually reimplemented this in Go with a dedicated `Qwen35Renderer` using `marshalWithSpaces(tool)`.
 **Who got it wrong**: The fork, which routes `qwen3.5` through `Qwen3CoderRenderer` (at `renderer.go:59-60`) and renders tool definitions in XML format.
 
 **What the official Qwen 3.5 training template specifies**: The Qwen team at Alibaba published the official Jinja2 chat template in `Qwen/Qwen3.5-35B-A3B/tokenizer_config.json` on HuggingFace (publicly accessible, no authentication required). Line 49 of the template renders each tool as `{{ tool | tojson }}`. Jinja2's `tojson` filter calls Python's `json.htmlsafe_dumps()`, which uses Python's default separators `(', ', ': ')` — producing **spaced JSON** with spaces after every colon and comma. It also **sorts keys alphabetically** and HTML-escapes `<`, `>`, `&` to `\u003c`, `\u003e`, `\u0026`.
@@ -576,7 +588,7 @@ One minor remaining difference: Go's `json.Marshal` serializes struct fields in 
 
 ### 6.3 System Message and Tools Ordering: Tools First, System After (from Upstream)
 
-**Who got it right**: The upstream Ollama developers in the `Qwen35Renderer` (lines 90-107 of `qwen35.go`).
+**Who got it right**: llama.cpp (`d969e933`) via Jinja2 template execution, and the upstream Ollama developers in the `Qwen35Renderer` (lines 90-107 of `qwen35.go`).
 **Who got it wrong**: The fork, which uses `Qwen3CoderRenderer` and puts the system message first.
 
 **What the official Qwen 3.5 training template specifies**: When both tools and a system message are present, the template renders a single `<|im_start|>system\n...` block with this exact structure:
@@ -613,10 +625,10 @@ Note: this system-first ordering and default injection IS correct for the Qwen3-
 
 ### 6.4 Prefill Detection: Must Exclude Tool-Call Messages (from Fork)
 
-**Who got it right**: The fork author, who added `&& len(message.ToolCalls) == 0` to the prefill condition in both `qwen3coder.go:159` and `qwen3vl.go:82`.
-**Who got it wrong**: All three upstream renderers (`qwen35.go:136`, `qwen3coder.go:140`, `qwen3vl.go:82`), which use `prefill := lastMessage && message.Role == "assistant"` without checking for tool calls.
+**Who got it right**: The fork author, who added `&& len(message.ToolCalls) == 0` to the prefill condition in both `qwen3coder.go:159` and `qwen3vl.go:82`. llama.cpp (`d969e933`) does not have this bug because it uses `add_generation_prompt` as a separate Jinja2 parameter — the template never conflates message closure with generation prompt skipping.
+**Who got it wrong**: All three upstream Ollama renderers (`qwen35.go:136`, `qwen3coder.go:140`, `qwen3vl.go:82`), which use `prefill := lastMessage && message.Role == "assistant"` without checking for tool calls.
 
-**What Ollama's prefill mechanism does**: When the last message in a chat completion request is an assistant message, Ollama treats it as a "prefill" — the assistant's content is emitted without a closing `<|im_end|>` tag, and no new `<|im_start|>assistant\n<think>\n` generation prompt is appended. This allows the model to continue generating from where the assistant left off, as if the assistant's message were incomplete. This is an Ollama-specific feature with no equivalent in the official Jinja2 template.
+**What Ollama's prefill mechanism does**: When the last message in a chat completion request is an assistant message, Ollama treats it as a "prefill" — the assistant's content is emitted without a closing `<|im_end|>` tag, and no new `<|im_start|>assistant\n<think>\n` generation prompt is appended. This allows the model to continue generating from where the assistant left off, as if the assistant's message were incomplete. This is an Ollama-specific feature with no equivalent in the official Jinja2 template or llama.cpp.
 
 **Why it must exclude tool calls**: When the last assistant message contains tool calls (e.g., the model called `get_weather` and is waiting for the tool response), Ollama's upstream prefill logic incorrectly treats it as an incomplete assistant message. In the `Qwen35Renderer` and `Qwen3VLRenderer`, this causes **two** things to break simultaneously:
 1. The `<|im_end|>` after the assistant's tool call is **skipped** (gated by `if !prefill` at qwen35.go:169 / qwen3vl.go:122)
@@ -632,7 +644,7 @@ The official Qwen 3.5 Jinja2 template **always** emits `<|im_end|>` after every 
 
 ### 6.5 `</think>` Closure: Must Always Close (from Fork's Qwen3VL Fix)
 
-**Who got it right**: The fork author, in the `Qwen3VLRenderer` at `qwen3vl.go:95-103`, where `</think>` is always emitted after thinking content, even when visible content is empty.
+**Who got it right**: The fork author, in the `Qwen3VLRenderer` at `qwen3vl.go:95-103`, where `</think>` is always emitted after thinking content, even when visible content is empty. llama.cpp (`d969e933`) also always closes `</think>` — the Jinja2 template unconditionally emits it, and the parser at `chat-parser-xml-toolcall.cpp:756` enforces closure.
 **Who got it wrong**: Upstream's `Qwen3VLRenderer` (`qwen3vl.go:95-103`), which only emits `\n</think>\n\n` when `content != ""`.
 
 **What the official Qwen 3.5 training template specifies**: For assistant messages after `last_query_index`, the template unconditionally emits `<think>\n{reasoning}\n</think>\n\n{content}` — the `</think>` tag is always present, even if reasoning is empty (producing `<think>\n\n</think>\n\n`). There is no path in the template that opens `<think>` without closing it.
@@ -645,7 +657,7 @@ Note: the `Qwen35Renderer` in upstream (used for qwen3.5 specifically) DOES alwa
 
 ### 6.6 lastQueryIndex with Tool-Response Filtering and TrimSpace (from Upstream)
 
-**Who got it right**: The upstream Ollama developers in the `Qwen35Renderer` (lines 114-127 of `qwen35.go`).
+**Who got it right**: llama.cpp (`d969e933`) via Jinja2 template execution (the template's `last_query_index` logic runs natively), and the upstream Ollama developers in the `Qwen35Renderer` (lines 114-127 of `qwen35.go`).
 **Who got it wrong**: The fork, which uses a simple "find last user message" loop without filtering tool responses (lines 149-155 of `qwen3coder.go`).
 
 **What `lastQueryIndex` controls**: In the Qwen 3.5 chat template, `lastQueryIndex` identifies the last **real user query** (not a tool response wrapped as a user message). Thinking blocks (`<think>...</think>`) are only emitted for assistant messages that appear **after** `lastQueryIndex`. For assistant messages at or before `lastQueryIndex` (i.e., from previous rounds of the conversation), thinking traces are **completely stripped** — only the visible content is rendered. This prevents the model from seeing its own prior thinking, which the Qwen team determined produces better multi-turn performance.
@@ -662,7 +674,7 @@ Note: the `Qwen35Renderer` in upstream (used for qwen3.5 specifically) DOES alwa
 
 ### 6.7 Dedicated Qwen35Parser with Two-Layer Architecture (from Upstream)
 
-**Who got it right**: The upstream Ollama developers, who created `Qwen35Parser` in `model/parsers/qwen35.go`.
+**Who got it right**: The upstream Ollama developers, who created `Qwen35Parser` in `model/parsers/qwen35.go`. llama.cpp (`d969e933`) handles parsing via `chat-parser-xml-toolcall.cpp`, which detects `<tool_call>` XML markers and has explicit thinking block extraction logic — the parser is model-agnostic since the template itself determines the output format.
 **Who got it wrong**: The fork, which routes `qwen3.5` through `Qwen3CoderParser` with thinking flags bolted on (at `parsers.go:52-53`).
 
 **What the `Qwen35Parser` does**: The upstream `Qwen35Parser` (239 lines) uses a clean two-layer architecture:
@@ -682,7 +694,7 @@ The `Qwen35Parser.Init()` also checks for assistant prefill at line 56: `assista
 ### 6.8 Repetition Penalty Sampler: Ring Buffer Recording Only Generated Tokens (from Fork)
 
 **Who got it right**: The fork author, who redesigned the `Sampler` struct in `sample/samplers.go` to use a self-contained ring buffer that records only tokens produced by `Sample()`.
-**Who got it wrong**: The upstream Ollama developers, whose sampler feeds both prompt tokens and generated tokens into the penalty window via externally-called `Accept()`.
+**Who got it wrong**: Both upstream Ollama and llama.cpp (`d969e933`). Upstream Ollama feeds both prompt and generated tokens via externally-called `Accept()`. llama.cpp does the same: `server-context.cpp:208-212` calls `common_sampler_accept()` on ALL prompt tokens during `init_sampler()`, feeding them into the penalty ring buffer at `llama-sampler.cpp:2644-2656`. The fork is the only implementation that correctly restricts the penalty window to generated tokens only.
 
 **What the Qwen 3.5 27B model needs for agentic tool calling**: The `Qwen3.5-27B-UD-Q4_K_XL.gguf` model is designed for multi-step agentic workflows where the model calls tools (functions) by name and receives structured results. In a typical agentic conversation:
 
@@ -716,7 +728,7 @@ The ring buffer implements classic O(1) circular buffer semantics:
 
 Zero allocations after warmup. Permanently bounded at `repeatLastN` entries. The window size is user-configurable via the `repeat_last_n` API parameter, which flows through `api/types.go` (default 64 at line 1065) → `runner.go` line 899 → `NewSampler` parameter 9 → `Sampler.repeatLastN` field.
 
-**Why upstream defaults `RepeatPenalty` to 1.0**: With prompt tokens in the penalty window, any `repeatPenalty > 1.0` would degrade tool calling. Setting it to 1.0 (identity) makes the entire penalty math a no-op: `logit / 1.0 = logit`. The upstream developers were forced into this default by their architectural decision to feed prompt tokens into the penalty window. This means the entire `Accept()`/`Reset()` machinery runs but has **zero effect on output** — it is dead code.
+**Why upstream Ollama and llama.cpp both default `RepeatPenalty` to 1.0**: With prompt tokens in the penalty window, any `repeatPenalty > 1.0` would degrade tool calling. Setting it to 1.0 (identity) makes the entire penalty math a no-op: `logit / 1.0 = logit`. Both projects were forced into this default by their architectural decision to feed prompt tokens into the penalty window. llama.cpp comments this explicitly: `float penalty_repeat = 1.00f; // 1.0 = disabled` (`common.h:196`). The entire `Accept()`/`Reset()` machinery runs but has **zero effect on output** — it is dead code in both projects.
 
 **Why the fork defaults `RepeatPenalty` to 1.1**: Because the fork's ring buffer only contains generated tokens, a non-trivial penalty is safe. The 1.1 value means: for a token the model already generated recently, positive logits are divided by 1.1 (~9.09% reduction: `1 - 1/1.1 = 1/11`) and negative logits are multiplied by 1.1 (pushed 10% further negative). This actively discourages the Qwen 3.5 27B model from degenerating into repetitive loops — a common failure mode in long-context generation with the model's 262,144-token context window.
 
@@ -728,7 +740,7 @@ Zero allocations after warmup. Permanently bounded at `repeatLastN` entries. The
 
 ### 6.9 mropeInterleaved Default: Architecture-Based (from Fork)
 
-**Who got it right**: The fork author, at `model.go:548`: `mropeInterleaved: c.Bool("rope.mrope_interleaved", c.Bool("mrope_interleaved", c.Architecture() != "qwen3next"))`.
+**Who got it right**: llama.cpp (`d969e933`) hardcodes this per architecture: `case LLM_ARCH_QWEN35: return LLAMA_ROPE_TYPE_IMROPE` at `llama-model.cpp:9109-9113` — no GGUF metadata lookup, no default mismatch possible. The fork author achieves the same result via `model.go:548`: `c.Architecture() != "qwen3next"` evaluates to `true` for qwen35.
 **Who got it wrong**: The upstream Ollama developers, at `model.go:641`: `mropeInterleaved: c.Bool("rope.mrope_interleaved", c.Bool("mrope_interleaved", false))`.
 
 **What the `Qwen3.5-27B-UD-Q4_K_XL.gguf` file contains — and does not contain**: The GGUF metadata was inspected in full (49 metadata keys, 851 tensors). The file has `general.architecture = "qwen35"` and `qwen35.rope.dimension_sections = [11, 11, 10, 0]` (the M-RoPE section sizes for time, height, width, and extra dimensions). It does **NOT** contain any of these keys:
@@ -765,7 +777,7 @@ For **text-only inference** (which is the case for the `Qwen3.5-27B-UD-Q4_K_XL.g
 
 ### 6.10 V-Head Reordering Default: Architecture-Based (Both Correct)
 
-**Who got it right**: Both the fork and upstream. The fork uses `c.Architecture() != "qwen3next"` (line 539); upstream uses `defaultVHeadReordered(c.Architecture())` which returns `arch == "qwen35" || arch == "qwen35moe"` (lines 493-495, 632). Both evaluate to `true` for `qwen35` and `false` for `qwen3next`.
+**Who got it right**: All three. The fork uses `c.Architecture() != "qwen3next"` (line 539); upstream uses `defaultVHeadReordered(c.Architecture())` which returns `arch == "qwen35" || arch == "qwen35moe"` (lines 493-495, 632). Both evaluate to `true` for `qwen35` and `false` for `qwen3next`. llama.cpp (`d969e933`) sidesteps the runtime flag entirely: the converter physically reorders V-head weights during GGUF conversion via `_LinearAttentionVReorderBase._reorder_v_heads()` (`convert_hf_to_gguf.py:4782-4791`). The permuted weights are stored in the GGUF, so no runtime reordering flag is needed.
 
 **What the `Qwen3.5-27B-UD-Q4_K_XL.gguf` file requires**: The GGUF does NOT contain `ssm.v_head_reordered` (confirmed absent from the 49 metadata keys). The architecture is `qwen35`. Both codebases default to `true`, which is correct.
 
@@ -780,8 +792,8 @@ Getting this wrong silently produces garbage output in all 48 recurrent layers �
 
 ### 6.11 Recurrent Layer Classification: Interval Formula (from Fork)
 
-**Who got it right**: Both, but the fork's approach is simpler and more robust for the `Qwen3.5-27B-UD-Q4_K_XL.gguf`.
-**Fork**: 4-line inline computation at `model.go:472-476` using `(i+1) % interval != 0`.
+**Who got it right**: All three use the same formula. llama.cpp (`d969e933`) reads `full_attention_interval` from GGUF metadata (default 4) and computes `((i + 1) % full_attn_interval != 0)` at `llama-model.cpp:2526`, storing results in `hparams.recurrent_layer_arr[]`.
+**Fork**: 4-line inline computation at `model.go:472-476` using `(i+1) % interval != 0` — identical to llama.cpp.
 **Upstream**: 52-line `inferRecurrentLayers()` function at `model.go:497-549` with a primary path through `headCountKV` and a fallback to the interval formula.
 
 **What the `Qwen3.5-27B-UD-Q4_K_XL.gguf` contains**: `qwen35.attention.head_count_kv = 4` — a **scalar** UINT32 value, not a per-layer array. And `qwen35.full_attention_interval = 4`.
@@ -794,8 +806,9 @@ The fork skips the `headCountKV` indirection entirely and goes straight to the i
 
 ### 6.12 Unconditional GGUF KV Emission in Converter (from Fork)
 
-**Who got it right**: The fork, which always writes both `rope.mrope_interleaved` and `ssm.v_head_reordered` to the GGUF regardless of their value.
+**Who got it right**: The fork, which always writes both `rope.mrope_interleaved` and `ssm.v_head_reordered` to the GGUF regardless of their value. This is defense-in-depth: it makes the GGUF self-describing.
 **Who got it wrong**: Upstream, which only writes these keys when `true`, meaning they are absent for architectures where they are `false`.
+**How llama.cpp avoids the problem entirely**: llama.cpp (`d969e933`) does NOT write `rope.mrope_interleaved` or `ssm.v_head_reordered` to GGUFs at all — these are ollama-internal conventions. Instead, llama.cpp hardcodes RoPE type per architecture in C++ and physically reorders V-heads during conversion. This means the GGUF doesn't need to carry these flags, and there's no default-mismatch risk.
 
 **Why this matters for the `Qwen3.5-27B-UD-Q4_K_XL.gguf`**: This GGUF was NOT produced by Ollama's converter — it was produced by Unsloth's quantization pipeline. So neither fork's nor upstream's converter behavior directly affects this file. However, the fork's unconditional emission matters for GGUFs that ARE produced by Ollama's own `ollama create` command. If a user creates an Ollama GGUF from Qwen 3.5 SafeTensors, the fork's converter writes `rope.mrope_interleaved = true` explicitly, making the GGUF self-describing. Upstream's converter also writes `true` for qwen35 (since the condition `if q.RopeParameters.MRopeInterleaved` is true), so for this specific architecture, both produce the same output. The fork's defense-in-depth matters more for hypothetical architectures where the value is `false` and needs to be explicitly recorded.
 
@@ -803,7 +816,7 @@ The fork skips the `headCountKV` indirection entirely and goes straight to the i
 
 ### 6.13 Model Validation and Nil Checks (from Upstream)
 
-**Who got it right**: The upstream Ollama developers, who added `Validate()` (`model.go:440-478`) and inline nil checks (`deltanet.go:138-149`).
+**Who got it right**: The upstream Ollama developers, who added `Validate()` (`model.go:440-478`) and inline nil checks (`deltanet.go:138-149`). llama.cpp (`d969e933`) achieves the same protection differently: `create_tensor()` at `llama-model.cpp:6779` uses flag `0` (REQUIRED) for all recurrent layer tensors — if any tensor is missing, model loading fails immediately with a clear error. No runtime nil checks needed.
 **Who got it wrong**: The fork, which has neither `Validate()` nor the additional nil checks.
 
 **What the `Qwen3.5-27B-UD-Q4_K_XL.gguf` contains that matters**: Each of the 48 GatedDeltaNet recurrent layers has these tensors (confirmed by inspecting the GGUF):
@@ -830,7 +843,7 @@ Notable: the `Qwen3.5-27B-UD-Q4_K_XL.gguf` uses `ssm_dt.bias` (not `ssm_dt.weigh
 
 ### 6.14 Image/Vision Support (from Upstream)
 
-**Who got it right**: The upstream Ollama developers, whose `Qwen35Renderer` includes `renderContent()` (lines 47-62 of `qwen35.go`) for image rendering.
+**Who got it right**: The upstream Ollama developers, whose `Qwen35Renderer` includes `renderContent()` (lines 47-62 of `qwen35.go`) for image rendering. llama.cpp (`d969e933`) handles vision via its `mtmd.cpp` multimodal tool, which inserts `<|vision_start|>` / `<|vision_end|>` tokens (at `mtmd.cpp:289-290`). The Jinja2 template itself renders image content via `render_content()` macros.
 **Who got it wrong**: The fork, whose `Qwen3CoderRenderer` has no image handling.
 
 **What the `Qwen3.5-27B-UD-Q4_K_XL.gguf` supports**: This specific GGUF is **text-only** — it contains 851 tensors, none of which are vision-related (no `visual.*`, `vit.*`, or `image_*` tensors). The vision encoder is distributed separately as `mmproj-BF16.gguf` (931 MB), `mmproj-F16.gguf` (928 MB), or `mmproj-F32.gguf` (1.84 GB) in the same Unsloth HuggingFace repository. However, the Qwen 3.5 27B model is **architecturally multimodal** — the model's code in upstream's `model.go` conditionally initializes vision support (lines 663-668), configures vision tokens (image_token_id=151655, vision_start=151652, vision_end=151653 at lines 695-700), and the scheduler at `sched.go:448` restricts `qwen35` to `numParallel = 1` (the multimodal pattern).
@@ -859,7 +872,7 @@ These optimizations do not affect correctness — they affect speed. The `Qwen3.
 
 | Priority | Item | Effort | Section |
 |----------|------|--------|---------|
-| **P0** | Replace `SetInplace` with balanced concat tree | Small | 1.1 |
+| **P0** | Replace `SetInplace` with balanced concat tree (workaround for Ollama's stale GGML vendor — llama.cpp master supports `GGML_OP_SET` on Metal/Vulkan) | Small | 1.1 |
 | **P0** | Use JSON tool definitions for qwen3.5 (keep XML for qwen3-coder) | Medium | 1.2 |
 | **P0** | Swap system+tools ordering for qwen3.5 | Small | 1.3 |
 | **P1** | Fix `formatToolCallArgument` to use spaced JSON for objects/arrays | Small | 2.2 |
@@ -871,16 +884,16 @@ These optimizations do not affect correctness — they affect speed. The `Qwen3.
 | **P3** | Emit `</think>` unconditionally for empty reasoning | Trivial | 1.8 |
 | **P3** | Add tool_response check to lastQueryIndex | Small | 1.9 |
 
-## What Upstream Should Fix (for reference)
+## What Upstream Ollama Should Fix (for reference)
 
-| Priority | Item | Section |
-|----------|------|---------|
-| **P0** | Fix prefill detection to exclude tool-call messages (ALL 3 renderers — doubly broken in qwen35.go and qwen3vl.go) | 2.1 |
-| **P1** | Fix `formatToolCallArgument` to use spaced JSON | 2.2 |
-| **P1** | Always close `</think>` in Qwen3VLRenderer | 2.4 |
-| **P1** | Actually honor `repeat_last_n` API parameter in Go runner | 2.5 |
-| **P1** | Fix mropeInterleaved default for third-party qwen35/qwen35moe GGUFs | 2.6 |
-| **P2** | Fix TrimSpace inconsistency in Qwen3VLRenderer lastQueryIndex | 2.7 |
-| **P2** | Consider recording only generated tokens in penalty window (requires architectural change) | 3.1 |
-| **P2** | Consider making repeat_penalty default non-trivial (1.1) — requires fixing prompt-token penalty inclusion first | 2.8, 3.1 |
-| **P2** | Emit `ssm.v_head_reordered` / `rope.mrope_interleaved` unconditionally in converter | 3.4 |
+| Priority | Item | llama.cpp status | Section |
+|----------|------|-----------------|---------|
+| **P0** | Fix prefill detection to exclude tool-call messages (ALL 3 renderers) | N/A — llama.cpp uses `add_generation_prompt`, no conflation | 2.1 |
+| **P1** | Fix `formatToolCallArgument` to use spaced JSON | Correct via `tojson` filter | 2.2 |
+| **P1** | Always close `</think>` in Qwen3VLRenderer | Correct via Jinja2 template | 2.4 |
+| **P1** | Actually honor `repeat_last_n` API parameter in Go runner | Correct — `penalty_last_n` wired through | 2.5 |
+| **P1** | Fix mropeInterleaved default for third-party qwen35/qwen35moe GGUFs | Correct — hardcoded per arch | 2.6 |
+| **P2** | Fix TrimSpace inconsistency in Qwen3VLRenderer lastQueryIndex | Correct via Jinja2 template | 2.7 |
+| **P2** | Consider recording only generated tokens in penalty window | **Same bug as llama.cpp** — both feed prompt tokens | 3.1 |
+| **P2** | Consider making repeat_penalty default > 1.0 — requires fixing prompt-token inclusion first | **Same 1.0 default as llama.cpp** | 2.8, 3.1 |
+| **P2** | Emit `ssm.v_head_reordered` / `rope.mrope_interleaved` unconditionally in converter | N/A — llama.cpp doesn't use these keys | 3.4 |
