@@ -115,25 +115,27 @@ This matters for attention patterns — tools-first means the model's attention 
 
 ~~**Fix**: `if repeatPenalty <= 0 { repeatPenalty = 1.0 }`~~
 
-### 1.5 MEDIUM: Missing nil checks + Validate() for third-party GGUFs
+### 1.5 ~~MEDIUM~~ FIXED: Missing nil checks + Validate() for third-party GGUFs
 
-**Fault: Fork (incomplete defensive coding).** The fork author contributed 3 commits specifically fixing third-party GGUF compatibility (ssm_dt.bias tensor name, head_count_kv scalar broadcast, architecture-based defaults) — all correct and valuable. But the fork lacks the defensive validation layer that would catch *other* third-party GGUF problems at load time rather than at inference time. The upstream Ollama developers added this in commit `8da09b1e`. llama.cpp (`d969e933`) achieves equivalent protection differently: `create_tensor()` at `llama-model.cpp:6779` uses flag `0` (REQUIRED), so missing tensors fail at model load time. No runtime nil checks needed — the loader refuses to proceed.
+**FIXED in fork.** Ported upstream's two layers of defense: (1) inline nil checks in `GatedDeltaNet.Forward()` for `SSMDT`, `SSMA`, `SSMConv1D` (+`.Weight`), `SSMNorm`, and `SSMOut` — right after the beta/alpha switch and before first use; (2) a full `Validate()` method on `Model` implementing the `model.Validator` interface, which checks Options, layer count vs isRecurrent flag count, and all tensor groups for each recurrent layer at model load time. Compile-time interface assertion `_ model.Validator = (*Model)(nil)` added. Matches upstream commit `8da09b1e`.
+
+~~**Fault: Fork (incomplete defensive coding).** The fork author contributed 3 commits specifically fixing third-party GGUF compatibility (ssm_dt.bias tensor name, head_count_kv scalar broadcast, architecture-based defaults) — all correct and valuable. But the fork lacks the defensive validation layer that would catch *other* third-party GGUF problems at load time rather than at inference time. The upstream Ollama developers added this in commit `8da09b1e`. llama.cpp (`d969e933`) achieves equivalent protection differently: `create_tensor()` at `llama-model.cpp:6779` uses flag `0` (REQUIRED), so missing tensors fail at model load time. No runtime nil checks needed — the loader refuses to proceed.~~
 
 **Files**: `model/models/qwen3next/deltanet.go`, `model/models/qwen3next/model.go`
 
-The fork explicitly targets third-party GGUF compatibility (3 commits fixing Unsloth/llama.cpp GGUFs). But its defensive validation is incomplete:
+~~The fork explicitly targets third-party GGUF compatibility (3 commits fixing Unsloth/llama.cpp GGUFs). But its defensive validation is incomplete:~~
 
-**Fork's current nil checks** in `GatedDeltaNet.Forward()`: Only `SSMQKV` and `SSMQKVGate` at `deltanet.go:103-105`, plus implicit nil checks in the `SSMBetaAlpha`/`SSMBeta`+`SSMAlpha` switch cases at lines 113 and 130. All other tensors (`SSMDT`, `SSMA`, `SSMConv1D`, `SSMNorm`, `SSMOut`) are accessed without nil guards — a missing tensor causes a nil-pointer panic at runtime (e.g., `alpha.Add(ctx, gdn.SSMDT)` at line 140).
+~~**Fork's current nil checks** in `GatedDeltaNet.Forward()`: Only `SSMQKV` and `SSMQKVGate` at `deltanet.go:103-105`, plus implicit nil checks in the `SSMBetaAlpha`/`SSMBeta`+`SSMAlpha` switch cases at lines 113 and 130. All other tensors (`SSMDT`, `SSMA`, `SSMConv1D`, `SSMNorm`, `SSMOut`) are accessed without nil guards — a missing tensor causes a nil-pointer panic at runtime (e.g., `alpha.Add(ctx, gdn.SSMDT)` at line 140).~~
 
-**Fork's Validate()**: Does not exist. No `Validate` method anywhere in the fork's `model.go`. Search confirmed: zero hits for "Validate" in the file.
+~~**Fork's Validate()**: Does not exist. No `Validate` method anywhere in the fork's `model.go`. Search confirmed: zero hits for "Validate" in the file.~~
 
-**Upstream's approach** (commit `8da09b1e`): Two layers of defense:
-1. `Validate()` method on `Model` (`model.go:440-478`) — checks Options not nil, layer count matches isRecurrent flag count, then for each recurrent layer: SSMQKV, SSMQKVGate, SSMBetaAlpha (or SSMBeta+SSMAlpha), SSMDT, SSMA, SSMConv1D+Weight, SSMNorm, SSMOut. Implements the `model.Validator` interface, called by `model.New()` after tensor loading — catches problems at model load time, not inference time.
-2. Inline nil checks in `GatedDeltaNet.Forward()` (`deltanet.go:138-149`) for `SSMDT`, `SSMA`, `SSMConv1D` (including `.Weight`), `SSMNorm`, `SSMOut` — right before first use at line 152.
+~~**Upstream's approach** (commit `8da09b1e`): Two layers of defense:~~
+~~1. `Validate()` method on `Model` (`model.go:440-478`) — checks Options not nil, layer count matches isRecurrent flag count, then for each recurrent layer: SSMQKV, SSMQKVGate, SSMBetaAlpha (or SSMBeta+SSMAlpha), SSMDT, SSMA, SSMConv1D+Weight, SSMNorm, SSMOut. Implements the `model.Validator` interface, called by `model.New()` after tensor loading — catches problems at model load time, not inference time.~~
+~~2. Inline nil checks in `GatedDeltaNet.Forward()` (`deltanet.go:138-149`) for `SSMDT`, `SSMA`, `SSMConv1D` (including `.Weight`), `SSMNorm`, `SSMOut` — right before first use at line 152.~~
 
-Without these, a missing tensor in a third-party GGUF causes a nil-pointer panic at inference time instead of a clean error at model load. This is the difference between a cryptic stack trace and a message like `"qwen3next: layer 3 missing ssm_dt tensor"`.
+~~Without these, a missing tensor in a third-party GGUF causes a nil-pointer panic at inference time instead of a clean error at model load. This is the difference between a cryptic stack trace and a message like `"qwen3next: layer 3 missing ssm_dt tensor"`.~~
 
-**Fix**: Port upstream's nil checks (4 additional checks in deltanet.go lines 138-149) and the full `Validate()` method (lines 440-478).
+~~**Fix**: Port upstream's nil checks (4 additional checks in deltanet.go lines 138-149) and the full `Validate()` method (lines 440-478).~~
 
 ### 1.6 MEDIUM: No image/vision support for Qwen3.5
 
@@ -200,23 +202,76 @@ if isThinking && i > lastQueryIndex {
 
 The official template also always emits `<think>\n{reasoning}\n</think>\n\n` — unconditionally — for assistant messages after `last_query_index` in the current round. An empty reasoning produces `<think>\n\n</think>\n\n`.
 
-Low practical impact — assistant messages with empty reasoning content are unusual in practice. But for exact template fidelity, the fork should emit the think block unconditionally.
-### 1.9 ~~LOW~~ NON-ISSUE: `lastQueryIndex` doesn't check for tool_response wrappers
+Low practical impact — assistant messages with empty reasoning content are unusual in practice. But for exact template fidelity, the fork should emit the think block unconditionally for Qwen 3.5.
 
-**Fault: Nobody — the fork's simpler approach is correct for Ollama's protocol.** The official Qwen3.5 Jinja2 template checks for `<tool_response>` wrappers inside user messages because HuggingFace's `transformers` library represents tool results as `role: "user"` messages with `<tool_response>...</tool_response>` content. But Ollama's API uses a distinct `role: "tool"` (confirmed: `api/types.go` line 243 normalizes `"TOOl"` → `"tool"`). The `lastQueryIndex` loop operates on **original `api.Message` roles before rendering** — tool messages have `Role == "tool"`, never `Role == "user"`, so the loop naturally skips them. The `<tool_response>` content check in upstream's `Qwen35Renderer` (`82848a78`, `qwen35.go:121`) and the fork's own `qwen3vl.go` (lines 61-74) is **redundant defensive code** — it guards against a scenario that Ollama's protocol makes impossible. Both the fork (`9ec17fc1`) and upstream (`82848a78`) renderers convert `role: "tool"` → rendered `<|im_start|>user\n<tool_response>...</tool_response><|im_end|>` in the output (fork: `qwen3coder.go:199-215`; upstream: `qwen35.go:172-179`), but this conversion happens AFTER `lastQueryIndex` is already computed.
+**CRITICAL COMPLICATION (see section 5.1)**: The fork's current `message.Thinking != ""` gating is actually **correct for Qwen3-Next-Thinking** models, whose official template ([`Qwen/Qwen3-Next-80B-A3B-Thinking`](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking/raw/main/tokenizer_config.json), line 44) only emits think blocks for non-last messages when `reasoning_content` is non-empty: `loop.last or (not loop.last and reasoning_content)`. Fixing this for Qwen 3.5 (making think blocks unconditional) would simultaneously **break** Qwen3-Next-Thinking fidelity. The two model families were trained on contradictory thinking block semantics. This cannot be resolved with a single code path — it requires either dedicated renderers or a parameterized flag per model family.
+### 1.9 LOW: `lastQueryIndex` doesn't check for tool_response wrappers
+
+**Previous analysis was WRONG.** This section previously claimed "NON-ISSUE" on the basis that "Ollama uses `role: 'tool'` for tool responses, so the `<tool_response>` content check is redundant." That reasoning had two factual errors:
+
+1. **Ollama's API performs zero content or role validation.** The `UnmarshalJSON` in `api/types.go` only calls `strings.ToLower(m.Role)`. No other normalization. The ChatHandler in `routes.go` passes the `[]api.Message` slice directly from JSON deserialization to the renderer with no validation. A client CAN send `{role: "user", content: "<tool_response>...</tool_response>"}` and the server will accept it.
+
+2. **The fork's own codebase already handles this path.** The fork's `qwen3vl.go:62-74` has the exact `<tool_response>` content check in its `lastQueryIndex` loop. Upstream's `qwen35.go:114-127` has it too. The fork's `qwen3coder.go` is the **only** renderer with a `lastQueryIndex` that lacks it — an internal inconsistency.
+
+**Fault: Fork (incomplete port when merging thinking support into `Qwen3CoderRenderer`).** The fork added `lastQueryIndex` to `Qwen3CoderRenderer` for qwen3.5 thinking support but used a simplified loop that doesn't match the official template. The fork's own `Qwen3VLRenderer` (in `qwen3vl.go:62-74`) correctly implements the `multiStepTool` / `<tool_response>` filtering pattern — proving the fork author understood the pattern but didn't replicate it in the Qwen3Coder renderer.
 
 **File**: `model/renderers/qwen3coder.go:149-155`
 
-The fork's `lastQueryIndex` search finds the last `role == "user"` message, which correctly excludes `role == "tool"` messages without needing to inspect content:
+**The official Qwen 3.5 template** (verified from [`Qwen/Qwen3.5-27B/tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3.5-27B/raw/main/tokenizer_config.json) on HuggingFace, publicly accessible):
+```jinja2
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = render_content(message.content, false)|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if ns.multi_step_tool %}
+    {{- raise_exception('No user query found in messages.') }}
+{%- endif %}
+```
+
+The template walks messages **backwards**, and for each `role == "user"` message: renders its content, **trims** whitespace, checks whether it is entirely wrapped in `<tool_response>...</tool_response>`. If yes — **skip it** (it's a tool result, not a real user query). The first non-tool-response user message found is `last_query_index`. If ALL user messages are tool responses, the template raises an exception.
+
+**The fork's implementation** (`qwen3coder.go:149-155`):
 ```go
+lastQueryIndex := -1
 for i := len(filteredMessages) - 1; i >= 0; i-- {
     if filteredMessages[i].Role == "user" {
-        lastQueryIndex = i; break
+        lastQueryIndex = i
+        break
     }
 }
 ```
 
-The official template walks backward and **skips user messages whose content is a `<tool_response>...</tool_response>` wrapper** (with `|trim` before checking). This is necessary for the HuggingFace `transformers` protocol where tool results are user messages. It is unnecessary for Ollama's protocol where tool results are `role: "tool"` messages.
+No content inspection. The first `role == "user"` message found (searching backwards) is assumed to be the last real user query, regardless of whether its content is a `<tool_response>` wrapper.
+
+**Concrete scenario that triggers the bug** — a multi-step agentic tool-calling conversation where the client sends tool results as `role: "user"` messages:
+```
+[0] user:      "Plan my trip to Tokyo"
+[1] assistant: <think>I should check the weather</think> + tool_call(get_weather, {location: "Tokyo"})
+[2] user:      "<tool_response>\n{\"temp\": 22, \"condition\": \"sunny\"}\n</tool_response>"
+[3] assistant: <think>Now search for flights</think> + tool_call(search_flights, {dest: "Tokyo"})
+[4] user:      "<tool_response>\n{\"price\": 800, \"airline\": \"ANA\"}\n</tool_response>"
+```
+
+| | Fork (`qwen3coder.go`) | Official template | Upstream (`qwen35.go`) |
+|---|---|---|---|
+| `lastQueryIndex` | **4** (last `role=="user"`) | **0** (skips [4] and [2] as tool_response, finds [0]) | **0** (same as official) |
+| Message [1] thinking preserved? | `1 > 4` = **false → STRIPPED** | `1 > 0` = **true → PRESERVED** | **PRESERVED** |
+| Message [3] thinking preserved? | `3 > 4` = **false → STRIPPED** | `3 > 0` = **true → PRESERVED** | **PRESERVED** |
+
+**What goes wrong**: The fork strips ALL thinking traces from the assistant's tool-calling responses. The model sees its own prior messages without `<think>...</think>` blocks, which misaligns with the template it was trained on. The model was trained to see `<think>\n{reasoning}\n</think>\n\n{content}` for assistant messages after `last_query_index`; the fork feeds it `{content}` alone, as if the assistant never reasoned.
+
+**When the bug does NOT trigger**: When the client uses Ollama's native `role: "tool"` for tool results. The `lastQueryIndex` loop only examines `role == "user"` messages, so `role: "tool"` messages are invisible to it. The bug specifically requires `role: "user"` messages with `<tool_response>` content.
+
+**Side effects on other models: NONE.** In the fork, `Qwen3CoderRenderer` serves two models: `qwen3-coder` (with `isThinking: false`) and `qwen3.5` (with `isThinking: true`). The `lastQueryIndex` value is consumed in exactly one place — `qwen3coder.go:164`: `if isThinking && message.Thinking != "" && i > lastQueryIndex`. Since `isThinking == false` for `qwen3-coder`, the `&&` short-circuits and `lastQueryIndex` is never evaluated. Adding `<tool_response>` filtering to the loop cannot affect `qwen3-coder` behavior — the code path that reads `lastQueryIndex` is dead code when `isThinking` is `false`. The only edge case is if a user explicitly passes `think: true` via the API for qwen3-coder (lines 142-144 allow this override), but adding the filter would make that edge case work **more correctly**, not less.
+
+**Fix**: Replace the simple loop with the `multiStepTool` / `<tool_response>` filtering pattern already used by the fork's own `qwen3vl.go:62-74`, matching both the official template and upstream's `qwen35.go:114-127`.
 
 ---
 
@@ -421,7 +476,7 @@ if logit > 0: logit /= repeatPenalty
 if logit < 0: logit *= repeatPenalty
 ```
 
-**Additional difference**: Upstream's `tokenCounts()` (`transforms.go:40`) performs bounds checking on token IDs: `if token < 0 || int(token) >= vocabSize { continue }`. The fork's `applyPenalties()` does NOT validate token IDs — if a corrupted or garbage token ID enters the ring buffer, it creates bogus entries in the penalty map. This is a minor robustness gap.
+~~**Additional difference**: Upstream's `tokenCounts()` (`transforms.go:40`) performs bounds checking on token IDs: `if token < 0 || int(token) >= vocabSize { continue }`. The fork's `applyPenalties()` does NOT validate token IDs — if a corrupted or garbage token ID enters the ring buffer, it creates bogus entries in the penalty map. This is a minor robustness gap.~~ **FIXED in fork.** Added bounds checking in `applyPenalties()` at `transforms.go`: token IDs that are negative or `>= vocabSize` (derived from `len(tokens)`) are skipped when building the penalty counts map. Matching upstream's defensive approach. Test added.
 
 ### 3.4 Unconditional KV emission — prevents a real default-mismatch bug
 
@@ -512,6 +567,57 @@ The `Qwen35Renderer` includes image support via `renderContent()`, correct tools
 **Assessment**: The upstream's strategy is architecturally cleaner and results in each model getting exactly the right behavior. The fork's strategy shares improvements but creates template-specific bugs for qwen3.5. For the ideal implementation, create a dedicated `Qwen35Renderer` and `Qwen35Parser` that take the best from both.
 
 **The llama.cpp contrast**: llama.cpp (`d969e933`) avoids this entire problem class by executing the Jinja2 template from the GGUF file directly (`chat.cpp:631-639`). Each model carries its own template, so there is no renderer routing, no shared renderer bugs, no format mismatches. Qwen3-Coder gets XML definitions because its template says so; Qwen3.5 gets JSON definitions because its template says so. The entire Part 1 sections 1.2, 1.3, 1.7, 1.8 — all collateral damage from Ollama's Go renderer architecture — simply do not exist in llama.cpp. Ollama chose to reimplement template rendering in Go (presumably for performance and control), but the cost is exactly this class of bugs: every model that deviates from the Qwen3-Coder format needs a new dedicated renderer. llama.cpp's Jinja2 approach trades some performance for correctness-by-construction.
+
+### 5.1 CRITICAL FINDING: Three Distinct Template Families — Shared Renderer Is Fundamentally Untenable
+
+**Discovered by comparing the official Jinja2 templates** for all models that share the `qwen3next` Go model architecture. The templates were downloaded from HuggingFace and saved for offline reference:
+
+| Model | HuggingFace URL | Local copy |
+|---|---|---|
+| Qwen 3.5 (qwen35 arch) | [`Qwen/Qwen3.5-27B/raw/main/tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3.5-27B/raw/main/tokenizer_config.json) | `/tmp/qwen35_template.jinja2` |
+| Qwen3-Next Thinking (qwen3next arch) | [`Qwen/Qwen3-Next-80B-A3B-Thinking/raw/main/tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking/raw/main/tokenizer_config.json) | `/tmp/qwen3next_thinking_template.jinja2` |
+| Qwen3-Next Instruct (qwen3next arch) | [`Qwen/Qwen3-Next-80B-A3B-Instruct/raw/main/tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/raw/main/tokenizer_config.json) | `/tmp/qwen3next_instruct_template.jinja2` |
+
+All three URLs are publicly accessible (no authentication required). The templates were fetched and verified on 2026-03-04.
+
+**Side-by-side comparison of template behaviors:**
+
+| Feature | Qwen 3.5 | Qwen3-Next **Thinking** | Qwen3-Next **Instruct** |
+|---|---|---|---|
+| `lastQueryIndex` | Yes, with `<tool_response>` filter | Yes, with `<tool_response>` filter | **None** — no lastQueryIndex |
+| Think blocks for non-last msgs | **Unconditional** after lastQueryIndex | **Conditional**: only if `reasoning_content` non-empty | **None** |
+| Think blocks for last msg | **Unconditional** | **Unconditional** (via `loop.last`) | **None** |
+| Tool definitions | JSON via `tojson` | JSON via `tojson` | JSON via `tojson` |
+| Tool CALL format | **XML parameters**: `<function=name><parameter=key>value</parameter></function>` | **JSON**: `{"name": "...", "arguments": {...}}` | **JSON**: `{"name": "...", "arguments": {...}}` |
+| System+tools order | **Tools first**, system appended after `</IMPORTANT>` | **System first**, then `# Tools` | **System first**, then `# Tools` |
+| Tool call instruction preamble | `"If you choose to call a function ONLY reply..."` with `<IMPORTANT>` wrapper | `"For each function call, return a json object..."` | Same as Thinking |
+| Default system message | None injected | None injected | None injected |
+| Generation prompt | `<think>\n` or `<think>\n\n</think>\n\n` (if thinking disabled) | `<think>\n` | Plain `<|im_start|>assistant\n` |
+| `raise_exception` on no user query | Yes | **No** | N/A |
+| Vision support (`render_content` macro) | Yes (images + video) | **No** (direct `message.content`) | **No** |
+
+**The thinking block conditionality difference is the most dangerous for the fork.** This directly impacts section 1.8. The fork's current code at `qwen3coder.go:164`:
+
+```go
+if isThinking && message.Thinking != "" && i > lastQueryIndex {
+```
+
+This gates on `message.Thinking != ""` — it only emits `<think>...</think>` for historical assistant messages when reasoning content exists. This matches **Qwen3-Next-Thinking** behavior (line 44 of its template: `loop.last or (not loop.last and reasoning_content)`). But it is **wrong for Qwen 3.5**, whose template (line 100-101) unconditionally emits `<think>\n{reasoning}\n</think>\n\n` for ALL assistant messages after `lastQueryIndex`, even when reasoning is empty (producing `<think>\n\n</think>\n\n`).
+
+**This means the fork's shared `Qwen3CoderRenderer` cannot correctly serve both models with a single code path.** The `message.Thinking != ""` condition is correct for one model family and wrong for the other. Any "fix" for section 1.8 (making think blocks unconditional for Qwen 3.5 fidelity) would simultaneously **break** Qwen3-Next-Thinking fidelity. The two models were trained on contradictory thinking block semantics.
+
+**The tool call format divergence compounds this.** Even if the thinking block issue could be parameterized (e.g., a boolean flag), the tool call format is structurally different:
+
+- Qwen 3.5: `<tool_call>\n<function=get_weather>\n<parameter=location>\nTokyo\n</parameter>\n</function>\n</tool_call>`
+- Qwen3-Next: `<tool_call>\n{"name": "get_weather", "arguments": {"location": "Tokyo"}}\n</tool_call>`
+
+These share the outer `<tool_call>` XML wrapper but diverge completely in the inner format. The fork's `Qwen3CoderRenderer` renders the XML parameter format (lines 172-191 of `qwen3coder.go`), which is correct for Qwen 3.5 but wrong for Qwen3-Next. This is not a minor whitespace difference — the model would see XML parameter tokens where it was trained on JSON, or vice versa.
+
+**The system+tools ordering adds a third axis of divergence.** Qwen 3.5 puts tools first and appends the system message after `</IMPORTANT>`. Qwen3-Next (both variants) puts the system message first and appends tools after. The fork currently uses the Qwen3-Coder ordering (system first), which happens to match Qwen3-Next but is wrong for Qwen 3.5 (section 1.3).
+
+**Architectural conclusion**: The fork's strategy of extending `Qwen3CoderRenderer` with flags (`isThinking`, `emitEmptyThinkOnNoThink`) was viable when there were only two models (qwen3-coder and qwen3.5). With three distinct template families that share the same Go model code but diverge on thinking semantics, tool call format, and system ordering, the parameterized shared renderer approach requires at minimum 3+ boolean flags and conditional branches throughout the render loop. This is the exact combinatorial explosion that upstream avoided by creating dedicated renderers per model family. The llama.cpp approach (executing the Jinja2 template from the GGUF) avoids the problem entirely — the model carries its own template, and the engine never needs to know the differences.
+
+**What this means for the fork's remaining P0-P3 fixes**: Sections 1.2 (JSON tool definitions), 1.3 (tools-first ordering), 1.7 (no default system message), and 1.8 (unconditional think blocks) are all specific to Qwen 3.5 and would need to be gated to NOT apply to Qwen3-Next models if those models are ever served through the same renderer. The safest path is dedicated renderers per model family — matching upstream's strategy — rather than accumulating more flags on `Qwen3CoderRenderer`.
 
 ---
 
@@ -672,9 +778,9 @@ Note: the `Qwen35Renderer` in upstream (used for qwen3.5 specifically) DOES alwa
 
 **What the upstream `Qwen35Renderer` does**: Lines 114-127 faithfully replicate this logic, including `strings.TrimSpace(content)` before the prefix/suffix check.
 
-**What the fork does**: The fork's `Qwen3CoderRenderer` (lines 149-155) simply finds the last message with `Role == "user"`, regardless of content. In Ollama's protocol, tool responses typically use `role: "tool"` rather than `role: "user"`, so the divergence is partially mitigated. However, the fork's approach is less robust and does not match the template.
+**What the fork does**: The fork's `Qwen3CoderRenderer` (lines 149-155) simply finds the last message with `Role == "user"`, regardless of content. This is wrong when a client sends tool results as `role: "user"` messages with `<tool_response>...</tool_response>` content — a path that Ollama's API accepts without validation (see section 1.9 for full analysis). The fork's own `Qwen3VLRenderer` (`qwen3vl.go:62-74`) already implements the correct `multiStepTool` / `<tool_response>` filtering pattern, proving the fork author understood it but didn't replicate it in the Qwen3Coder renderer.
 
-**What breaks if you don't fix this**: In a multi-step agentic workflow with the Qwen 3.5 27B model — where the conversation goes user → assistant(tool_call) → tool(result) → assistant(response) → user → assistant(tool_call) → tool(result) → assistant(response) — the wrong `lastQueryIndex` could cause thinking blocks from the current round to be stripped (too aggressive) or thinking from a prior round to be included (too permissive). Both degrade multi-turn reasoning quality.
+**What breaks if you don't fix this**: When a client sends tool results as `role: "user"` with `<tool_response>` content, the fork's `lastQueryIndex` points at the tool response instead of the real user query. All assistant thinking traces between the real query and the tool response are stripped (the check `i > lastQueryIndex` evaluates to `false` for messages before the misidentified index). In a multi-step agentic workflow — user → assistant(think+tool_call) → user("<tool_response>...") → assistant(think+tool_call) → user("<tool_response>...") — the fork strips ALL thinking traces because `lastQueryIndex` points at the last tool response, not the original user query. See section 1.9 for the concrete step-by-step trace.
 
 ---
 
@@ -738,7 +844,7 @@ Zero allocations after warmup. Permanently bounded at `repeatLastN` entries. The
 
 **Why the fork defaults `RepeatPenalty` to 1.1**: Because the fork's ring buffer only contains generated tokens, a non-trivial penalty is safe. The 1.1 value means: for a token the model already generated recently, positive logits are divided by 1.1 (~9.09% reduction: `1 - 1/1.1 = 1/11`) and negative logits are multiplied by 1.1 (pushed 10% further negative). This actively discourages the Qwen 3.5 27B model from degenerating into repetitive loops — a common failure mode in long-context generation with the model's 262,144-token context window.
 
-**What the ideal implementation also needs from upstream**: The upstream's `tokenCounts()` function (`transforms.go:40`) performs bounds checking on token IDs: `if token < 0 || int(token) >= vocabSize { continue }`. The Qwen 3.5 27B model has a vocabulary of 248,320 tokens (confirmed in the GGUF metadata: `tokenizer.ggml.tokens` = 248,320 entries). The fork's `applyPenalties()` does not validate token IDs — if a corrupted token ID (e.g., `-1` or `300000`) enters the ring buffer, it would create a bogus entry in the penalty `counts` map. The upstream's bounds check should be ported. Additionally, the upstream's `repeatPenalty <= 0` guard (`samplers.go:186-188`: `if repeatPenalty <= 0 { repeatPenalty = 1.0 }`) prevents division by zero when a user passes `repeat_penalty: 0` via the API.
+~~**What the ideal implementation also needs from upstream**: The upstream's `tokenCounts()` function (`transforms.go:40`) performs bounds checking on token IDs: `if token < 0 || int(token) >= vocabSize { continue }`. The Qwen 3.5 27B model has a vocabulary of 248,320 tokens (confirmed in the GGUF metadata: `tokenizer.ggml.tokens` = 248,320 entries). The fork's `applyPenalties()` does not validate token IDs — if a corrupted token ID (e.g., `-1` or `300000`) enters the ring buffer, it would create a bogus entry in the penalty `counts` map. The upstream's bounds check should be ported. Additionally, the upstream's `repeatPenalty <= 0` guard (`samplers.go:186-188`: `if repeatPenalty <= 0 { repeatPenalty = 1.0 }`) prevents division by zero when a user passes `repeat_penalty: 0` via the API.~~ **FIXED in fork.** Both the token ID bounds check and the `repeatPenalty <= 0` guard have been ported. See sections 1.4 and 3.3.
 
 **What breaks if you don't fix this**: Using upstream's sampler architecture with any `repeatPenalty > 1.0` on the Qwen 3.5 27B model in an agentic tool-calling scenario causes the model to avoid reproducing tokens from the tool schema and tool results. Tool call accuracy degrades. The model may paraphrase function names (e.g., generating `weather_check` instead of `get_weather`), skip required parameters, or produce malformed JSON in tool call arguments. Using upstream's 1.0 default avoids this but makes repetition penalty completely non-functional — the model can degenerate into repetitive loops during long generations with no mechanism to prevent it.
 
@@ -820,10 +926,12 @@ The fork skips the `headCountKV` indirection entirely and goes straight to the i
 
 ---
 
-### 6.13 Model Validation and Nil Checks (from Upstream)
+### ~~6.13~~ FIXED: Model Validation and Nil Checks (from Upstream)
 
-**Who got it right**: The upstream Ollama developers, who added `Validate()` (`model.go:440-478`) and inline nil checks (`deltanet.go:138-149`). llama.cpp (`d969e933`) achieves the same protection differently: `create_tensor()` at `llama-model.cpp:6779` uses flag `0` (REQUIRED) for all recurrent layer tensors — if any tensor is missing, model loading fails immediately with a clear error. No runtime nil checks needed.
-**Who got it wrong**: The fork, which has neither `Validate()` nor the additional nil checks.
+**FIXED in fork.** Both layers of defense ported from upstream: inline nil checks in `Forward()` and a `Validate()` method implementing `model.Validator`. See section 1.5.
+
+~~**Who got it right**: The upstream Ollama developers, who added `Validate()` (`model.go:440-478`) and inline nil checks (`deltanet.go:138-149`). llama.cpp (`d969e933`) achieves the same protection differently: `create_tensor()` at `llama-model.cpp:6779` uses flag `0` (REQUIRED) for all recurrent layer tensors — if any tensor is missing, model loading fails immediately with a clear error. No runtime nil checks needed.~~
+~~**Who got it wrong**: The fork, which has neither `Validate()` nor the additional nil checks.~~
 
 **What the `Qwen3.5-27B-UD-Q4_K_XL.gguf` contains that matters**: Each of the 48 GatedDeltaNet recurrent layers has these tensors (confirmed by inspecting the GGUF):
 
@@ -882,10 +990,10 @@ These optimizations do not affect correctness — they affect speed. The `Qwen3.
 | **P0** | Use JSON tool definitions for qwen3.5 (keep XML for qwen3-coder) | Medium | 1.2 |
 | **P0** | Swap system+tools ordering for qwen3.5 | Small | 1.3 |
 | **P1** | Fix `formatToolCallArgument` to use spaced JSON for objects/arrays | Small | 2.2 |
-| **P2** | Add `repeatPenalty <= 0` guard | Trivial | 1.4 |
-| **P2** | Add nil checks + `Validate()` to qwen3next | Small | 1.5 |
+| ~~**P2**~~ | ~~Add `repeatPenalty <= 0` guard~~ | ~~Trivial~~ | ~~1.4~~ FIXED |
+| ~~**P2**~~ | ~~Add nil checks + `Validate()` to qwen3next~~ | ~~Small~~ | ~~1.5~~ FIXED |
 | **P2** | Add image/vision support for qwen3.5 | Medium | 1.6 |
-| **P2** | Add token ID bounds checking to penalty sampler | Trivial | 3.3 |
+| ~~**P2**~~ | ~~Add token ID bounds checking to penalty sampler~~ | ~~Trivial~~ | ~~3.3~~ FIXED |
 | **P3** | Remove default system message injection for qwen3.5 | Trivial | 1.7 |
 | **P3** | Emit `</think>` unconditionally for empty reasoning | Trivial | 1.8 |
 | **P3** | Add tool_response check to lastQueryIndex | Small | 1.9 |
