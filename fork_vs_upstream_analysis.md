@@ -25,7 +25,7 @@ Qwen3-Coder reference: `Qwen/Qwen3-Coder-30B-A3B-Instruct` Jinja2 template ([ver
 | GGUF converter KV emission | Unconditional (always writes `rope.mrope_interleaved` and `ssm.v_head_reordered`) | Conditional (only writes when `true` — third-party GGUFs that omit the key fall through to wrong default) | **Fork** |
 | `SetInplace` → balanced concat tree | Fixed (matches upstream Ollama commit `3490e959`) | Fixed | Tie |
 | Tokenizer performance | Binary search prompt truncation, `strings.Contains` early-out, stack buffer BPE merge | None of these optimizations | **Fork** |
-| JSON tool serialization (key ordering + HTML escaping + spacing) | Go struct field order, HTML-escaped `<>&`, compact JSON in `formatToolCallArgument` — mismatches HuggingFace's `tojson` override which uses dict insertion order, literal `<>&`, spaced separators (fix planned) | Same | Neither yet (both wrong vs HuggingFace's `tojson` override: `json.dumps(sort_keys=False, ensure_ascii=False)` — note: NOT stock Jinja2's `tojson` which sorts alphabetically and HTML-escapes; llama.cpp correct because it executes the HF template directly) |
+| JSON tool serialization (key ordering + HTML escaping + spacing) | Go struct field order, HTML-escaped `<>&`, compact JSON in `formatToolCallArgument` — mismatches HuggingFace's `tojson` override (fix planned, empirically verified — see section 3.1) | Same | Neither yet (both wrong vs HuggingFace's `tojson` override at [`transformers` v5.2.0 `chat_template_utils.py:463-466`](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/utils/chat_template_utils.py#L463-L466): `json.dumps(x, ensure_ascii=False, sort_keys=False)` — NOT stock Jinja2's `tojson` which uses `htmlsafe_json_dumps` with `sort_keys=True`; llama.cpp correct because it executes the HF template directly) |
 
 ---
 
@@ -247,36 +247,28 @@ Note: the fork's `Qwen3CoderRenderer` AND `Qwen3CoderParser` already differ from
 - **Fork's `Qwen3CoderParser`** (`qwen3coder.go`): has `hasThinkingSupport` and `defaultThinking` fields, 4 parser states (including `CollectingThinking` and `ThinkingDoneTransition`), and `HasThinkingSupport()` that returns the field value. Upstream's version has only 2 parser states (no thinking states) and `HasThinkingSupport()` returns `false` unconditionally.
 - These differences predate the current change and are part of the fork's earlier commits (`fbae6976`). The current change only affects `"qwen3.5"` routing — `"qwen3-coder"` continues to use these fork-enhanced files.
 
-### 2.1 FIXED: Tool definition format — Qwen 3.5 was trained on JSON, not XML
+### 2.1 FIXED: Tool definition format — Qwen 3.5 uses a JSON/XML hybrid that must be matched exactly
 
 **Was**: The fork routed `"qwen3.5"` through `Qwen3CoderRenderer` (at `renderer.go:59-60`), which emits XML tool definitions (`<function><name>...`). The Qwen 3.5 official template uses JSON tool definitions (`{{ tool | tojson }}`).
 
 **Now**: The dedicated `Qwen35Renderer` uses `marshalWithSpaces()` (at `json.go:8-45`) for JSON tool definitions, matching the official Qwen 3.5 Jinja2 template. Test `TestQwen35RendererUsesXMLToolCallingFormat` explicitly asserts the `<tools>` section is present with JSON content.
 
-**Background**: Alibaba Qwen publishes **two different official templates** with a hybrid format split that is easy to miss:
+**Background — the Qwen 3.5 / Qwen3-Coder hybrid format split**: Alibaba Qwen trains two model families on **different tool definition formats but identical tool call formats**. This is verified against the official Jinja2 templates downloaded from HuggingFace ([`Qwen/Qwen3.5-27B/raw/main/tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3.5-27B/raw/main/tokenizer_config.json), [`Qwen/Qwen3-Coder-30B-A3B-Instruct/raw/main/tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/raw/main/tokenizer_config.json)):
 
-| Template | Tool definitions | Tool calls (model output) | System+tools order |
-|----------|-----------------|--------------------------|-------------------|
-| **Qwen3-Coder** (`Qwen/Qwen3-Coder-30B-A3B-Instruct`) | XML `<function><name>...` | XML `<tool_call><function=...>` | System first, tools second |
-| **Qwen 3.5** (`Qwen/Qwen3.5-27B`) | JSON `{{ tool | tojson }}` | XML `<tool_call><function=...>` **(same!)** | Tools first, system appended after |
+| | Tool definitions (system prompt — what the model **reads**) | Tool calls (assistant output — what the model **writes**) | Tool call arguments (inside XML parameters) | System+tools order |
+|---|---|---|---|---|
+| **Qwen3-Coder** | **XML**: `<function><name>get_weather</name><description>...` — the template iterates `tool.function.parameters.properties` and emits XML tags per field | **XML**: `<tool_call><function=get_weather><parameter=location>...` | Scalars: `args_value \| string`. Maps/lists: `args_value \| tojson \| safe` (JSON inside XML) | System first, tools second |
+| **Qwen 3.5** | **JSON**: `{{ tool \| tojson }}` — the entire tool dict serialized as one JSON blob | **XML**: identical to Qwen3-Coder, character-for-character | Identical to Qwen3-Coder | Tools first, system appended after |
 
-The tool call format is character-for-character identical. Only the tool *definition* rendering and system message ordering differ. This is **Alibaba Qwen's confusing design decision** — it's the reason the fork author made the wrong call in commit `fbae6976`. llama.cpp (`d969e933`) sidesteps this entirely by executing the Jinja2 template directly (`chat.cpp:631-639`).
+The tool call output format is the same for both. Only the tool *definition* rendering in the system prompt and the system message ordering differ. This is easy to get wrong — it's why the fork author originally (commit `fbae6976`) routed Qwen 3.5 through the Qwen3-Coder renderer instead of implementing a dedicated one.
 
-**OPEN BUG — JSON serialization mismatches vs training data (key ordering, HTML escaping)**: HuggingFace `transformers` **overrides** Jinja2's built-in `tojson` filter in `chat_template_utils.py` with a custom implementation that calls plain `json.dumps(x, ensure_ascii=False, sort_keys=False)`. The source comment states: *"We override the built-in tojson filter because Jinja's default filter escapes HTML characters."* This override is critical — it means the model's training data differs from what stock Jinja2 would produce in two ways:
+The fork's `Qwen35Renderer` and `Qwen35Parser` (at `model/renderers/qwen35.go` and `model/parsers/qwen35.go`, routed via `renderer.go:59-60` and `parsers.go:52-53`) now match the official template's hybrid format:
+- **Renderer**: emits JSON tool definitions via `marshalWithSpaces(tool)`, emits XML tool calls via `<tool_call><function=...><parameter=...>`, handles `<tool_response>` wrapping for tool results
+- **Parser**: `Qwen35Parser` extracts `<think>` reasoning content, then delegates all post-thinking content (including XML tool call parsing) to an embedded `Qwen3CoderParser` — which finds `<tool_call>...</tool_call>` blocks, transforms the `<function=name>` syntax into valid XML via `transformToXML()`, and XML-unmarshals parameters
 
-**Key ordering (REQUIRES EMPIRICAL RESEARCH)**: HuggingFace's `tojson` uses `sort_keys=False`, which means Python dict insertion order. But dict insertion order is determined by how the caller *constructs* the dict before passing it to `apply_chat_template` — and we don't have Alibaba's training code. We know the template does `{{ tool | tojson }}`, we know HuggingFace's override preserves insertion order, but we do not know what insertion order Alibaba's training pipeline used when it built the tool dicts. The OpenAI function calling convention suggests `{"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}`, but that's a convention, not a guarantee. Go's `json.Marshal` uses a third ordering: struct field declaration order from `api.Tool`. Any of these three orderings — alphabetical (stock Jinja2), insertion (HuggingFace override, order unknown), or struct field (Go) — could accidentally match at some nesting levels and diverge at others.
+A byte-level comparison of the fork's full rendered output against the official template (run via `apply_chat_template` with `transformers` v5.2.0 and the `Qwen/Qwen3.5-27B` tokenizer) shows **the entire structural format matches exactly** — system prompt layout, `<tools>` wrapper, postamble instruction text, `<tool_call>` XML, `<tool_response>` wrapping, `<think>` blocks, `lastQueryIndex` logic, `<|im_start|>`/`<|im_end|>` placement. The **only** difference is inside the JSON tool definition blob itself, due to the JSON serialization bugs described in section 3.1.
 
-**Why this matters enough to research**: Ollama's Go renderers are hardcoded reimplementations of each model's Jinja2 template. Unlike llama.cpp, which executes the actual Jinja2 template and therefore produces byte-identical output to the training pipeline, Ollama must manually replicate every detail — including JSON key ordering. If the key ordering is wrong, every tool-using prompt has a positional encoding mismatch: the token positions the model's attention learned to associate with "this is the function name" vs "this is the type field" are shuffled at inference time. This is a distribution shift that affects every single tool call. Nobody appears to have verified whether Ollama's Go struct field order matches what any model actually saw during training — not for Qwen 3.5, and not for any other model. The fix is straightforward once the correct ordering is known; the research gap is determining what "correct" means.
-
-**How to determine the correct ordering**: Pass a sample tool through `apply_chat_template` using the actual `Qwen/Qwen3.5-27B` tokenizer in Python (environment at `/tmp/qwen35-check/`) and observe the exact byte output. This gives us the ground truth for what the Qwen 3.5 template produces with HuggingFace's `tojson` override — the same code path Alibaba would have used during training data preparation. Then compare byte-for-byte against what the fork's `Qwen35Renderer` produces for the same tool. Any difference is a bug. This research is planned.
-
-**HTML escaping (confirmed bug)**: HuggingFace's `tojson` uses plain `json.dumps` which outputs literal `<`, `>`, `&` characters. Go's `json.Marshal` HTML-escapes these to `\u003c`, `\u003e`, `\u0026`. For tool descriptions containing angle brackets (common in coding tools — e.g., `"Returns items where value < threshold"`), the model sees different byte sequences at inference than during training. This is not a key-ordering ambiguity — it is a definite, confirmed mismatch. Go's `json.NewEncoder` with `SetEscapeHTML(false)` produces the correct output — Ollama's own `LFM2Renderer` already uses this pattern at `lfm2.go:53-56`.
-
-**Spacing (partially fixed)**: HuggingFace's `tojson` uses `separators=None`, which defaults to Python's `(', ', ': ')` — spaced JSON. The existing `marshalWithSpaces` function handles this for tool definitions, but `formatToolCallArgument` (`qwen3coder.go:235-257`) still uses raw `json.Marshal` (compact separators).
-
-llama.cpp (`d969e933`) sidesteps all three issues because it executes the Jinja2 template directly, producing the same JSON the training pipeline would have produced.
-
-This is an Ollama-wide problem affecting every model whose training template uses `tojson`. The HTML escaping fix is straightforward and planned. The key ordering fix requires the empirical research described above. See section 3.1.
+**OPEN BUG — JSON serialization mismatches inside tool definitions and tool call arguments (empirically verified, fix planned)**: The JSON blob produced by `marshalWithSpaces(tool)` differs from what HuggingFace's `tojson` override produces. This has been empirically verified by running `apply_chat_template` with `transformers` v5.2.0 against the `Qwen/Qwen3.5-27B` tokenizer and comparing byte-for-byte. Three mismatches exist — see section 3.1 for the full verified analysis.
 
 ### 2.2 FIXED: System+tools ordering reversed for Qwen 3.5
 
@@ -372,29 +364,81 @@ The `Qwen35Parser` has a 3-state thinking machine (`CollectingThinking` → `Thi
 
 ## Part 3: Shared Issues (Neither Fork Nor Upstream Ollama Fixes)
 
-### 3.1 JSON serialization mismatches — wrong key ordering, HTML escaping, and compact spacing in tool definitions and tool call arguments (PLANNED FIX)
+### 3.1 JSON serialization mismatches — HTML escaping, key ordering, and compact spacing (EMPIRICALLY VERIFIED, FIX PLANNED)
 
 **Fault: Both upstream Ollama (`82848a78`) and the fork. Affects every model that uses `tojson` in its training template — not just Qwen 3.5. The fork will fix this.**
 
 llama.cpp (`d969e933`) gets all three right because it executes the Jinja2 template directly via HuggingFace's template engine, producing the same JSON the model was trained on.
 
-**The root cause is Go's `json.Marshal`, which differs from HuggingFace's `tojson` in three ways.** HuggingFace `transformers` overrides Jinja2's built-in `tojson` filter (`chat_template_utils.py`) with plain `json.dumps(x, ensure_ascii=False, sort_keys=False)`. The source comment states: *"We override the built-in tojson filter because Jinja's default filter escapes HTML characters."* This is NOT the same as stock Jinja2's `tojson`, which uses `htmlsafe_json_dumps` with `sort_keys=True`. The model was trained with **HuggingFace's override**, not stock Jinja2.
+**How we verified this**: We ran `apply_chat_template` with `transformers` [v5.2.0](https://github.com/huggingface/transformers/tree/v5.2.0) against the official `Qwen/Qwen3.5-27B` tokenizer (downloaded from [HuggingFace](https://huggingface.co/Qwen/Qwen3.5-27B/raw/main/tokenizer_config.json)) and compared the rendered output byte-for-byte against what the fork's `Qwen35Renderer` produces for the same tool and conversation. We also ran Go programs using Ollama's exact `api.Tool`, `api.ToolFunction`, `api.ToolFunctionParameters`, `api.ToolProperty`, and `api.ToolPropertiesMap` types to verify the actual serialization behavior. Every claim below is backed by empirical output, not inference from documentation.
 
-**Bug A — Key ordering (HIGH impact):** HuggingFace's `tojson` uses `sort_keys=False` — Python dict insertion order. Go's `json.Marshal` uses struct declaration order. These differ at any nesting level where the Go struct field order doesn't happen to match the Python dict construction order. This is a positional encoding mismatch: token positions the model learned for parsing tool schemas are shuffled at inference time. Every tool-using prompt is affected. See section 2.1 for the per-level comparison.
+**The root cause is Go's `json.Marshal`**. HuggingFace `transformers` overrides Jinja2's built-in `tojson` filter at [`chat_template_utils.py:463-466`](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/utils/chat_template_utils.py#L463-L466) with a custom implementation:
 
-**Bug B — HTML escaping (HIGH impact for coding tools):** HuggingFace's `tojson` uses plain `json.dumps` which outputs literal `<`, `>`, `&`. Go's `json.Marshal` HTML-escapes these to `\u003c`, `\u003e`, `\u0026`. For tool descriptions containing angle brackets — common in coding tools (e.g., `"Returns items where value < threshold"`, `"Wraps content in <div> tags"`) — the model sees different byte sequences at inference than during training. Each escaped character becomes 6 bytes (`\u003c`) instead of 1 byte (`<`), producing entirely different tokens.
-
-**Bug C — Spacing in `formatToolCallArgument` (MEDIUM impact):** HuggingFace's `tojson` uses `separators=None`, defaulting to Python's `(', ', ': ')` — spaced JSON. The existing `marshalWithSpaces` function at `json.go:8-45` handles this for tool **definitions** in `Qwen35Renderer`. But `formatToolCallArgument` (`qwen3coder.go:235-257`, shared by all renderers for tool call argument rendering) still uses raw `json.Marshal` (compact separators `(',', ':')`).
-
-**Concrete comparison for a tool call argument containing `<`:**
-```
-Training (HF tojson):    {"key": "value < 10", "nested": [1, 2, 3]}   ← spaced, literal <, insertion order
-Ollama (json.Marshal):   {"key":"value \u003c 10","nested":[1,2,3]}   ← compact, HTML-escaped, Go struct order
+```python
+def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+    # We override the built-in tojson filter because Jinja's default filter escapes HTML characters
+    return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 ```
 
-**Which models are affected:** Every model in Ollama whose official HuggingFace training template uses `{{ tool | tojson }}` or `{{ args_value | tojson }}` — virtually all tool-calling models. This includes at minimum: Qwen 3.5, Qwen3-Coder, Llama 3.x, Mistral/Devstral, Gemma, Command-R, and GLM-4.
+This is registered at [line 474](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/utils/chat_template_utils.py#L474): `jinja_env.filters["tojson"] = tojson`. When the Qwen 3.5 template calls `{{ tool | tojson }}`, only the `x` argument is passed — all others use defaults: `ensure_ascii=False`, `sort_keys=False`, `separators=None` (which in Python 3 defaults to `(', ', ': ')`).
 
-**The fix (planned for fork):** Replace `marshalWithSpaces` in `json.go` with a function that: (1) uses `json.NewEncoder` with `SetEscapeHTML(false)` to disable HTML escaping (Ollama's own `LFM2Renderer` already does this at `lfm2.go:53-56`), (2) adds spaced separators, and (3) recursively sorts object keys to match Python dict insertion order for the `api.Tool` struct shape. Use it everywhere `json.Marshal` is called for tool-related serialization: tool definitions in all renderers AND `formatToolCallArgument` in `qwen3coder.go:235-257`. The `api.Tool` struct has a known, fixed shape — this is a finite, well-defined problem.
+This is NOT the same as stock Jinja2's `tojson`. Stock Jinja2 ([`jinja2/utils.py:htmlsafe_json_dumps`](https://github.com/pallets/jinja/blob/3.1.6/src/jinja2/utils.py)) uses `json.dumps` with the environment policy `{'sort_keys': True}`, then runs `.replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026').replace("'", '\\u0027')` — alphabetical key sorting plus HTML escaping. HuggingFace's override does neither. The model was trained with HuggingFace's override, so that is the ground truth.
+
+**Bug A — HTML escaping (HIGH impact for coding tools):**
+
+Go's `json.Marshal` HTML-escapes `<`, `>`, `&` to `\u003c`, `\u003e`, `\u0026` by default. This is a [deliberate Go standard library design decision](https://github.com/golang/go/issues/8592) intended for safely embedding JSON in HTML `<script>` tags — a concern that has zero relevance to Ollama, where JSON is serialized into a chat template prompt fed to a neural network with no browser involved. HuggingFace's `tojson` outputs literal `<`, `>`, `&`. Stock Jinja2's `tojson` also HTML-escapes (for the same HTML-embedding reason), but HuggingFace explicitly overrode it because LLM chat templates are not HTML.
+
+Empirically verified: for a tool description `"Returns temperature in <fahrenheit> & <celsius>."`:
+```
+HuggingFace tojson:      ...Returns temperature in <fahrenheit> & <celsius>....       (379 bytes total)
+Go marshalWithSpaces:    ...Returns temperature in \u003cfahrenheit\u003e \u0026 \u003ccelsius\u003e....  (404 bytes total)
+```
+
+Each `<` becomes 6 bytes (`\u003c`) instead of 1, producing entirely different tokens. The fix is straightforward: `json.NewEncoder` with `SetEscapeHTML(false)`. Ollama's own `LFM2Renderer` already does this at [`model/renderers/lfm2.go:55-56`](https://github.com/ollama/ollama/blob/82848a78/model/renderers/lfm2.go#L55-L56).
+
+**Bug B — Key ordering at `ToolFunctionParameters` level (MEDIUM impact):**
+
+Empirically verified by running Go's `json.Marshal` on the actual Ollama `api.Tool` struct types and comparing against HuggingFace's `get_json_schema()` output:
+
+| Nesting level | Go struct field order | HuggingFace `get_json_schema` / OpenAI convention | Match? |
+|---|---|---|---|
+| `Tool` | `type`, `function` | `type`, `function` | **Yes** |
+| `ToolFunction` | `name`, `description`, `parameters` | `name`, `description`, `parameters` | **Yes** |
+| `ToolFunctionParameters` | `type`, `required`, `properties` | `type`, `properties`, `required` | **No — `required`/`properties` swapped** |
+| `ToolProperty` | `type`, `description`, `enum` | `type`, `description`, `enum` | **Yes** |
+| `ToolPropertiesMap` (property names) | insertion order (orderedmap) | insertion order | **Yes** |
+
+The only structural key ordering mismatch is at the `ToolFunctionParameters` level: Go always outputs `"required"` before `"properties"` (struct field order in `api/types.go:486-491`) regardless of what order the API client originally sent, because Go's `json.Marshal` uses struct tag order and re-serialization destroys the original JSON key ordering. Both HuggingFace's `get_json_schema()` function (at [`chat_template_utils.py:210-213`](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/utils/chat_template_utils.py#L210-L213)) and the [OpenAI function calling convention](https://platform.openai.com/docs/guides/function-calling) put `properties` before `required`. This is a positional encoding mismatch on every tool-using prompt.
+
+**Additional key ordering concern for `any`-typed fields**: Ollama's `ToolProperty.Items` and `ToolFunctionParameters.Defs` are typed as Go `any`. When JSON is unmarshaled into these fields, nested objects become `map[string]any`, and Go's `json.Marshal` sorts `map[string]any` keys **alphabetically** — not by insertion order. This affects tools with array parameters whose `items` contain nested object schemas, or tools using JSON Schema `$defs`. These nested levels silently get their keys reordered on every roundtrip through Go's JSON serializer.
+
+The fix for the `ToolFunctionParameters` level: swap the `Required` and `Properties` field declarations in `api/types.go` so `Properties` comes before `Required`. For the `any`-typed fields, the fix requires either using an orderedmap for deserialization or a custom JSON marshaler that preserves insertion order.
+
+**Bug C — Compact separators in `formatToolCallArgument` (MEDIUM impact):**
+
+HuggingFace's `tojson` uses Python's default separators `(', ', ': ')` — JSON with spaces after `:` and `,`. The existing `marshalWithSpaces` function at `json.go:8-45` correctly handles this for tool **definitions** in `Qwen35Renderer`. But `formatToolCallArgument` at `qwen3coder.go:195-217` (shared by `Qwen35Renderer`, `Qwen3CoderRenderer`, and all other renderers for rendering nested map/list values inside XML `<parameter>` tags) still uses raw `json.Marshal` — compact separators AND HTML escaping.
+
+Empirically verified for a nested tool call argument `{"unit": "<celsius>", "verbose": true}`:
+```
+HuggingFace tojson|safe:      {"unit": "<celsius>", "verbose": true}     ← spaced, literal <
+Go formatToolCallArgument:    {"unit":"\u003ccelsius\u003e","verbose":true}  ← compact, HTML-escaped
+```
+
+Both HTML escaping (Bug A) and compact spacing apply here. The model was trained on the spaced, non-escaped form.
+
+**Which models are affected:** Every model in Ollama whose official HuggingFace training template uses `{{ tool | tojson }}` for tool definitions or `{{ args_value | tojson | safe }}` for tool call arguments — virtually all tool-calling models. For Qwen 3.5 specifically, Bug A affects tool definitions (the JSON blob inside `<tools>`) and Bug C affects tool call argument rendering (nested values inside `<parameter>` tags). Bug B affects tool definitions only.
+
+**Concrete byte-level comparison for the complete tool JSON** (this is the single differing line between the fork's rendered output and the official template):
+```
+HuggingFace: ..."parameters": {"type": "object", "properties": {"location": ..., "unit": ...}, "required": ["location"]}...
+Fork (Go):   ..."parameters": {"type": "object", "required": ["location"], "properties": {"location": ..., "unit": ...}}...
+                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                                   required/properties swapped (Go struct field order)
+```
+
+**The fix (planned for fork):** Two changes needed:
+1. **`marshalWithSpaces` in `json.go`**: Replace the inner `json.Marshal` call with `json.NewEncoder` using `SetEscapeHTML(false)` (fixes Bug A). The spacing logic already handles Bug C for this code path. For Bug B, swap the `Required` and `Properties` field declarations in `api/types.go:486-491`.
+2. **`formatToolCallArgument` in `qwen3coder.go:195-217`**: Replace `json.Marshal` with the same `SetEscapeHTML(false)` encoder plus spaced separators (fixes Bugs A and C for tool call arguments).
 
 ### 3.2 `lastQueryIndex` initialization edge case
 
@@ -419,9 +463,7 @@ if len(ids) > 0 && slices.Contains(v.BOS, ids[len(ids)-1]) {
 
 Both codebases have this bug. Zero priority for either.
 
-### 3.4 HTML-escaping in JSON — IS a real bug (previously misidentified as non-issue)
-
-**Correction**: The earlier analysis incorrectly stated that both Go and Jinja2's `tojson` HTML-escape identically. This was based on stock Jinja2's `tojson`, which does use `htmlsafe_json_dumps` (escaping `<>&` to `\u003c\u003e\u0026`). However, HuggingFace `transformers` **overrides** the `tojson` filter with plain `json.dumps` (`chat_template_utils.py`, comment: *"We override the built-in tojson filter because Jinja's default filter escapes HTML characters"*). The model was trained with HuggingFace's override — it saw literal `<`, `>`, `&`. Go's `json.Marshal` HTML-escapes them to `\u003c`, `\u003e`, `\u0026`. This is a real mismatch. See section 3.1 Bug B for details and the planned fix.
+### 3.4 *(Merged into section 3.1 — HTML escaping is Bug A in the verified JSON serialization analysis.)*
 
 ---
 
@@ -429,10 +471,12 @@ Both codebases have this bug. Zero priority for either.
 
 | Priority | Item | Effort | Section | Status |
 |----------|------|--------|---------|--------|
-| **P0** | Fix JSON serialization to match HuggingFace's `tojson` override | Medium — replace `marshalWithSpaces` in `json.go` with a function that uses `json.NewEncoder` with `SetEscapeHTML(false)` (disables HTML escaping of `<>&`), adds spaced separators, and sorts keys to match Python dict insertion order for the `api.Tool` shape. Apply to: (1) tool definitions in `Qwen35Renderer` and all other renderers, (2) `formatToolCallArgument` at `qwen3coder.go:235-257`. Ollama's own `LFM2Renderer` (`lfm2.go:53-56`) already uses `SetEscapeHTML(false)` as a reference. | 3.1, 3.4, 2.1 | **OPEN** — three mismatches in one root cause: key ordering (Go struct order vs Python dict insertion order), HTML escaping (`\u003c` vs literal `<`), and compact spacing in `formatToolCallArgument`. |
+| **P0** | Fix HTML escaping in `marshalWithSpaces` (`json.go`) and `formatToolCallArgument` (`qwen3coder.go:195-217`) | Small — replace `json.Marshal` with `json.NewEncoder` + `SetEscapeHTML(false)` in both functions. Reference: Ollama's own `LFM2Renderer` at [`lfm2.go:55-56`](https://github.com/ollama/ollama/blob/82848a78/model/renderers/lfm2.go#L55-L56). | 3.1 Bug A | **OPEN** — empirically verified: Go outputs `\u003c` where model was trained on literal `<`. |
+| **P0** | Fix `required`/`properties` key ordering in `ToolFunctionParameters` | Small — swap the `Required` and `Properties` field declarations in `api/types.go:486-491` so `Properties` comes before `Required`, matching HuggingFace [`get_json_schema`](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/utils/chat_template_utils.py#L210-L213) and the OpenAI function calling convention. | 3.1 Bug B | **OPEN** — empirically verified: Go outputs `"required", "properties"` where model was trained on `"properties", "required"`. |
+| **P1** | Fix compact separators in `formatToolCallArgument` | Small — apply the same `marshalWithSpaces`-style spacing to `formatToolCallArgument` at `qwen3coder.go:195-217`. Currently uses raw `json.Marshal` (compact `{k:v}`) where model was trained on spaced `{k: v}`. | 3.1 Bug C | **OPEN** — empirically verified. |
 | **P2** | Add a dedicated test in `qwen35_test.go` for the prefill bug fix | Small — test where last message is `{Role: "assistant", ToolCalls: [...]}`, assert `<\|im_end\|>` IS emitted and `<\|im_start\|>assistant\n<think>\n` IS appended | 1.1 | **OPEN** — the fork's single differentiating line (`qwen35.go:136`: `&& len(message.ToolCalls) == 0`) currently has no dedicated test in the qwen35 test suite; it is only tested indirectly via `qwen3coder_test.go:327-376` |
 
-All other previously-open items (P0: JSON tool definitions, P0: tools-first ordering, P2: image support, P3: default system message, P3: unconditional think blocks, P3: lastQueryIndex tool_response filtering) are now **RESOLVED** by the dedicated `Qwen35Renderer`/`Qwen35Parser`.
+All other previously-open items (P0: JSON tool definitions, P0: tools-first ordering, P2: image support, P3: default system message, P3: unconditional think blocks, P3: lastQueryIndex tool_response filtering) are now **RESOLVED** by the dedicated `Qwen35Renderer`/`Qwen35Parser`. The JSON serialization bugs (Bugs A/B/C in section 3.1) are the only remaining template fidelity gaps — every other aspect of the rendered output is byte-identical to the official Qwen 3.5 training template.
 
 ---
 
@@ -444,7 +488,7 @@ All other previously-open items (P0: JSON tool definitions, P0: tools-first orde
 | **P0** | **`mropeInterleaved` defaults to `false`** — wrong for ALL third-party Qwen 3.5 GGUFs (Unsloth, bartowski, llama.cpp converter) | Silent data corruption: RoPE type 8 (MROPE) instead of 40 (IMROPE) in every full-attention layer. Model loads and runs but positional encoding is wrong. Users blame model quality. | **Fork**: architecture-based default. **llama.cpp**: hardcoded per arch (`LLAMA_ROPE_TYPE_IMROPE`) | 1.3 |
 | **P1** | **`repeat_last_n` API parameter silently ignored** in Go runner — accepted by API, never wired to sampler | Dead API field. Users setting `repeat_last_n: 128` get no effect. | **Fork**: wired as 9th parameter to `NewSampler`. **llama.cpp**: `penalty_last_n` correctly wired | 1.5 |
 | **P1** | **`</think>` not always closed** in `Qwen3VLRenderer` — gated on `content != ""` | Unclosed `<think>` tag for thinking-only responses in `qwen3-vl-instruct` and `qwen3-vl-thinking` models | **Fork**: always closes. **llama.cpp**: always closes via Jinja2 template | 1.2 |
-| **P0** | **JSON key ordering wrong in ALL tool serialization** — Go's `json.Marshal` uses struct field order; training templates use `tojson` which sorts alphabetically. Every nested object in every tool definition has wrong key order. Plus compact spacing in `formatToolCallArgument`. | Systematic positional encoding mismatch on every tool-using prompt for every model. The single largest template fidelity gap between Ollama and llama.cpp. Affects Qwen 3.5, Qwen3-Coder, Llama 3.x, Mistral/Devstral, Gemma, Command-R, GLM-4 — virtually all tool-calling models. | **Fork**: same bug. **llama.cpp**: correct (executes Jinja2 directly, `tojson` produces alphabetically-sorted spaced JSON) | 3.1, 2.1 |
+| **P0** | **JSON serialization wrong in ALL tool-using renderers** — three bugs: (A) Go's `json.Marshal` HTML-escapes `<>&` to `\u003c\u003e\u0026` where model was trained on literal characters, (B) `ToolFunctionParameters` struct outputs `required` before `properties` where model was trained on `properties` before `required`, (C) `formatToolCallArgument` uses compact separators where model was trained on spaced JSON. Empirically verified against `transformers` [v5.2.0](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/utils/chat_template_utils.py#L463-L466) — HuggingFace's `tojson` override uses `json.dumps(sort_keys=False, ensure_ascii=False)`, NOT stock Jinja2's `tojson` which sorts alphabetically and HTML-escapes. | Distribution shift on every tool-using prompt. Bug A affects any tool description containing `<>&` (6 bytes per char instead of 1). Bug B is a positional encoding mismatch at the parameters level. Bug C affects nested map/list values inside tool call arguments. | **Fork**: same bugs. **llama.cpp**: correct (executes Jinja2 directly with HuggingFace's `tojson` override) | 3.1, 2.1 |
 | **P1** | **Penalty sampler feeds prompt tokens into penalty window** via public `Accept()` — `repeatPenalty`, `presencePenalty`, AND `frequencyPenalty` all corrupted | With any penalty > 0/1.0, tool names, JSON tokens, and previous results in the prompt are penalized during generation. Forces `repeat_penalty: 1.0` default (disabled). Makes `presence_penalty` and `frequency_penalty` unsafe for agentic use. | **Fork**: private `recordToken()`, generated-only ring buffer. **llama.cpp**: same bug as upstream Ollama | 1.4 |
 | **P2** | **GGUF converter conditional KV emission** — `rope.mrope_interleaved` and `ssm.v_head_reordered` only written when `true` | Third-party GGUFs that omit these ollama-internal keys fall through to wrong defaults (see P0 mropeInterleaved above) | **Fork**: unconditional emission. **llama.cpp**: N/A (doesn't use these keys) | 1.7 |
 | **P2** | **`repeat_penalty` defaults to `1.0`** — penalty system is a no-op with defaults | `repeat_penalty: 1.0` means the multiplicative penalty math is identity. Combined with prompt-token contamination, upstream cannot safely raise this above 1.0. | **Fork**: also defaults to `1.0` (reverted from `1.1` to avoid affecting other models; the fork's architecture makes it safe to raise per-model via Modelfile). **llama.cpp**: same `1.0` default | 1.6 |
