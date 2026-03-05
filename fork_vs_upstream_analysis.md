@@ -19,12 +19,12 @@ Qwen3-Coder reference: `Qwen/Qwen3-Coder-30B-A3B-Instruct` Jinja2 template ([ver
 | `mropeInterleaved` default for third-party GGUFs | Architecture-aware default (`c.Architecture() != "qwen3next"`) | Hardcoded `false` — **silently wrong RoPE type** for all third-party Qwen 3.5 GGUFs | **Fork** |
 | `repeat_last_n` API parameter | Wired through to Go sampler via `NewSampler` parameter | Silently ignored (hardcoded `DefaultPenaltyLookback = 64`) | **Fork** |
 | Penalty sampling architecture (repeat, presence, frequency — all three share one token window) | Private `recordToken()` inside `Sample()`, ring buffer, excludes prompt tokens — matches original Keskar et al. 2019 CTRL paper. All 3 penalty types benefit. | Public `Accept()` called externally by runner, feeds prompt tokens into penalty window — all 3 penalty types corrupted | **Fork** |
-| `repeatPenalty` default | `1.1` (penalty system actually functions) | `1.0` (penalty system is a no-op; llama.cpp comments: `// 1.0 = disabled`) | **Fork** |
+| `repeatPenalty` default | `1.0` (same as upstream — reverted from `1.1` to avoid affecting other models; safe to raise per-model via Modelfile because fork's ring buffer excludes prompt tokens) | `1.0` (penalty system is a no-op; llama.cpp comments: `// 1.0 = disabled`) | Tie (but fork's architecture makes it safe to raise; upstream's doesn't) |
 | Third-party GGUF compatibility | Architecture-based `mropeInterleaved` default (the critical fix) + shared `ssm_dt.bias` alt tag + `Validate()` + nil checks | Hardcoded `false` mropeInterleaved default (wrong for third-party qwen35 GGUFs) + shared `ssm_dt.bias` alt tag + `Validate()` + nil checks | **Fork** (due to mropeInterleaved; other fixes are shared or equivalent) |
 | GGUF converter KV emission | Unconditional (always writes `rope.mrope_interleaved` and `ssm.v_head_reordered`) | Conditional (only writes when `true` — third-party GGUFs that omit the key fall through to wrong default) | **Fork** |
 | `SetInplace` → balanced concat tree | Fixed (matches upstream Ollama commit `3490e959`) | Fixed | Tie |
 | Tokenizer performance | Binary search prompt truncation, `strings.Contains` early-out, stack buffer BPE merge | None of these optimizations | **Fork** |
-| `formatToolCallArgument` JSON spacing | Compact JSON via `json.Marshal` | Compact JSON via `json.Marshal` | Neither (both wrong vs official template's spaced JSON) |
+| JSON tool serialization (key ordering + spacing) | Go struct field order, compact JSON — **every nested object** has wrong key order vs training data | Same | Neither (both wrong vs official template's alphabetically-sorted spaced JSON; llama.cpp correct via Jinja2 `tojson`) |
 
 ---
 
@@ -261,7 +261,24 @@ Note: the fork's `Qwen3CoderRenderer` AND `Qwen3CoderParser` already differ from
 
 The tool call format is character-for-character identical. Only the tool *definition* rendering and system message ordering differ. This is **Alibaba Qwen's confusing design decision** — it's the reason the fork author made the wrong call in commit `fbae6976`. llama.cpp (`d969e933`) sidesteps this entirely by executing the Jinja2 template directly (`chat.cpp:631-639`).
 
-**Template fidelity note on JSON key ordering**: Jinja2's `tojson` calls `json.htmlsafe_dumps()` which uses Python's default separators `(', ', ': ')` — **spaced JSON** — and **sorts keys alphabetically** (confirmed: `"function"` before `"type"` at top level, `"description"` before `"name"` inside `function`). The fork's `marshalWithSpaces` post-processes Go's `json.Marshal` output to add spaces after `:` and `,` — matching the separator style. However, Go's `json.Marshal` uses **struct declaration order** for keys, not alphabetical: it emits `{"type": "function", "function": {...}}` while `tojson` emits `{"function": {...}, "type": "function"}`. This key ordering difference is low-impact (LLMs handle JSON key order variability well) but worth noting for exact template fidelity. The HTML-escaping behavior is identical: both Go's `json.Marshal` and `tojson` produce `\u003c`/`\u003e`/`\u0026` for `<`/`>`/`&`.
+**OPEN BUG — JSON key ordering mismatch vs training data**: Jinja2's `tojson` filter **sorts keys alphabetically** (verified empirically — it is NOT the same as `json.dumps()` default, which preserves insertion order; `tojson` internally passes `sort_keys=True`). Go's `json.Marshal` uses **struct declaration order**. This means **every single nested object** in the tool definition has different key ordering between what the model was trained on and what Ollama feeds it:
+
+```
+Training (tojson, alphabetical):  {"function": {"description": "...", "name": "get_weather", "parameters": {"properties": {...}, "required": [...], "type": "object"}}, "type": "function"}
+Ollama (Go struct field order):   {"type": "function", "function": {"name": "get_weather", "description": "...", "parameters": {"type": "object", "properties": {...}, "required": [...]}}}
+```
+
+For a realistic tool with 5 nested objects, **all 5 have different key ordering**:
+- Top level: trained `function, type` → Ollama `type, function`
+- Function object: trained `description, name, parameters` → Ollama `name, description, parameters`
+- Parameters: trained `properties, required, type` → Ollama `type, properties, required`
+- Each property: trained `description, type` → Ollama `type, description`
+
+This is a systematic positional encoding mismatch across the entire tool schema — the attention patterns the model learned during training for parsing tool definitions see tokens in different positions at inference time. This is **not low-impact** — it is a distribution shift on every tool-using prompt. llama.cpp (`d969e933`) gets this right because it executes the Jinja2 template directly, which produces the same alphabetically-sorted JSON the model was trained on.
+
+This is an Ollama-wide architectural problem affecting **every model** whose training template uses `tojson`, not just Qwen 3.5. The fix is a `marshalSortedKeys` function that recursively sorts JSON object keys alphabetically before serialization. See section 3.1 for the combined fix (spacing + key ordering).
+
+The HTML-escaping behavior is identical: both Go's `json.Marshal` and `tojson` produce `\u003c`/`\u003e`/`\u0026` for `<`/`>`/`&`.
 
 ### 2.2 FIXED: System+tools ordering reversed for Qwen 3.5
 
@@ -355,23 +372,27 @@ The `Qwen35Parser` has a 3-state thinking machine (`CollectingThinking` → `Thi
 
 ## Part 3: Shared Issues (Neither Fork Nor Upstream Ollama Fixes)
 
-### 3.1 `formatToolCallArgument` uses compact JSON for object/array parameters
+### 3.1 MEDIUM: JSON serialization mismatches — wrong key ordering AND compact spacing in tool definitions and tool call arguments
 
-**Fault: Both upstream Ollama (`82848a78`) and the fork.** The `marshalWithSpaces` function already exists (at `json.go:8-45`) and is used for tool **definitions**, but neither codebase uses it for tool call **arguments**. llama.cpp (`d969e933`) gets this right because the Jinja2 template uses `tojson` for tool call arguments too (e.g., `args_value | tojson | safe` for mappings/sequences), producing spaced JSON automatically.
+**Fault: Both upstream Ollama (`82848a78`) and the fork. This is an Ollama-wide architectural deficiency affecting every model that uses `tojson` in its training template — not just Qwen 3.5.**
 
-**File**: `model/renderers/qwen3coder.go:235-257` (shared by all renderers via tool call rendering)
+llama.cpp (`d969e933`) gets both right because it executes the Jinja2 template directly, which calls `tojson` and produces the same JSON the model was trained on.
 
-When a tool call parameter value is a map, slice, or array, `formatToolCallArgument` uses `json.Marshal()`, which produces **compact JSON**:
+**Two distinct bugs, one root cause (Go's `json.Marshal`):**
+
+**Bug A — Key ordering (HIGH impact):** Jinja2's `tojson` filter sorts keys alphabetically (verified empirically: `tojson` passes `sort_keys=True` internally — this is NOT the same as Python's `json.dumps()` default which preserves insertion order). Go's `json.Marshal` uses struct declaration order. For a realistic tool definition with 5 nested objects, **all 5** have different key ordering between training and inference (see section 2.1 for the full comparison). This is a systematic positional encoding mismatch: the token positions the model's attention learned to associate with "this is the function name" vs "this is the type field" are shuffled at inference time. Every tool-using prompt is affected.
+
+**Bug B — Spacing (MEDIUM impact):** `tojson` uses Python's default separators `(', ', ': ')` — spaced JSON. Go's `json.Marshal` uses compact separators `(',', ':')`. The `marshalWithSpaces` function at `json.go:8-45` already exists and is used for tool **definitions** in `Qwen35Renderer`, but `formatToolCallArgument` (`qwen3coder.go:235-257`, shared by all renderers for tool call argument rendering) still uses raw `json.Marshal`.
+
+**Concrete comparison for a tool call argument:**
 ```
-Go:       {"key":"value","nested":[1,2,3]}
+Training (tojson):   {"key": "value", "nested": [1, 2, 3]}   ← spaced, keys sorted
+Ollama (json.Marshal): {"key":"value","nested":[1,2,3]}       ← compact, keys in Go order
 ```
 
-The official template uses Jinja2's `tojson` (via `args_value | tojson | safe` for mappings/sequences), which produces **spaced JSON**:
-```
-Python:   {"key": "value", "nested": [1, 2, 3]}
-```
+**Which models are affected:** Every model in Ollama whose official HuggingFace training template uses `{{ tool | tojson }}` or `{{ args_value | tojson }}` for tool definitions or arguments — which is virtually all tool-calling models. This includes at minimum: Qwen 3.5, Qwen3-Coder, Llama 3.x, Mistral/Devstral, Gemma, Command-R, and GLM-4. The key ordering mismatch is **the single largest systematic template fidelity gap** between Ollama and llama.cpp across all models, and it has existed since Ollama's first hardcoded Go renderers.
 
-This was verified empirically: Python's `json.dumps()` default separators are `(', ', ': ')`, and `tojson` uses these defaults. Simple string/number arguments render identically. Low practical impact — complex object/array tool call arguments are rare.
+**The fix:** Write a `marshalSortedKeys` function that recursively walks the JSON output and sorts object keys alphabetically, with spaced separators. Use it everywhere `json.Marshal` is called for tool-related serialization: tool definitions in all renderers AND `formatToolCallArgument` in `qwen3coder.go:235-257`. This fixes both bugs in one shot.
 
 ### 3.2 `lastQueryIndex` initialization edge case
 
@@ -398,7 +419,7 @@ Both codebases have this bug. Zero priority for either.
 
 ### 3.4 HTML-escaping in JSON — confirmed non-issue
 
-Both Go's `json.Marshal` and Jinja2's `tojson` (which calls `json.htmlsafe_dumps`) produce the same `\u003c`/`\u003e`/`\u0026` unicode escapes for `<`, `>`, `&`. Verified empirically. The only real format differences between Go and Python JSON serialization are spacing (section 3.1) and key ordering (section 2.1 note).
+Both Go's `json.Marshal` and Jinja2's `tojson` (which calls `json.htmlsafe_dumps`) produce the same `\u003c`/`\u003e`/`\u0026` unicode escapes for `<`, `>`, `&`. Verified empirically. The real format differences between Go and Python JSON serialization are key ordering and spacing (section 3.1).
 
 ---
 
@@ -406,7 +427,7 @@ Both Go's `json.Marshal` and Jinja2's `tojson` (which calls `json.htmlsafe_dumps
 
 | Priority | Item | Effort | Section | Status |
 |----------|------|--------|---------|--------|
-| **P1** | Use `marshalWithSpaces` for object/array values in `formatToolCallArgument` | Small — change `json.Marshal` → `marshalWithSpaces` in `qwen3coder.go:235-257` | 3.1 | **OPEN** |
+| **P0** | Write `marshalSortedKeys` — alphabetically-sorted, spaced JSON for all tool serialization | Medium — new function that recursively sorts JSON object keys + adds spaced separators. Replace `json.Marshal` in: (1) `marshalWithSpaces` at `json.go:8-45` (tool definitions, used by `Qwen35Renderer`), (2) `formatToolCallArgument` at `qwen3coder.go:235-257` (tool call arguments, shared by all renderers). One function fixes both key ordering and spacing mismatches. | 3.1, 2.1 | **OPEN** — this is the single largest remaining template fidelity gap between the fork and the official training template. Every tool-using prompt is affected. |
 | **P2** | Add a dedicated test in `qwen35_test.go` for the prefill bug fix | Small — test where last message is `{Role: "assistant", ToolCalls: [...]}`, assert `<\|im_end\|>` IS emitted and `<\|im_start\|>assistant\n<think>\n` IS appended | 1.1 | **OPEN** — the fork's single differentiating line (`qwen35.go:136`: `&& len(message.ToolCalls) == 0`) currently has no dedicated test in the qwen35 test suite; it is only tested indirectly via `qwen3coder_test.go:327-376` |
 
 All other previously-open items (P0: JSON tool definitions, P0: tools-first ordering, P2: image support, P3: default system message, P3: unconditional think blocks, P3: lastQueryIndex tool_response filtering) are now **RESOLVED** by the dedicated `Qwen35Renderer`/`Qwen35Parser`.
@@ -421,10 +442,10 @@ All other previously-open items (P0: JSON tool definitions, P0: tools-first orde
 | **P0** | **`mropeInterleaved` defaults to `false`** — wrong for ALL third-party Qwen 3.5 GGUFs (Unsloth, bartowski, llama.cpp converter) | Silent data corruption: RoPE type 8 (MROPE) instead of 40 (IMROPE) in every full-attention layer. Model loads and runs but positional encoding is wrong. Users blame model quality. | **Fork**: architecture-based default. **llama.cpp**: hardcoded per arch (`LLAMA_ROPE_TYPE_IMROPE`) | 1.3 |
 | **P1** | **`repeat_last_n` API parameter silently ignored** in Go runner — accepted by API, never wired to sampler | Dead API field. Users setting `repeat_last_n: 128` get no effect. | **Fork**: wired as 9th parameter to `NewSampler`. **llama.cpp**: `penalty_last_n` correctly wired | 1.5 |
 | **P1** | **`</think>` not always closed** in `Qwen3VLRenderer` — gated on `content != ""` | Unclosed `<think>` tag for thinking-only responses in `qwen3-vl-instruct` and `qwen3-vl-thinking` models | **Fork**: always closes. **llama.cpp**: always closes via Jinja2 template | 1.2 |
-| **P1** | **`formatToolCallArgument` uses compact JSON** for object/array parameters | Tool call arguments rendered as `{"key":"value"}` instead of `{"key": "value"}` — wrong vs official template's spaced JSON | **Fork**: same bug. **llama.cpp**: correct via `tojson` filter | 3.1 |
+| **P0** | **JSON key ordering wrong in ALL tool serialization** — Go's `json.Marshal` uses struct field order; training templates use `tojson` which sorts alphabetically. Every nested object in every tool definition has wrong key order. Plus compact spacing in `formatToolCallArgument`. | Systematic positional encoding mismatch on every tool-using prompt for every model. The single largest template fidelity gap between Ollama and llama.cpp. Affects Qwen 3.5, Qwen3-Coder, Llama 3.x, Mistral/Devstral, Gemma, Command-R, GLM-4 — virtually all tool-calling models. | **Fork**: same bug. **llama.cpp**: correct (executes Jinja2 directly, `tojson` produces alphabetically-sorted spaced JSON) | 3.1, 2.1 |
 | **P1** | **Penalty sampler feeds prompt tokens into penalty window** via public `Accept()` — `repeatPenalty`, `presencePenalty`, AND `frequencyPenalty` all corrupted | With any penalty > 0/1.0, tool names, JSON tokens, and previous results in the prompt are penalized during generation. Forces `repeat_penalty: 1.0` default (disabled). Makes `presence_penalty` and `frequency_penalty` unsafe for agentic use. | **Fork**: private `recordToken()`, generated-only ring buffer. **llama.cpp**: same bug as upstream Ollama | 1.4 |
 | **P2** | **GGUF converter conditional KV emission** — `rope.mrope_interleaved` and `ssm.v_head_reordered` only written when `true` | Third-party GGUFs that omit these ollama-internal keys fall through to wrong defaults (see P0 mropeInterleaved above) | **Fork**: unconditional emission. **llama.cpp**: N/A (doesn't use these keys) | 1.7 |
-| **P2** | **`repeat_penalty` defaults to `1.0`** — penalty system is a no-op with defaults | `repeat_penalty: 1.0` means the multiplicative penalty math is identity. Combined with prompt-token contamination, upstream cannot safely raise this above 1.0. | **Fork**: defaults to `1.1` (safe because prompt tokens excluded). **llama.cpp**: same `1.0` default | 1.6 |
+| **P2** | **`repeat_penalty` defaults to `1.0`** — penalty system is a no-op with defaults | `repeat_penalty: 1.0` means the multiplicative penalty math is identity. Combined with prompt-token contamination, upstream cannot safely raise this above 1.0. | **Fork**: also defaults to `1.0` (reverted from `1.1` to avoid affecting other models; the fork's architecture makes it safe to raise per-model via Modelfile). **llama.cpp**: same `1.0` default | 1.6 |
 
 ---
 
@@ -468,3 +489,107 @@ For text-only Unsloth GGUFs, the model layer behaves correctly: `model.go:572` c
 Upstream Ollama has secondary architectural issues (not bugs, but design debt):
 - The chat handler (`routes.go`) never checks `CapabilityVision` before accepting images — the error surfaces late in `EncodeMultimodal()` rather than at the API boundary. By contrast, llama.cpp's server validates `allow_image` at the API entry point (`server-common.cpp:970`: `"image input is not supported - hint: you may need to provide the mmproj"`) and advertises vision capability in its `/models` metadata (`server-context.cpp:3414`: `"modalities": {"vision": true}`). This missing capability advertisement is why [issue #14508](https://github.com/ollama/ollama/issues/14508) exists — third-party tools (Dify) can't detect that `qwen3.5:27b` supports vision.
 - `sched.go:448` forces `numParallel = 1` for all `qwen35` models. This restriction exists because the hybrid recurrent architecture (GatedDeltaNet) is not safe with concurrent requests (ref: [issue #4165](https://github.com/ollama/ollama/issues/4165)), not because of vision — the same restriction applies to non-vision architectures like `lfm2`.
+
+---
+
+## Part 5: Full Capability Utilization — What It Takes to Run Qwen 3.5 27B Q4 at Its Full Potential
+
+Unsloth's UD-Q4_K_XL quantization uses dynamic mixed precision — sensitive layers get higher quantization types (Q6_K, Q8_0) while less sensitive layers get Q4_K. This is the best 4-bit quantization available for consumer hardware. But the quantization quality is wasted if the inference engine doesn't handle everything else correctly. Here is the complete picture.
+
+### What already works correctly in the fork
+
+These require no action — they are verified working:
+
+- **Flash attention** for FullAttention layers (every 4th layer). Enabled by default for `qwen3next` architecture (`fs/ggml/ggml.go:873,901`). Uses `ggml_flash_attn_ext()` with F32 precision. The 48 GatedDeltaNet recurrent layers (75% of the model) do not use flash attention — they use their own chunked linear attention with delta state updates, which is architecturally correct.
+- **KV cache quantization** via `OLLAMA_KV_CACHE_TYPE=q8_0` (or `q4_0`). Only applies to the 16 FullAttention layers' causal KV cache — the recurrent layers' conv+delta state always stays F32, which is correct (quantizing recurrent state causes severe quality loss). Requires flash attention to be enabled (it is by default). Supported types checked at `fs/ggml/ggml.go:848-854`.
+- **131K context window**. `num_ctx 131072` works — the code at `llm/server.go:167-171` clamps to the GGUF metadata's `context_length`, which the Unsloth GGUF correctly sets. No artificial cap in the engine.
+- **YaRN RoPE scaling** at `model/models/qwen3next/model.go:77-84`. Correct attention factor formula: `1.0 / (1.0 + 0.1*ln(ropeScale))`. Parameters flow through to GGML's `ggml_rope_multi`/`ggml_rope_ext` at `ml/backend/ggml/ggml.go:1550-1582`.
+- **MRoPE (Multi-Resolution RoPE)** with `mrope_sections` from GGUF metadata (`model.go:536-545`). The fork's `mropeInterleaved` architecture-based default (section 1.3) ensures the correct IMROPE type 40 is used.
+- **Grammar/GBNF constrained decoding** at `sample/samplers.go:212-251`. Wraps llama.cpp's GBNF engine 1:1. Guarantees valid JSON for tool calls. Works with qwen3next.
+- **Mmap with smart defaults** at `llm/server.go:672-694`. Model weights are memory-mapped. Disabled automatically for partial GPU offload on Metal, Windows CUDA perf, and Linux when model exceeds free memory.
+- **Vision (unified GGUF from ollama.com/library only)**. The model code at `model/models/qwen3next/model.go:237-238,297-367,611-617` has full vision support — 27-layer vision encoder, `EncodeMultimodal`, grid-based image processing with spatial merge. Works with Ollama's own `qwen3.5:27b` blob (1307 tensors, `vision.block_count=27`). Images from ALL messages in the conversation are correctly handled — `prompt.go:122-127` collects `ImageData` from every message that survived truncation, the renderer emits `[img-N]` tags with incrementing IDs across all messages (`qwen35.go:129-132`), and the runner splits the entire prompt on `\[img-(\d+)\]` regex (`ollamarunner/runner.go:236-238`) and processes every match via `EncodeMultimodal`. Multi-turn vision conversations work. Does NOT work with Unsloth text-only GGUFs (851 tensors, no vision weights) — see "Vision with Unsloth third-party GGUFs" below. **One minor template fidelity gap:** the renderer puts all image tokens before text within each message (`qwen35.go:50-56`, comment: "assumes all images are at the front"), while the official Qwen 3.5 Jinja2 template renders image tokens inline where they appear in the content list. This only matters for multi-image messages where the user interleaves text and images (e.g., "What's in [img] compared to [img]?"). This is an upstream Ollama design choice, not a fork issue — the fork's renderer is byte-identical to upstream here.
+- **Penalty sampling** — fork's private `recordToken()` ring buffer excludes prompt tokens. All 3 penalty types (repeat, presence, frequency) correctly operate on generated tokens only.
+
+### What needs fixing (correctness)
+
+| Issue | Impact | Fix | Section |
+|-------|--------|-----|---------|
+| **JSON key ordering** in all tool serialization — Go's `json.Marshal` emits struct field order, training templates use `tojson` which sorts alphabetically. Every nested object wrong. | Distribution shift on every tool-using prompt. The model's attention patterns for parsing tool schemas see tokens in different positions than during training. | Write `marshalSortedKeys` — one function fixes both key ordering and spacing. | 3.1, 2.1 |
+| **Compact JSON spacing** in `formatToolCallArgument` — `json.Marshal` produces `{"key":"value"}`, training template produces `{"key": "value"}` | Incorrect tokenization of tool call arguments (different byte sequences = different tokens). | Same `marshalSortedKeys` function. | 3.1 |
+| **Prefill test gap** — the fork's single differentiating line (`qwen35.go:136`) has no dedicated test | Risk of regression. | Add test to `qwen35_test.go`. | 1.1 |
+
+### What's missing (performance)
+
+#### Speculative decoding — the single biggest performance opportunity (REQUIRES RESEARCH)
+
+**What it is:** A small "draft" model (e.g., Qwen 3.5 0.6B or 1.5B at Q8_0) generates N candidate tokens cheaply, then the full 27B model verifies them all in a single forward pass. Correct tokens are accepted, wrong ones are rejected and regenerated. For 4-bit models on consumer hardware, generation is overwhelmingly memory-bandwidth-bound (you're moving 17.6 GB of weights through memory for every single token). Speculative decoding amortizes this cost across multiple tokens.
+
+**Expected speedup:** 2-4x on token generation, depending on draft model quality and acceptance rate. This would transform the user experience from "usable but slow" to "genuinely fast" on a single GPU.
+
+**Current status in Ollama:** Not supported at all. Zero infrastructure — no draft model loading, no accept/reject logic, no token tree verification. The only trace is dead code in llama.cpp's vendored `common.h:236-245` (`common_params_speculative` structs), never called by Ollama.
+
+**llama.cpp status:** llama.cpp has speculative decoding via `llama-speculative` with configurable parameters (`n_max=16` draft tokens, `p_min=0.75` acceptance threshold). **However, it is unclear whether llama.cpp's speculative decoding works with hybrid recurrent architectures like qwen3next.** The GatedDeltaNet recurrent layers maintain internal state that depends on the exact token sequence — if draft tokens are rejected, the recurrent state must be rolled back, which is fundamentally different from rolling back a KV cache. This is a deep architectural question that requires studying:
+1. Whether llama.cpp's speculative decoding handles recurrent state rollback for Mamba/Jamba/qwen3next models
+2. Whether the draft model needs to be the same architecture (hybrid) or can be a pure transformer
+3. Whether the recurrent state can be checkpointed/restored efficiently without replaying the entire sequence
+4. What the interaction is between speculative decoding and the `numParallel=1` constraint
+
+**Bottom line:** This requires significant research before any implementation work. The payoff is enormous but the complexity for hybrid architectures is unknown.
+
+#### Parallel requests — hard-locked to 1
+
+`sched.go:448` forces `numParallel = 1` for all qwen3next models. The blocker is the GatedDeltaNet recurrent layers: `deltanet.go:80-87` requires all sequences in a batch to have the same token count (`ErrUnsupportedBatchLayout`). The 16 FullAttention layers could theoretically batch across sequences (standard causal KV cache supports it), but the 48 recurrent layers cannot.
+
+**Gotcha:** This is not a bug — it's an architectural constraint of hybrid recurrent models. Ollama, llama.cpp, and every other inference engine have this limitation for Mamba/Jamba/GatedDeltaNet architectures. Two possible approaches exist (run recurrent layers per-sequence while batching attention, or pad sequences to equal length) but both have significant complexity and questionable net benefit.
+
+#### Fused GatedDeltaNet kernel
+
+The current Go-level implementation at `deltanet.go:463-495` loops over chunks in Go, creating ~10 GGML graph nodes per chunk per layer. For a 512-token prompt evaluation: 64 layers × 75% recurrent = 48 recurrent layers × 8 chunks = 384 chunk iterations, each creating multiple graph nodes. This is a graph compilation bottleneck.
+
+GGML already has relevant CUDA kernels (`gla.cu` for Gated Linear Attention, `ssm-conv.cu` for SSM convolution, `solve_tri.cu` for triangular solve, `cumsum.cu` for cumulative sum) but the Go-level deltanet implementation constructs the computation from generic GGML ops (Mulmat, Slice, Concat) rather than calling these specialized ops.
+
+**Gotcha:** Fusing this into a single GGML op requires CUDA/Metal/Vulkan kernel work. The `gla.cu` kernel in the vendored GGML is the closest match, but GatedDeltaNet's delta rule update (`S = α ⊙ S + β^T v` with short convolution preprocessing) differs from standard GLA (`S = S + k^T v`). This would need a custom CUDA kernel or significant adaptation of `gla.cu`.
+
+#### Batch size
+
+Default is 512 (`api/types.go:1074`). llama.cpp defaults to 2048. For 131K context prompt evaluation, a larger batch size reduces the number of forward passes. The GatedDeltaNet's chunk size is 64 (`deltanet.go:12`), so batch sizes should be multiples of 64 for optimal padding.
+
+**Quick fix:** Add `PARAMETER num_batch 2048` to the Modelfile. No code change needed. Verify memory fits first — larger batch sizes require more intermediate tensor memory during prompt evaluation.
+
+### What's missing (capabilities)
+
+#### Vision with Unsloth third-party GGUFs (REQUIRES SIGNIFICANT RESEARCH)
+
+**Two completely different vision situations exist — do not confuse them:**
+
+**Situation A: Official `ollama.com/library/qwen3.5:27b` (unified GGUF) — VISION WORKS.**
+Ollama's own model blob contains all 1307 tensors (851 text + 456 vision) in a single GGUF with `vision.block_count=27`. The model loads with `Vision = qwen3vl.NewVisionModel(c)` at `model.go:611-617`. `EncodeMultimodal` at `model.go:297-319` processes images through the 27-layer vision encoder with grid-based spatial merge. The `Qwen35Renderer` emits `[img-N]` tags (when `useImgTags=true`, which is the case in the server at `routes.go:108`), and the runner at `ollamarunner/runner.go:236-284` splits the prompt on those tags and splices in image embeddings. Images from all messages in the conversation work — not just the most recent message. Verified: `prompt.go:122-127` collects `ImageData` from every surviving message, the renderer's `imageOffset` counter at `qwen35.go:129-132` increments across all messages, and the runner's regex at line 236 matches all `[img-N]` tags anywhere in the prompt. **The fork does not break any of this** — the `Qwen35Renderer` is byte-identical to upstream except the prefill fix at line 136, which does not touch vision code.
+
+**Situation B: Unsloth text-only GGUF (`qwen3.5-custom` Modelfile) — NO VISION, BY DESIGN.**
+The Unsloth UD-Q4_K_XL GGUF has 851 tensors and no `vision.block_count` metadata. At `model.go:611`, `c.Uint("vision.block_count", 0)` returns 0, so `NewVisionModel` is never called and `Vision = nil`. If a user sends an image via the API, `EncodeMultimodal` returns `ErrNoVisionModel` at `model.go:298-299`. The renderer still emits `[img-N]` tags into the prompt text, but the runner's `multimodalProcessor` type assertion at `ollamarunner/runner.go:233` evaluates to `visionModel = false`, so it takes the text-only path at line 241 and the `[img-N]` tags remain as literal text (never processed). This is correct behavior for text-only usage.
+
+**The trap: using `FROM hf.co/unsloth/Qwen3.5-27B-GGUF:Q4_K_XL` in a Modelfile.** When Ollama pulls from HuggingFace instead of using a local file, it auto-discovers the mmproj file alongside the main GGUF, classifies it as `"application/vnd.ollama.image.projector"` at `create.go:653`, and adds it to `ProjectorPaths` at `images.go:319`. The Go engine then hits the check at `llm/server.go:148-152`: `if len(projectors) == 0 { ... } else { err = errors.New("split vision models aren't supported") }`. Since `qwen3next` is in the `OllamaEngineRequired()` list (`fs/ggml/ggml.go:294`), there is no fallback to the llama.cpp runner — **the entire model load fails**. The custom Modelfile at `/home/user/Desktop/vibe_web_terminal/ollama-models/qwen3.5-custom.Modelfile` works around this by using `FROM /tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` (manually downloaded text-only GGUF) — the mmproj is never pulled, `ProjectorPaths` stays empty, and the model loads successfully as text-only.
+
+**What it would take to enable vision with Unsloth GGUFs — and why this requires significant research:**
+
+1. **The Go engine loads a single GGUF file.** The entire model loading pipeline (`ml/backend/ggml/ggml.go`) assumes one GGUF. The mmproj is a second GGUF with its own tensor namespace. Merging them at load time requires understanding how tensor names map between the two files (the main GGUF uses `v.*` prefixed tensor names for vision, the mmproj may use different naming conventions depending on the converter).
+
+2. **Unsloth's mmproj may not match Ollama's expected vision tensor layout.** Ollama's `qwen3vl.NewVisionModel(c)` at `model.go:611` reads vision config from GGUF metadata (`vision.block_count`, `vision.embedding_length`, etc.) and expects tensors at specific GGUF names (e.g., `v.blk.{n}.attn_qkv.weight`). Unsloth's mmproj was generated by llama.cpp's `convert_hf_to_gguf.py`, which may use different tensor names (e.g., `v.enc.blk.{n}.attn_qkv.weight` or `mm.{n}.weight`). A tensor name mapping layer would be needed.
+
+3. **The vision encoder is 27 layers (456 tensors).** This is not a small projector — it's a full ViT with 1152 hidden size, 16 heads, and patch size 16. Loading it separately, mapping its tensors, and integrating it with the Go engine's single-GGUF buffer allocation is non-trivial.
+
+4. **Quantization compatibility.** The mmproj files come in BF16/F16/F32. The text model is Q4_K_XL. The Go engine needs to handle mixed precision across the two GGUFs, placing vision tensors on the correct device (GPU) with the correct quantization type.
+
+5. **An alternative: merge the GGUFs offline.** Instead of fixing the Go engine, one could write a tool that merges the Unsloth text GGUF + mmproj into a single unified GGUF matching Ollama's expected format. This avoids engine changes but requires understanding both GGUF layouts and producing correct metadata. This is probably the more practical path but still requires research into tensor name mappings and metadata compatibility.
+
+6. **Testing.** Even after loading, the vision pipeline (`EncodeMultimodal` at `model.go:297-319`, `PostTokenize` at `model.go:321-367`) was tested with Ollama's own unified GGUFs. Third-party vision tensors from a different converter may have subtle differences (weight ordering, normalization conventions, patch embedding layout) that produce wrong results without error.
+
+**Bottom line:** This is a research project, not a quick fix. The minimum viable approach (offline GGUF merge tool) still requires deep understanding of both Ollama's and llama.cpp's GGUF vision tensor conventions. The full approach (Go engine multi-GGUF loading) is a significant architectural change to Ollama's model loading pipeline. Vision works perfectly with the official `ollama.com/library` model — the gap is exclusively about third-party GGUFs that split text and vision into separate files.
+
+### What doesn't matter
+
+- **Token healing / BPE anti-corruption**: Not implemented in Ollama or llama.cpp. Handled at the application layer. Ollama tokenizes the full rendered prompt as a single string, so there are no internal boundary artifacts — the boundaries are between special tokens (`<|im_start|>`, `<|im_end|>`) which are in the vocabulary and tokenized correctly.
+- **Continuous batching**: Blocked by `numParallel=1` (same root cause as parallel requests). Even if unblocked, the GatedDeltaNet layers would need all sequences padded to equal length, negating the efficiency benefit.
+- **Dynamic NTK RoPE scaling**: Would allow exceeding the 131K training context length. Neither Ollama nor llama.cpp implement this at runtime. The static YaRN implementation is sufficient since the Modelfile's `num_ctx 131072` matches the training length.
+- **Separate K/V cache quantization types**: Ollama uses one type for both K and V (`llama/llama.go:139-140`). llama.cpp supports separate `cache_type_k`/`cache_type_v`. Low impact — the difference between Q8_0 for both vs Q8_0-K/Q4_0-V is minor compared to the recurrent state dominating memory anyway.
+- **Lazy expert loading for MoE layers**: Qwen 3.5 27B has MoE in its architecture (128 experts, 8 active per token). Lazy loading could reduce memory by only loading active experts on demand. Neither Ollama nor llama.cpp implement this. The 4-bit quantization already makes the full model fit in memory on consumer GPUs, so the motivation is limited.
