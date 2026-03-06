@@ -17,10 +17,12 @@ The fork's critical fixes (prefill bug, `mropeInterleaved` default, penalty samp
 1. **CUDA async copy / reduced synchronization** — llama.cpp gained a meaningful performance optimization that the fork's vendored GGML lacks
 2. **M-RoPE `can_shift()` guard** — llama.cpp added a correctness fix that prevents corrupt K-shift on M-RoPE models; the fork's vendored llama.cpp lacks this but the Go runner gracefully degrades
 3. **History `<think>` blocks bug** — both fork and upstream incorrectly gate history thinking blocks on `isThinking`; the official template always includes them for messages after `lastQueryIndex`, regardless of `enable_thinking`
-4. **Speculative decoding** is confirmed impossible for hybrid recurrent architectures in both llama.cpp and Ollama — the recurrent state fundamentally cannot be rolled back
-5. **Parallelism** is restricted at the scheduler level (`sched.go:450`) despite the runner supporting it — both the fork and upstream have this limitation
-6. **KDA chunk size** change doesn't affect Qwen 3.5 (it uses GDA, not KDA)
-7. **Vision prompt caching** was added to llama.cpp's server — Ollama has no equivalent
+4. **llama.cpp has its own Qwen 3.5 bugs** — four confirmed issues in llama.cpp's own code: (a) non-thinking mode generation prompt produces `<think>\n</think>` (3 tokens) instead of the official `<think>\n\n</think>\n\n` (6 tokens) — a token sequence the model was never trained on; (b) prompt tokens contaminate the penalty sampler ring buffer; (c) no model-specific sampler defaults; (d) float precision loss in `tojson`. See Section 6.4 for details.
+5. **Unsloth GGUF embeds a modified template** — the Unsloth Dynamic `UD-Q4_K_XL` GGUF at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` contains a Jinja2 template that is NOT byte-identical to the official HuggingFace version. The modifications are in the tool call arguments section only (defensive workarounds for older Jinja engines) and are functionally equivalent. See Section 6.5 for details.
+6. **Speculative decoding** is confirmed impossible for hybrid recurrent architectures in both llama.cpp and Ollama — the recurrent state fundamentally cannot be rolled back
+7. **Parallelism** is restricted at the scheduler level (`sched.go:450`) despite the runner supporting it — both the fork and upstream have this limitation
+8. **KDA chunk size** change doesn't affect Qwen 3.5 (it uses GDA, not KDA)
+9. **Vision prompt caching** was added to llama.cpp's server — Ollama has no equivalent
 
 ---
 
@@ -145,9 +147,9 @@ Qwen 3.5 uses GDA → chunk size remains 64 → no change in behavior. The fork'
 
 ### 1.11 Sampler/Penalty System — NO CHANGES
 
-The penalty sampler in `llama-sampler.cpp` is **byte-identical** between `d969e933` and the latest. Same ring buffer, same `accept()` behavior, same prompt-token feeding in `server-context.cpp:197-219`. Defaults unchanged: `penalty_repeat=1.0` (disabled), `penalty_last_n=64`.
+The penalty sampler in `llama-sampler.cpp` is **byte-identical** between `d969e933` and the latest. Same ring buffer, same `accept()` behavior, same prompt-token feeding in `server-context.cpp:208-215`. Defaults unchanged: `penalty_repeat=1.0` (disabled), `penalty_last_n=64`.
 
-**The fork's penalty architecture remains the only correct implementation per the original Keskar et al. (2019) CTRL paper.** Both llama.cpp and upstream Ollama continue to feed prompt tokens into the penalty window.
+**The fork's penalty architecture remains the only correct implementation per the original Keskar et al. (2019) CTRL paper.** Both llama.cpp and upstream Ollama continue to feed prompt tokens into the penalty window. The specific bug: at `server-context.cpp:208-215`, all prompt tokens are passed to `common_sampler_accept(smpl.get(), id, false)`, which calls through to `llama_sampler_accept` at `common/sampling.cpp:361-375`. The penalty sampler struct at `llama-sampler.cpp:2622-2656` uses a ring buffer that makes no distinction between prompt-origin and generation-origin tokens. When a user sets `repeat_penalty=1.05` (Qwen's recommendation), tokens from the system prompt, tool definitions, and conversation history are penalized during generation — the penalty targets the wrong population. This is currently masked by llama.cpp's default `repeat_penalty=1.0` (effectively disabled) at `common/common.h:199`.
 
 ---
 
@@ -351,9 +353,14 @@ All findings from the previous analysis remain valid:
 | Prefill bug (`qwen35.go:136`) | Fixed | **BROKEN** | N/A (uses `add_generation_prompt`) |
 | `mropeInterleaved` default | Architecture-based | **BROKEN** (`false`) | Hardcoded per arch |
 | `repeat_last_n` wiring | Wired from API | **DEAD** (hardcoded 64) | Wired |
-| Penalty sampler (prompt tokens) | Generated-only ring buffer | **Prompt-contaminated** | **Prompt-contaminated** |
+| Penalty sampler (prompt tokens) | Generated-only ring buffer | **Prompt-contaminated** | **Prompt-contaminated** (masked by `repeat_penalty=1.0` default) |
 | `</think>` closure in Qwen3VL | Always closes | **Broken** | Always closes |
 | GGUF converter KV emission | Unconditional | Conditional | N/A |
+| `enable_thinking` generation prompt | **Correct** (`emitEmptyThinkOnNoThink`) | **Correct** | **WRONG** — not passed to Jinja; post-processing at `chat.cpp:1534-1536` produces `<think>\n</think>` (3 tokens) instead of official `<think>\n\n</think>\n\n` (6 tokens) — a token sequence never seen in training |
+| History `<think>` blocks gated on thinking mode | **BROKEN** (gated on `isThinking`) | **BROKEN** (identical code) | **Correct** (template handles it) |
+| Model-specific sampler defaults | Not implemented | Not implemented | **Not implemented** (`common.h:186-198` — same defaults for all models) |
+| Float precision in `tojson` | N/A (Go renderer) | N/A (Go renderer) | **Minor flaw** — 6 sig digits vs Python's ~17 (`value.cpp:1290`) |
+| Tool call parser robustness | **Free-form** — accepts any model output, parses after the fact; malformed tool calls silently produce garbage `api.ToolCall` structs that propagate | **Free-form** (identical code) | **Grammar-constrained** — PEG parser forces model to produce syntactically valid tool calls during generation; malformed output is structurally impossible |
 
 ### 6.2 New Correctness Considerations
 
@@ -371,7 +378,93 @@ The 3 JSON serialization bugs remain unfixed in both the fork and upstream Ollam
 
 **KV cache round-trip danger:** Sub-bugs A and C have a second, more severe failure mode beyond training distribution shift. In multi-turn conversations with tool calls, the renderer re-serializes tool call arguments from parsed Go types. If the re-serialized bytes don't match what the model originally generated, the KV cache cannot reuse the cached computation — the engine must reprocess everything from the divergence point. For a 20-turn agentic coding conversation with structured tool arguments, this means reprocessing potentially tens of thousands of tokens on every new turn. The user sees progressively slower response times with no visible cause — a scaling catastrophe that is invisible in simple testing because it only manifests at conversation length and produces correct output regardless. Fixing Sub-bug C (spaced JSON) actually *improves* the round-trip (model generates spaced, renderer re-serializes spaced → match), but the fix must be validated end-to-end across the parse→store→re-render cycle.
 
-llama.cpp avoids all three by executing the official Jinja2 template directly. Its `tojson` implementation at `common/jinja/value.cpp:179-180` defaults to `", "` and `": "` separators, and at lines 1291-1312 writes `<>&` literally without escaping.
+llama.cpp avoids all three JSON serialization bugs by executing the official Jinja2 template directly. Its `tojson` implementation at `common/jinja/value.cpp:179-180` defaults to `", "` and `": "` separators, preserves dict insertion order (at line 1330: `as_ordered_object()` with comment "IMPORTANT: need to keep exact order"), and at lines 1291-1312 writes `<>&` literally without escaping.
+
+However, llama.cpp's `tojson` has **one minor flaw**: float serialization at `value.cpp:1290` uses C++ `ostringstream` default formatting (6 significant digits), while Python's `json.dumps` preserves full IEEE 754 double precision (~17 digits). Additionally, `1.0` becomes `1` (no decimal point) in C++ but stays `1.0` in Python. This is unlikely to affect model behavior in practice (only matters for tool call arguments containing high-precision float values, e.g. geographic coordinates), but is a technical divergence from HuggingFace's `tojson` behavior.
+
+**Important context: llama.cpp has its own set of bugs** unrelated to JSON serialization — see Section 6.4. Also note that the Unsloth GGUF at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` embeds a modified template — see Section 6.5.
+
+### 6.4 llama.cpp's Own Qwen 3.5 Bugs (4 Confirmed)
+
+While llama.cpp avoids the JSON serialization bugs by executing Jinja templates directly, it has its own set of correctness bugs relevant to Qwen 3.5:
+
+**Bug 1 — Non-thinking mode generation prompt produces wrong token sequence:**
+The `common_chat_params_init_qwen3_coder` handler at `common/chat.cpp:1527` calls `data.prompt = apply(tmpl, inputs)` without including `enable_thinking` in the Jinja template context. The `apply()` function at `chat.cpp:804-854` builds context from messages, tools, `extra_context`, and `add_generation_prompt` — but never `enable_thinking`. Only the Hermes 2 Pro handler (at `chat.cpp:2392-2397`) passes `enable_thinking` via `extra_context` directly to the template.
+
+The Qwen3Coder handler attempts to compensate with **post-processing** at lines 1533-1539: after the template renders (always producing `<think>\n` at the end because `enable_thinking` is undefined → treated as enabled), the handler checks `if (supports_reasoning && string_ends_with(data.prompt, "<think>\n"))` and, when `!inputs.enable_thinking`, appends `</think>`. The result for non-thinking mode is `<think>\n</think>`.
+
+The official template produces `<think>\n\n</think>\n\n` for non-thinking mode — with an empty line inside the think block (the "empty reasoning content") and a double-newline separator after it. llama.cpp's post-processing produces a completely different token sequence: `<think>\n</think>` (3 tokens: `<think>`, `\n`, `</think>`) vs `<think>\n\n</think>\n\n` (6 tokens: `<think>`, `\n`, `\n`, `</think>`, `\n`, `\n`). The 3-token sequence was never seen during training — the model was exclusively trained on the 6-token version for non-thinking mode. This is a real distribution shift: the model encounters a novel prefix that it must interpret on the fly, which can affect output quality, formatting, and the model's understanding of whether thinking is truly disabled.
+
+The fork and upstream Ollama produce the exact official 6-token prefill via `emitEmptyThinkOnNoThink` (Section 9.4), making them correct on this point where llama.cpp is not.
+
+**Bug 2 — Prompt tokens contaminate penalty sampler ring buffer (masked by default):**
+At `tools/server/server-context.cpp:208-215`, llama.cpp feeds ALL prompt tokens into the penalty sampler via `common_sampler_accept(smpl.get(), id, false)`. The `common_sampler_accept` function at `common/sampling.cpp:361-375` calls `llama_sampler_accept(gsmpl->chain, token)` for every token, and the penalty sampler at `src/llama-sampler.cpp:2622-2656` uses a ring buffer that makes no distinction between prompt and generated tokens.
+
+This means tokens from the system prompt, tool definitions, and conversation history are fed into the same ring buffer as generated tokens. If a user sets `repeat_penalty > 1.0` (recommended by Qwen for 1.05), the penalty sampler penalizes tokens that appear in the system prompt or tool definitions — exactly the tokens the model NEEDS to produce for tool calls. The penalty targets the wrong population.
+
+This bug is currently **masked** by llama.cpp's defaults: `repeat_penalty=1.0` (at `common/common.h:199`) disables the penalty entirely, and `penalty_last_n=64` limits the window. But any user who follows Qwen's recommendation of `repeat_penalty=1.05` with a larger window activates the bug.
+
+The fork's penalty sampler architecture (`sample/samplers.go`) correctly maintains a generated-only ring buffer that never sees prompt tokens.
+
+**Bug 3 — No model-specific sampler defaults:**
+llama.cpp uses the same hardcoded defaults for all models at `common/common.h:186-208`: `temp=0.80`, `top_k=40`, `top_p=0.95`, `min_p=0.05`, `repeat_penalty=1.0`. Qwen recommends `temp=0.6`, `top_p=0.95`, `top_k=20`, `min_p=0`, `repeat_penalty=1.05` for Qwen 3.5 specifically (from the model card). There is no mechanism to read recommended sampling parameters from GGUF metadata or model config. This affects all inference engines (llama.cpp, Ollama, and the fork equally) — none auto-configure per-model sampling.
+
+**Bug 4 — Float precision loss in `tojson`:**
+At `common/jinja/value.cpp:1290`, float serialization uses `oss << val->as_float()` which defaults to 6 significant digits via C++ `ostringstream`. Python's `json.dumps` preserves ~17 digits (full IEEE 754). Additionally, `1.0` renders as `1` in C++ (no decimal point) vs `1.0` in Python. While unlikely to affect model behavior for most tool calls, this is a correctness divergence for tool call arguments containing high-precision floats (e.g., geographic coordinates: `37.7749` is fine at 6 digits, but `37.774929` would be truncated to `37.7749`).
+
+### 6.5 Unsloth GGUF Template Modification
+
+The Unsloth Dynamic 2.0 `UD-Q4_K_XL` GGUF at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` (17.6 GB, 851 tensors) embeds a Jinja2 chat template that is **not byte-identical** to the official `Qwen/Qwen3.5-27B` HuggingFace template. The template was extracted from the GGUF's `tokenizer.chat_template` metadata field (7817 chars vs the official 7756 chars).
+
+**What Unsloth changed** (tool call arguments section only):
+
+| Official Template | Unsloth GGUF Template |
+|---|---|
+| `tool_call.arguments is defined` | `tool_call.arguments is mapping` |
+| `for args_name, args_value in tool_call.arguments\|items` | `for args_name in tool_call.arguments` |
+| (tuple unpacking from `\|items`) | `set args_value = tool_call.arguments[args_name]` (bracket access) |
+
+**Why Unsloth made these changes:** The `|items` Jinja2 filter on a dict returns a list of `(key, value)` tuples. Older versions of llama.cpp's Jinja engine may not have supported tuple unpacking in `for` loops or may have had buggy `|items` implementations. The `is mapping` check is more defensive than `is defined` (catches the case where arguments is a string instead of a dict). These are workarounds for Jinja engine compatibility, not semantic changes.
+
+**Functional equivalence:** Both versions produce identical output for normal use. llama.cpp's `func_args_not_string` workaround at `common/chat.cpp:2947-2965` ensures that tool call arguments are always parsed from strings into JSON objects before template execution, so the `is mapping` check always succeeds. The iteration approach (key iteration + bracket access vs tuple unpacking from `|items`) produces the same output because dict iteration in Jinja yields keys, and `dict[key]` is equivalent to the value from `dict.items()`.
+
+**Everything else is identical:** The `enable_thinking` handling, history rendering, tool definition formatting, system message logic, and all other template logic are byte-identical to the official template.
+
+**Impact on llama.cpp users:** None for normal use. If llama.cpp's Jinja engine is updated to change `|items` behavior, the Unsloth template would be more resilient than the official template. This is a purely defensive modification.
+
+**Impact on Ollama users:** None. Ollama does not execute the GGUF-embedded Jinja template — it uses its own Go renderers. The GGUF template is only relevant for llama.cpp's `--chat-template` auto-detection.
+
+### 6.6 Tool Call Parser Architecture: Ollama's Free-Form Parser vs llama.cpp's Grammar-Constrained Parser
+
+Both Ollama and llama.cpp parse the same Qwen 3.5 tool call format — the XML-style `<tool_call>/<function=name>/<parameter=name>` structure defined in the official template (lines 105-128 of `/tmp/qwen35_template.jinja2`). Both the official HuggingFace template and the Unsloth GGUF template at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` produce identical tool call formatting (the Unsloth modifications only affect how tool call arguments are iterated inside the template, not the output format). llama.cpp correctly detects this format by checking the GGUF-embedded template for `<tool_call>`, `<function=`, and `<parameter=` markers at `chat.cpp:3118-3120`, routing to the `common_chat_params_init_qwen3_coder` handler. Ollama routes Qwen 3.5 to `Qwen35Parser` (at `parsers/parsers.go:53`) which wraps `Qwen3CoderParser` (at `parsers/qwen3coder.go`).
+
+The critical difference is **how** they parse:
+
+**llama.cpp — Grammar-constrained PEG parser (`chat.cpp:1555-1616`):**
+llama.cpp builds a PEG (Parsing Expression Grammar) at render time from the declared tool schemas. At `chat.cpp:1580`, each tool becomes a grammar rule: `"<function=" + literal(name) + ">\n"`. Each parameter becomes a grammar rule at line 1592: `"<parameter=" + literal(param_name) + ">\n"`. String parameters accept free text (line 1597: `p.tool_arg_string_value(arg_string)`); non-string parameters are constrained to match their JSON schema (line 1599: `p.schema(p.json(), rule_name + "-schema", param_schema)`). Required parameters must appear exactly once (line 1604: `min = 1, max = 1`); optional parameters appear zero or one times.
+
+This grammar is applied **during token generation** — the model's logits are masked at each step so it can only produce tokens that continue a valid parse. The model literally cannot generate a malformed tool call. If the model tries to hallucinate a function name that wasn't declared, the grammar prevents it. If it tries to output a string where the schema expects a JSON object, the grammar forces valid JSON. The output is guaranteed to be a syntactically valid tool call with correct parameter names and type-conforming values.
+
+**Ollama — Free-form streaming parser (`parsers/qwen3coder.go:150-317`, `parsers/qwen35.go:84-238`):**
+Ollama's parser is a state machine that processes the model's raw text output token by token after generation. The `Qwen35Parser` first handles `<think>`/`</think>` extraction (states: `CollectingThinking` → `ThinkingDoneEatingWhitespace` → `CollectingContent`), then delegates post-thinking content to `Qwen3CoderParser`. The `Qwen3CoderParser` scans for `<tool_call>` open tags (state `LookingForToolStart` at line 249), accumulates everything until `</tool_call>` (state `CollectingToolContent` at line 293), then passes the raw content between these tags to `parseToolCall()` at line 341.
+
+`parseToolCall()` transforms the XML-like `<function=name>` / `<parameter=name>` tags into standard XML via regex replacement (`transformToXML` at line 520: `<tag=abc>` → `<tag name="abc">`), then calls Go's `xml.Unmarshal` to parse. Parameter values are type-coerced by `parseValue()` at line 404, which tries each declared type in precedence order (boolean → integer → number → array → object → string).
+
+**The problem is what happens when the model misbehaves.** The model's output is untrusted — it can generate anything. With llama.cpp's grammar-constrained approach, "anything" is limited to the set of valid parses. With Ollama's free-form approach, the model can generate:
+
+1. **A function name that doesn't exist in the declared tools.** llama.cpp: impossible — the grammar only allows declared names. Ollama: the `<function=hallucinated_name>` tag is parsed by `transformToXML`, `xml.Unmarshal` succeeds, and `parseToolCall` produces an `api.ToolCall` with `Function.Name = "hallucinated_name"`. The tool matching loop at line 358 sets `matchedTool = nil`, so all parameters are parsed without type information (defaulting to raw strings at line 416). This phantom tool call propagates through the API to the client, which must handle a tool call for a function it never declared.
+
+2. **Malformed XML between `<tool_call>` and `</tool_call>`.** llama.cpp: impossible. Ollama: if the model generates `<tool_call>\nsome garbage that isn't valid XML\n</tool_call>`, the `transformToXML` regex may partially match, `xml.Unmarshal` may fail (returning an error at line 349), and `parseToolCall` returns the error. This propagates up through `Qwen3CoderParser.Add()` at line 84-85, which logs a warning and returns the error. The runner then has an error for a turn that looked like it might have tool calls — the recovery path is unclear.
+
+3. **A `<tool_call>` open tag with no matching `</tool_call>`.** llama.cpp: impossible — the grammar requires `</tool_call>` + whitespace at line 1612. Ollama: the `CollectingToolContent` state at line 293 accumulates forever, waiting for `</tool_call>`. If the model generates content after the unclosed `<tool_call>` and then stops (EOS), the accumulated content is never emitted as either a tool call or as content — it's silently lost in the parser's buffer.
+
+4. **Tool call XML appearing inside `<think>` blocks.** The `Qwen35Parser` handles this correctly: when in `CollectingThinking` state, the `Qwen3CoderParser` is not active, so `<tool_call>` inside thinking is treated as thinking content, not parsed as a tool call. However, the `Qwen3CoderParser` (used standalone for qwen3-coder models) does check for `<tool_call>` during thinking collection at line 182 — if a tool call open tag appears before `</think>`, it treats the tool call boundary as the end of thinking. This is a design choice for Qwen3-Coder (which may legitimately produce tool calls during reasoning), but is handled by the `Qwen35Parser` wrapper for Qwen 3.5.
+
+5. **Parameter values that don't match declared types.** llama.cpp: impossible for non-string parameters — the grammar constrains values to match the JSON schema. Ollama: `parseValue()` at line 404 does best-effort type coercion. If the schema says `"type": "integer"` and the model outputs `"not a number"`, `strconv.ParseInt` fails at line 445, and since integer is the only type, it falls back to returning the raw string at line 454. The caller receives a `string` where it expected an `int` — a type mismatch that propagates silently through `api.ToolCall.Function.Arguments`.
+
+**Why this matters in practice:** Qwen 3.5 is a well-trained model that usually generates valid tool calls. But "usually" is not "always" — especially under adversarial prompts, long context degradation, low temperature with unlucky sampling, or quantization artifacts (the Unsloth `UD-Q4_K_XL` is a 4-bit quantization, which inherently has higher error rates than FP16). When the model does produce a malformed tool call, the difference between the two approaches determines whether the error is caught at generation time (llama.cpp — the grammar prevents it from being generated in the first place) or propagated silently through the system (Ollama — the malformed output becomes a malformed `api.ToolCall` that the client must handle).
+
+In an agentic workflow where tool call results feed back into the conversation, a single malformed tool call can cascade: the client receives a phantom function call, fails to execute it (or worse, misroutes it), sends back an error or garbage result, and the model's next turn is conditioned on this corrupted history. llama.cpp's grammar-constrained approach prevents this entire failure cascade at the source.
 
 ---
 
@@ -433,6 +526,12 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 | **P1** | Fix history `<think>` block rendering — remove `isThinking &&` gate at both `qwen35.go:143` (rendering) and `qwen35.go:65` (extraction) | Small (2 lines) | 9.3 |
 | **P3** | Verify `Qwen3VLRenderer` thinking variant needs `emitEmptyThinkOnNoThink` | Research | 9.7 |
 
+### Parser Architecture (Structural Limitation — Not a Simple Fix)
+
+| Priority | Item | Effort | Section |
+|----------|------|--------|---------|
+| **P2** | Investigate grammar-constrained tool call generation (Ollama's free-form parser silently propagates malformed tool calls; llama.cpp's PEG parser prevents them at generation time) | Very High (architectural change to the Go runner's sampling pipeline) | 6.6 |
+
 ### From Previous Report (Still Open — Revised Effort Estimates)
 
 | Priority | Item | Effort | Section (prev report) |
@@ -441,6 +540,17 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 | **P0** | Fix HTML escaping in `marshalWithSpaces` + `formatToolCallArgument` (Sub-bug A) — shared infrastructure, verify all callers | Small-Medium (shared function, must verify Olmo3/Qwen3VL callers) | 3.1 Bug A |
 | **P1** | Fix `required`/`properties` key ordering (Sub-bug B) — **DO NOT change the shared struct without per-model template verification** — requires either verifying every model's HuggingFace template or implementing renderer-local marshaling | Medium-High (prerequisite research across all tool-calling models) | 3.1 Bug B |
 | **P2** | Add dedicated prefill bug fix test in `qwen35_test.go` | Small | 1.1 |
+
+### Known Issues in Other Implementations (Not Fork Action Items — For Reference)
+
+| Implementation | Issue | Severity | Section |
+|----------------|-------|----------|---------|
+| **llama.cpp** | Non-thinking prefill produces `<think>\n</think>` (3 tokens) instead of official `<think>\n\n</think>\n\n` (6 tokens) — never seen in training | Medium-High | 6.4 Bug 1, 9.1 |
+| **llama.cpp** | Prompt tokens contaminate penalty sampler ring buffer | Medium (masked by defaults) | 1.11, 6.4 Bug 2 |
+| **llama.cpp** | No model-specific sampler defaults | Low | 6.4 Bug 3 |
+| **llama.cpp** | Float precision loss in `tojson` (6 digits vs 17) | Very Low | 6.4 Bug 4 |
+| **Fork + Upstream Ollama** | Free-form tool call parser silently propagates malformed model output (phantom function names, type mismatches, unclosed tags) — llama.cpp prevents this via grammar-constrained generation | Structural limitation | 6.6 |
+| **Unsloth GGUF** | Modified template (defensive `is mapping` + key iteration) — functionally equivalent | Informational | 6.5 |
 
 ---
 
@@ -456,9 +566,10 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | Async CPU→CUDA copy | `ml/backend/ggml/ggml/src/ggml-cuda/ggml-cuda.cu` |
 | `ggml/src/ggml-backend.cpp` | saaasg sync pattern | `ml/backend/ggml/ggml/src/ggml-backend.cpp` |
 | `convert_hf_to_gguf.py` | ForCausalLM registration | `convert/convert_qwen3next.go` (different approach) |
-| `tools/server/server-context.cpp` | Multi-modal caching | `runner/ollamarunner/runner.go` (no equivalent) |
-| `src/llama-sampler.cpp` | **No changes** | `sample/samplers.go` |
-| `common/chat.cpp` | **No changes** | `model/renderers/qwen35.go` |
+| `src/llama-sampler.cpp` | **No changes** — but has existing penalty contamination bug (ring buffer accepts prompt tokens at `llama-sampler.cpp:2622-2656`) | `sample/samplers.go` (fork is correct) |
+| `common/chat.cpp` | **No changes** — but has existing non-thinking prefill bug: post-processing at line 1534-1536 produces `<think>\n</think>` instead of official `<think>\n\n</think>\n\n` | `model/renderers/qwen35.go` (fork is correct) |
+| `common/jinja/value.cpp` | **No changes** — has minor `tojson` float precision divergence at line 1290 | N/A (Go renderers don't use Jinja) |
+| `tools/server/server-context.cpp` | Multi-modal caching; also has existing prompt→penalty feed bug at lines 208-215 | `runner/ollamarunner/runner.go` |
 
 ### Upstream Ollama files changed since 82848a78
 
@@ -469,13 +580,14 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 | `cmd/config/openclaw.go` | Native API endpoint | Missing |
 | `server/routes.go` | Loosen thinking level constraint | None — harmony/gptoss feature |
 
-### Files verified unchanged (no action needed)
+### Files verified unchanged (no new changes since d969e933 — but may have pre-existing bugs)
 
 - `src/models/qwen35.cpp` (llama.cpp) — no changes to graph build
 - `src/models/qwen35moe.cpp` (llama.cpp) — no changes
 - `src/models/qwen3next.cpp` (llama.cpp) — no changes
-- `src/llama-sampler.cpp` (llama.cpp) — byte-identical
-- `common/chat.cpp` (llama.cpp) — byte-identical
+- `src/llama-sampler.cpp` (llama.cpp) — byte-identical; has pre-existing penalty contamination bug (see 1.11, 6.4 Bug 2)
+- `common/chat.cpp` (llama.cpp) — byte-identical; has pre-existing non-thinking prefill bug (see 6.4 Bug 1)
+- `common/jinja/value.cpp` (llama.cpp) — no changes; has minor float precision divergence (see 6.4 Bug 4)
 - `tools/mtmd/models/qwen3vl.cpp` (llama.cpp) — no substantive changes
 
 ---
@@ -503,6 +615,8 @@ The official Qwen 3.5 Jinja2 template (verified from [`Qwen/Qwen3.5-27B/tokenize
 | `false` | `<\|im_start\|>assistant\n<think>\n\n</think>\n\n` | Empty think block → model generates content directly |
 
 There are **no `/think` or `/no_think` tokens**, no special token IDs for mode switching, and no per-turn thinking level control. The `<think>` and `</think>` are token IDs 248068-248069 in the vocabulary, marked as `"special": false` — they are regular tokens, not control tokens. The mode is determined entirely by the prefill.
+
+**llama.cpp's generation prompt bug:** llama.cpp's Qwen 3.5 handler at `common/chat.cpp:1527` does NOT pass `enable_thinking` to the Jinja template context — the `apply()` function at `chat.cpp:804-854` builds context from messages, tools, `extra_context`, and `add_generation_prompt`, but never `enable_thinking`. Only the Hermes 2 Pro handler (at `chat.cpp:2392-2397`) passes it via `extra_context`. Since `enable_thinking` is always `undefined`, the template always produces the thinking-mode prefill (`<think>\n`). llama.cpp then post-processes at `chat.cpp:1533-1539`: when `!inputs.enable_thinking` and the prompt ends with `<think>\n`, it appends `</think>`, producing `<think>\n</think>` (3 tokens). But the official non-thinking prefill is `<think>\n\n</think>\n\n` (6 tokens) — the 3-token sequence was never seen during training. This is a real distribution shift that can affect output quality. The fork and upstream Ollama produce the exact official 6-token prefill via `emitEmptyThinkOnNoThink` (Section 9.4).
 
 ### 9.2 CRITICAL: History Messages Are NOT Gated on `enable_thinking` in the Official Template
 
@@ -569,6 +683,8 @@ if messageThinking != "" {
 ```
 
 **Severity:** Medium. The bug only manifests when a user switches `think` between turns in the same conversation. In practice, most users either always use thinking or always don't. But for agentic frameworks that might toggle thinking per-turn for latency reasons, this is a real distribution shift that could degrade quality.
+
+**llama.cpp comparison:** llama.cpp does NOT have this bug for history rendering — it executes the official Jinja2 template directly, which always includes `<think>` blocks for history messages after `last_query_index`. However, llama.cpp has its own generation prompt bug (Section 6.4 Bug 1): it produces `<think>\n</think>` (3 tokens) instead of the official `<think>\n\n</think>\n\n` (6 tokens) for non-thinking mode — a token sequence the model was never trained on. The fork and upstream Ollama have the history rendering bug but produce the correct generation prompt prefill; llama.cpp has the generation prompt bug but correct history rendering.
 
 ### 9.4 The `emitEmptyThinkOnNoThink` Field — Correct Implementation
 
@@ -664,10 +780,12 @@ Since Qwen3-Coder models don't have an official `enable_thinking` mechanism in t
 
 | Issue | Affects | Severity | Status |
 |-------|---------|----------|--------|
-| **History `<think>` blocks gated on `isThinking`** — official template includes them unconditionally | Both fork and upstream | **Medium** — distribution shift when switching think modes between turns | **BUG — OPEN in both** |
-| **`emitEmptyThinkOnNoThink` correctly implements prefill** | Fork and upstream | N/A | **Correct** |
-| **Parser correctly handles both modes** | Fork and upstream | N/A | **Correct** |
-| **Qwen3-VL-Thinking missing `emitEmptyThinkOnNoThink`** | Fork and upstream | **Low** — think=false produces no prefill at all | **Potential bug** — needs verification against official template |
+| **History `<think>` blocks gated on `isThinking`** — official template includes them unconditionally | Both fork and upstream Ollama | **Medium** — distribution shift when switching think modes between turns | **BUG — OPEN in both** |
+| **Non-thinking prefill wrong token sequence** — post-processing produces `<think>\n</think>` (3 tokens) instead of official `<think>\n\n</think>\n\n` (6 tokens) | llama.cpp only | **Medium-High** — 3-token sequence never seen in training; real distribution shift for all non-thinking mode usage | **BUG — OPEN in llama.cpp** (`chat.cpp:1534-1536` post-processing) |
+| **Prompt tokens contaminate penalty sampler** — system prompt/tool definitions fed into penalty ring buffer | llama.cpp and upstream Ollama | **Medium** — masked by `repeat_penalty=1.0` default, activates when user follows Qwen's `1.05` recommendation | **BUG — OPEN in llama.cpp + upstream** (fork is correct) |
+| **`emitEmptyThinkOnNoThink` correctly implements prefill** | Fork and upstream Ollama | N/A | **Correct** |
+| **Parser correctly handles both modes** | Fork and upstream Ollama | N/A | **Correct** |
+| **Qwen3-VL-Thinking missing `emitEmptyThinkOnNoThink`** | Fork and upstream Ollama | **Low** — think=false produces no prefill at all | **Potential bug** — needs verification against official template |
 | **Fork's Qwen3CoderRenderer has thinking support upstream lacks** | Fork only | **Informational** — extension beyond training data | Fork-specific feature |
 
 ### 9.10 Updated Action Items
