@@ -11,7 +11,7 @@
 
 | Priority | Item | Effort | Potential Impact |
 |----------|------|--------|-----------------|
-| **High** | JSON serialization mismatch fix (3 sub-bugs: HTML escaping, key ordering, compact separators) — see Section A.1 | Small | Improved tool calling accuracy for all tool-using models |
+| **High** | JSON serialization mismatch fix (3 sub-bugs: HTML escaping, key ordering, compact separators) — see Section A.1 | **Medium-High** (shared infrastructure, per-model verification required) | Improved tool calling accuracy + KV cache round-trip correctness for tool-using models |
 | **High** | CUDA asynchronous copy and reduced synchronization vendor update from llama.cpp — see Section B.3 | Medium | 5-15% throughput improvement on NVIDIA GPU hardware |
 | **High** | History `<think>` block rendering fix (remove incorrect `isThinking` gate in two places) — see Section A.2 | Tiny (2 lines changed) | Correct multi-turn thinking/non-thinking conversations |
 | **Medium** | `num_batch 2048` Modelfile configuration change — see Section B.4 | Zero (configuration-only, no code change) | Approximately 10% faster prompt evaluation speed |
@@ -30,18 +30,78 @@
 
 ### A.1 — JSON Serialization Mismatches in Tool Definitions and Tool Call Arguments (3 Sub-Bugs)
 
-The fork (and upstream Ollama) serialize tool definitions into the model's prompt differently from how the Qwen 3.5 model was originally trained by Alibaba. The official Qwen 3.5 Jinja2 template (at `/tmp/qwen35_template.jinja2`, fetched from `Qwen/Qwen3.5-27B` on HuggingFace) uses the `tojson` Jinja2 filter at line 50 for tool definitions and at line 122 for tool call arguments. In HuggingFace Transformers, this filter is overridden (at `chat_template_utils.py:463-466` in version 5.2.0) to use `json.dumps` with default separators. In llama.cpp's vendored Jinja engine, the equivalent is at `common/jinja/value.cpp:179-180`, which defaults to `", "` and `": "` separators and does not HTML-escape. Ollama reimplements this serialization in Go, producing different output in three ways:
+The fork (and upstream Ollama) serialize tool definitions into the model's prompt differently from how the Qwen 3.5 model was originally trained by Alibaba. The official Qwen 3.5 Jinja2 template (at `/tmp/qwen35_template.jinja2`, fetched from `Qwen/Qwen3.5-27B` on HuggingFace) uses the `tojson` Jinja2 filter at line 50 for tool definitions and at line 122 for tool call arguments. In HuggingFace Transformers, this filter is overridden (at `chat_template_utils.py:463-466` in version 5.2.0) to use `json.dumps` with default separators. In llama.cpp's vendored Jinja engine, the equivalent is at `common/jinja/value.cpp:179-180`, which defaults to `", "` and `": "` separators and does not HTML-escape. Ollama reimplements this serialization in Go, producing different output in three ways.
+
+> **CRITICAL IMPLEMENTATION NOTE — READ BEFORE ATTEMPTING ANY FIX:**
+>
+> These three sub-bugs range from "straightforward but requires care" (Sub-bug C) to "deceptively dangerous shared infrastructure change" (Sub-bug B). They should NOT be attempted simultaneously, and each requires prerequisite research described below. The core danger is that much of the serialization code is **shared infrastructure** used by many renderers (DeepSeek, GLM, Cogito, Olmo3, Nemotron, etc.), not just the Qwen family. Changing shared code without verifying every consumer can silently break other models — and the breakage may manifest not as obvious errors but as subtle quality degradation or catastrophic KV cache performance collapse (see "KV Cache Round-Trip Danger" below).
 
 **Sub-bug A — HTML character escaping (high impact for coding and API tools):**
 The `marshalWithSpaces` function at `model/renderers/json.go:9` calls Go's `json.Marshal` as its first step, then post-processes the output to add spaces after `:` and `,`. The spacing post-processing is correct. However, `json.Marshal` also HTML-escapes `<`, `>`, and `&` to `\u003c`, `\u003e`, `\u0026` — a Go design decision for safe HTML embedding that has no relevance here. The official template's `tojson` outputs these characters literally. A tool description like `"Returns temperature in <fahrenheit> & <celsius>"` becomes completely different tokens when HTML-escaped. The fix: replace the `json.Marshal` call in `marshalWithSpaces` with `json.NewEncoder` using `SetEscapeHTML(false)`. This pattern already exists in the codebase at `model/renderers/lfm2.go:55-56`.
 
-**Sub-bug B — Key ordering at the `ToolFunctionParameters` level (medium impact):**
-Go's `json.Marshal` outputs struct fields in declaration order. In `api/types.go:486-491`, `Required` is declared before `Properties`, so serialized JSON always outputs `"required"` before `"properties"`. The official template's `tojson` preserves Python dict insertion order, which places `"properties"` before `"required"` (matching the OpenAI function calling convention). This is a positional encoding mismatch on every tool-using prompt. The fix: swap the `Required` and `Properties` field declarations in `api/types.go`.
+*Shared infrastructure concern:* `marshalWithSpaces` is called by the Olmo3, Qwen 3.5, and Qwen3VL renderers. Changing its internals propagates to all of them. Before modifying it, each consumer's training template must be checked to confirm it also expects no HTML escaping. This is very likely true (HTML escaping in model prompts is universally wrong), but must be verified rather than assumed. An alternative is to create a separate no-escape variant and migrate callers individually. Additionally, `formatToolCallArgument` in `qwen3coder.go` (shared by Qwen3Coder, Qwen 3.5, and Qwen3VL) calls raw `json.Marshal` directly — it also needs the HTML escaping fix, but this is Qwen-family-only code and safer to change.
 
-**Sub-bug C — Compact separators in `formatToolCallArgument` (medium impact):**
-The `formatToolCallArgument` function at `qwen3coder.go:250` uses raw `json.Marshal` for map/slice/array values inside XML `<parameter>` tags, producing compact JSON (`{"key":"value"}`). The official template at line 122 uses `tojson` which produces spaced JSON (`{"key": "value"}`). Note: this only affects nested structured values in tool call arguments (maps, arrays) — string and scalar arguments are rendered correctly. The `marshalWithSpaces` function used for tool *definitions* already handles spacing correctly; this bug is specifically in the tool call *argument* rendering path.
+**Sub-bug B — Key ordering at the `ToolFunctionParameters` level (HIGH COMPLEXITY — shared struct change):**
+Go's `json.Marshal` outputs struct fields in declaration order. In `api/types.go:486-491`, `Required` is declared before `Properties`, so serialized JSON always outputs `"required"` before `"properties"`. The official Qwen 3.5 template's `tojson` preserves Python dict insertion order, which places `"properties"` before `"required"` for Qwen 3.5 specifically.
 
-**Why these bugs matter:** Every time the model uses tools, it sees a prompt format that differs from its training data. This creates a distribution shift — the model still works, but tool calling reliability is degraded. llama.cpp avoids all three because it executes the official Jinja2 template directly. These bugs exist identically in upstream Ollama.
+*This is NOT a simple "swap two struct fields" fix.* `ToolFunctionParameters` is a shared type in `api/types.go` used by **every single renderer** in Ollama that supports tool calling — DeepSeek, GLM-4.7, GLM-OCR, Cogito, Olmo3, Nemotron3Nano, LFM2, and all Qwen variants. Swapping the field order changes the JSON output for ALL of them simultaneously. The critical subtlety: Python's `tojson` (which is `json.dumps` with `sort_keys=False`) preserves **dict insertion order**, which means the key ordering is an artifact of how each model's specific Jinja2 template constructs its Python dicts. Different model families have different templates that may construct dicts in different orders. The fact that Qwen 3.5's template produces `"properties"` before `"required"` says nothing about what DeepSeek's or GLM's or Cogito's templates produce. Changing the shared struct to match Qwen 3.5's ordering could make the serialization WORSE for other models.
+
+The correct approach is one of:
+1. **Renderer-local custom marshaling** — Have the Qwen renderers control field ordering when they serialize tool definitions, leaving the shared struct untouched. This is safer but more code.
+2. **Universal verification** — Verify the HuggingFace template for every model family that uses `ToolFunctionParameters`, confirm they all produce the same ordering, and only then change the shared struct. This is more work upfront but cleaner if the ordering is in fact universal.
+3. **Per-renderer struct wrapper** — Define a renderer-specific wrapper type with the desired field order and marshal that instead of the shared type.
+
+Until the per-model verification is done, the shared struct MUST NOT be changed.
+
+**Sub-bug C — Compact separators in `formatToolCallArgument` (medium impact, safest to fix):**
+The `formatToolCallArgument` function at `qwen3coder.go:250` uses raw `json.Marshal` for map/slice/array values inside XML `<parameter>` tags, producing compact JSON (`{"key":"value"}`). The official template at line 122 uses `tojson` which produces spaced JSON (`{"key": "value"}`). Note: this only affects nested structured values in tool call arguments (maps, arrays) — string and scalar arguments are rendered correctly. The `marshalWithSpaces` function used for tool *definitions* already handles spacing correctly; this bug is specifically in the tool call *argument* rendering path. This is the safest sub-bug to fix because `formatToolCallArgument` lives in `qwen3coder.go` and is only shared across the Qwen model family (Qwen3Coder, Qwen 3.5, Qwen3VL), all of which use the same `tojson` convention.
+
+#### Why These Bugs Matter — Two Distinct Failure Modes
+
+**Failure mode 1 — Training distribution shift (affects all three sub-bugs):**
+Every time the model uses tools, it sees a prompt format that differs from its training data. This creates a distribution shift — the model still works, but tool calling reliability is degraded. The model was trained on millions of examples with `{"key": "value"}` (spaced), `<` (literal), and `"properties"` before `"required"`. Feeding it `{"key":"value"}` (compact), `\u003c` (escaped), and `"required"` before `"properties"` means the model is operating slightly out-of-distribution on every single tool-using turn.
+
+**Failure mode 2 — KV cache round-trip mismatch (affects Sub-bugs A and C specifically, catastrophic for performance):**
+This is the more dangerous failure mode and is non-obvious. In a multi-turn conversation with tool calls, Ollama must re-render the entire conversation history on each turn. When re-rendering an assistant message that contained tool calls, the renderer must re-serialize the tool call arguments from the parsed Go types back into the prompt. If the re-serialized bytes don't exactly match what the model originally generated, the KV cache cannot be reused for that portion of the prompt — the engine must reprocess everything from the point of divergence.
+
+Here is the round-trip path:
+1. Model generates: `<parameter=city>\n{"name": "San Francisco", "state": "CA"}\n</parameter>` (spaced JSON, literal `<>&`)
+2. Parser (`qwen3coder.go:parseValue`) parses `{"name": "San Francisco", "state": "CA"}` via `json.Unmarshal` into a `map[string]any` — original formatting is lost
+3. On the next turn, the renderer calls `formatToolCallArgument(value)` on the stored map
+4. `formatToolCallArgument` calls `json.Marshal`, producing `{"name":"San Francisco","state":"CA"}` — compact, no spaces
+5. The re-rendered prompt now has **different bytes** at this position than what the model originally generated
+6. KV cache lookup fails at the divergence point — everything after it must be reprocessed from scratch
+
+This is not just a minor performance regression. It is a **scaling catastrophe for agentic coding workflows**. Consider:
+- An agentic coding assistant with a 20-turn conversation, each turn involving 2-3 tool calls with structured arguments
+- Each tool call argument with any nested map/array triggers a KV cache miss at the point of the argument
+- The miss forces reprocessing of everything from that point to the end of the conversation
+- On turn 20, this could mean reprocessing 15,000+ tokens that were already in the cache
+- The user experiences progressively slower response times with each turn, with no visible cause — the first few turns are fast, and by turn 15-20, each response takes dramatically longer
+- This is invisible in testing because it only manifests at conversation scale, and the model still produces correct output — it's purely a latency problem
+
+The irony is that fixing Sub-bug C (using `marshalWithSpaces` instead of raw `json.Marshal` in `formatToolCallArgument`) actually **improves** the round-trip: the model generates spaced JSON, and after the fix, the renderer re-serializes to spaced JSON — matching the model's output and preserving KV cache hits. The current compact serialization is the one causing mismatches. But this fix must be validated end-to-end: the renderer's output must match the parser's input must match the model's training format. Getting any one of these three legs wrong creates a new mismatch worse than the original.
+
+llama.cpp avoids all three sub-bugs entirely because it executes the official Jinja2 template directly. These bugs exist identically in upstream Ollama.
+
+#### Prerequisite Research Before Implementation
+
+Each sub-bug requires specific research that must be completed before writing code:
+
+**Research topic 1 — Shared infrastructure dependency map:**
+Build a complete call graph of which renderers call which shared functions (`marshalWithSpaces`, `jsonMarshalNoEscape` if created, `formatToolCallArgument`, `renderAdditionalKeys`, `formatToolDefinitionType`). For each call site, document whether the caller is model-family-specific or shared across families. Map which renderers serialize `ToolFunctionParameters` and how (direct `json.Marshal`, `json.MarshalIndent`, `marshalWithSpaces`, or custom). This determines the blast radius of each change.
+
+**Research topic 2 — Per-model template verification:**
+For every model family whose renderer touches shared serialization code (at minimum: DeepSeek, GLM-4.7, GLM-OCR, Cogito, Olmo3, Nemotron3Nano, LFM2, and all Qwen variants), download and inspect the official HuggingFace Jinja2 template. For each, determine: (a) What JSON serialization function the template uses for tool definitions (is it `tojson`? `tojson(indent=4)`? Custom?). (b) What key ordering the template produces for the `parameters` object (is it `properties` before `required`? The reverse? Something else?). (c) Whether the template expects literal `<>&` or HTML-escaped versions. (d) Whether tool call arguments use spaced or compact JSON. Only after this verification is complete can we know which changes are safe to make globally vs. which must be renderer-local.
+
+**Research topic 3 — KV cache round-trip proof per renderer:**
+For each renderer that handles tool calls (Qwen3Coder, Qwen 3.5, Qwen3VL, DeepSeek, GLM, Cogito, Olmo3, Nemotron), trace the complete round-trip: model output format → parser extraction → Go type storage → renderer re-serialization → prompt bytes. Prove that after the proposed fix, the re-serialized bytes exactly match what the model was trained to generate. A mismatch in ANY leg of this chain creates a KV cache miss. Document edge cases: nested objects, arrays, strings containing `<>&"`, unicode, empty objects, null values.
+
+**Research topic 4 — Scoping and sequencing strategy:**
+Decide upfront: fix only Qwen 3.5 (safest, narrowest blast radius), fix all Qwen family models (medium, since they share `tojson` conventions), or fix globally (maximum impact but requires completing Research topic 2 for all models). The sub-bugs should be sequenced by risk: Sub-bug C first (Qwen-only code, improves KV cache round-trip), Sub-bug A second (shared function but likely universally correct), Sub-bug B last (shared struct, requires universal verification or renderer-local approach).
+
+**Research topic 5 — Test infrastructure strategy:**
+The existing renderer tests encode exact byte strings as golden expectations. Changing shared types or functions breaks tests across many renderer test files simultaneously, even if the runtime behavior is correct. Before implementing, decide: update all affected test expectations (requires understanding whether the new output is correct for each model), or restructure tests to be more resilient to serialization changes (e.g., parse the JSON output and compare structurally rather than byte-for-byte).
 
 ### A.2 — History `<think>` Blocks Incorrectly Gated on the `isThinking` Boolean
 

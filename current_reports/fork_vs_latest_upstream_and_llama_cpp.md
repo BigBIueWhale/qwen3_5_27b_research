@@ -361,13 +361,15 @@ All findings from the previous analysis remain valid:
 
 **Qwen 3.5 model family size diversity** (section 1.4): llama.cpp now recognizes 0.8B through 397B Qwen 3.5 variants. The fork should verify that its qwen3next model code handles the full range of layer counts (24, 32, 40, 48, 60, 64) and embedding dimensions (1024, 2560, etc.) without hardcoded assumptions.
 
-### 6.3 JSON Serialization Bugs (Unchanged)
+### 6.3 JSON Serialization Bugs (Unchanged — But Implementation Complexity Is Higher Than Initially Assessed)
 
 The 3 JSON serialization bugs remain unfixed in both the fork and upstream Ollama. Verified against the official template at `/tmp/qwen35_template.jinja2` (line 50 for tool definitions via `tojson`, line 122 for tool call arguments via `tojson`):
 
-- **HTML escaping:** `marshalWithSpaces` at `json.go:9` correctly adds spacing after `:` and `,` but inherits `json.Marshal`'s HTML escaping of `<>&` — the spacing is right, the escaping is wrong.
-- **Key ordering:** `api/types.go:490-491` declares `Required` before `Properties` — reversed from the official template's `tojson` output.
-- **Compact separators in tool call arguments:** `formatToolCallArgument` at `qwen3coder.go:250` uses raw `json.Marshal` (compact) for map/list values. This is a separate code path from `marshalWithSpaces` — the tool *definition* rendering has correct spacing, but the tool call *argument* rendering does not.
+- **HTML escaping:** `marshalWithSpaces` at `json.go:9` correctly adds spacing after `:` and `,` but inherits `json.Marshal`'s HTML escaping of `<>&` — the spacing is right, the escaping is wrong. `marshalWithSpaces` is shared infrastructure: called by the Olmo3, Qwen 3.5, and Qwen3VL renderers. Additionally, `formatToolCallArgument` in `qwen3coder.go` calls raw `json.Marshal` directly (a separate code path).
+- **Key ordering:** `api/types.go:490-491` declares `Required` before `Properties` — reversed from the official Qwen 3.5 template's `tojson` output. However, `ToolFunctionParameters` is a shared struct used by ALL tool-calling renderers. Python's `tojson` preserves dict insertion order, meaning the `"properties"`-before-`"required"` ordering is specific to how Qwen 3.5's template constructs its dicts. Other models' templates may construct dicts in different orders. Changing this shared struct without verifying every model's template could make serialization WORSE for non-Qwen models. This is not a "swap two fields" fix — it's a design problem requiring either per-model verification or a renderer-local marshaling approach. See Section A.1 in `prioritized_research_topics_and_action_items.md` for the full analysis and required prerequisite research.
+- **Compact separators in tool call arguments:** `formatToolCallArgument` at `qwen3coder.go:250` uses raw `json.Marshal` (compact) for map/list values. This is a separate code path from `marshalWithSpaces` — the tool *definition* rendering has correct spacing, but the tool call *argument* rendering does not. This is the safest bug to fix because `formatToolCallArgument` is only shared across the Qwen model family.
+
+**KV cache round-trip danger:** Sub-bugs A and C have a second, more severe failure mode beyond training distribution shift. In multi-turn conversations with tool calls, the renderer re-serializes tool call arguments from parsed Go types. If the re-serialized bytes don't match what the model originally generated, the KV cache cannot reuse the cached computation — the engine must reprocess everything from the divergence point. For a 20-turn agentic coding conversation with structured tool arguments, this means reprocessing potentially tens of thousands of tokens on every new turn. The user sees progressively slower response times with no visible cause — a scaling catastrophe that is invisible in simple testing because it only manifests at conversation length and produces correct output regardless. Fixing Sub-bug C (spaced JSON) actually *improves* the round-trip (model generates spaced, renderer re-serializes spaced → match), but the fix must be validated end-to-end across the parse→store→re-render cycle.
 
 llama.cpp avoids all three by executing the official Jinja2 template directly. Its `tojson` implementation at `common/jinja/value.cpp:179-180` defaults to `", "` and `": "` separators, and at lines 1291-1312 writes `<>&` literally without escaping.
 
@@ -431,13 +433,13 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 | **P1** | Fix history `<think>` block rendering — remove `isThinking &&` gate at both `qwen35.go:143` (rendering) and `qwen35.go:65` (extraction) | Small (2 lines) | 9.3 |
 | **P3** | Verify `Qwen3VLRenderer` thinking variant needs `emitEmptyThinkOnNoThink` | Research | 9.7 |
 
-### From Previous Report (Still Open)
+### From Previous Report (Still Open — Revised Effort Estimates)
 
 | Priority | Item | Effort | Section (prev report) |
 |----------|------|--------|----------------------|
-| **P0** | Fix HTML escaping in `marshalWithSpaces` + `formatToolCallArgument` | Small | 3.1 Bug A |
-| **P0** | Fix `required`/`properties` key ordering in `ToolFunctionParameters` | Small | 3.1 Bug B |
-| **P1** | Fix compact separators in `formatToolCallArgument` | Small | 3.1 Bug C |
+| **P0** | Fix compact separators in `formatToolCallArgument` (Sub-bug C) — Qwen-family-only code, safest to fix, improves KV cache round-trip | Small (but requires KV cache round-trip validation) | 3.1 Bug C |
+| **P0** | Fix HTML escaping in `marshalWithSpaces` + `formatToolCallArgument` (Sub-bug A) — shared infrastructure, verify all callers | Small-Medium (shared function, must verify Olmo3/Qwen3VL callers) | 3.1 Bug A |
+| **P1** | Fix `required`/`properties` key ordering (Sub-bug B) — **DO NOT change the shared struct without per-model template verification** — requires either verifying every model's HuggingFace template or implementing renderer-local marshaling | Medium-High (prerequisite research across all tool-calling models) | 3.1 Bug B |
 | **P2** | Add dedicated prefill bug fix test in `qwen35_test.go` | Small | 1.1 |
 
 ---
