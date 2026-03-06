@@ -13,13 +13,11 @@
 |----------|------|--------|-----------------|
 | **High** | JSON serialization mismatch fix (3 sub-bugs: HTML escaping, key ordering, compact separators) — see Section A.1 | Small | Improved tool calling accuracy for all tool-using models |
 | **High** | CUDA asynchronous copy and reduced synchronization vendor update from llama.cpp — see Section B.3 | Medium | 5-15% throughput improvement on NVIDIA GPU hardware |
-| **High** | History `<think>` block rendering fix (remove incorrect `isThinking` gate) — see Section A.2 | Tiny (1 line of code) | Correct multi-turn thinking/non-thinking conversations |
+| **High** | History `<think>` block rendering fix (remove incorrect `isThinking` gate in two places) — see Section A.2 | Tiny (2 lines changed) | Correct multi-turn thinking/non-thinking conversations |
 | **Medium** | `num_batch 2048` Modelfile configuration change — see Section B.4 | Zero (configuration-only, no code change) | Approximately 10% faster prompt evaluation speed |
 | **Medium** | Multi-Resolution Rotary Position Embedding (M-RoPE) `can_shift()` guard — see Section C.5 | Tiny (3 lines of code) | Defensive correctness fix preventing corrupt positional encoding |
-| **Medium** | Thinking level constraint removal (cherry-pick upstream Ollama commit `122c68c`) — see Section E.11 | Small | Better compatibility with API clients that send string-valued thinking levels |
 | **Medium** | Parallelism investigation (lifting the `numParallel = 1` scheduler restriction) — see Section D.9 | High | Enables serving concurrent requests instead of queuing them |
 | **Low** | Qwen 3.5 model family size diversity verification — see Section C.6 | Small | Ensures all Qwen 3.5 model sizes (0.8B through 397B) work correctly |
-| **Low** | Read `full_attention_interval` from GGUF metadata instead of hardcoding — see Section C.7 | Tiny | Future-proofing against models that use a different attention interval |
 | **Low** | Qwen3-VL-Thinking renderer missing `emitEmptyThinkOnNoThink` field — see Section E.12 | Research required | Correct `think: false` behavior for Qwen3 Vision-Language Thinking models |
 | **Low** | Vulkan flash attention fix for AMD Radeon RDNA2 GPUs on Microsoft Windows — see Section G.14 | Small | Fixes broken flash attention for AMD GPU users on older Windows drivers |
 | **Informational** | Speculative decoding confirmed impossible for hybrid recurrent architectures — see Section D.8 | Not applicable | Confirmed dead end — do not pursue |
@@ -32,23 +30,24 @@
 
 ### A.1 — JSON Serialization Mismatches in Tool Definitions and Tool Call Arguments (3 Sub-Bugs)
 
-The fork (and upstream Ollama) serialize tool definitions into the model's prompt differently from how the Qwen 3.5 model was originally trained by Alibaba. The model was trained using HuggingFace Transformers' `apply_chat_template` function, which uses a custom `tojson` Jinja2 filter override (defined at `chat_template_utils.py:463-466` in HuggingFace Transformers version 5.2.0). Ollama reimplements this serialization in Go using `json.Marshal`, which produces different output in three ways:
+The fork (and upstream Ollama) serialize tool definitions into the model's prompt differently from how the Qwen 3.5 model was originally trained by Alibaba. The official Qwen 3.5 Jinja2 template (at `/tmp/qwen35_template.jinja2`, fetched from `Qwen/Qwen3.5-27B` on HuggingFace) uses the `tojson` Jinja2 filter at line 50 for tool definitions and at line 122 for tool call arguments. In HuggingFace Transformers, this filter is overridden (at `chat_template_utils.py:463-466` in version 5.2.0) to use `json.dumps` with default separators. In llama.cpp's vendored Jinja engine, the equivalent is at `common/jinja/value.cpp:179-180`, which defaults to `", "` and `": "` separators and does not HTML-escape. Ollama reimplements this serialization in Go, producing different output in three ways:
 
 **Sub-bug A — HTML character escaping (high impact for coding and API tools):**
-Go's standard library `json.Marshal` function automatically converts `<`, `>`, and `&` characters into Unicode escape sequences (`\u003c`, `\u003e`, `\u0026`). This is a deliberate Go design decision intended for safely embedding JSON inside HTML `<script>` tags — a concern that has zero relevance to Ollama, where JSON is serialized into a chat template prompt fed to a neural network. HuggingFace Transformers' `tojson` override outputs literal `<`, `>`, `&` characters. The result: a tool description like `"Returns temperature in <fahrenheit> & <celsius>"` becomes completely different tokens when HTML-escaped (`\u003cfahrenheit\u003e` is 6 bytes per character instead of 1). The fix is straightforward: use Go's `json.NewEncoder` with `SetEscapeHTML(false)`. Ollama's own `LFM2Renderer` (for Liquid Foundation Model 2) already does this correctly at `model/renderers/lfm2.go:55-56`.
+The `marshalWithSpaces` function at `model/renderers/json.go:9` calls Go's `json.Marshal` as its first step, then post-processes the output to add spaces after `:` and `,`. The spacing post-processing is correct. However, `json.Marshal` also HTML-escapes `<`, `>`, and `&` to `\u003c`, `\u003e`, `\u0026` — a Go design decision for safe HTML embedding that has no relevance here. The official template's `tojson` outputs these characters literally. A tool description like `"Returns temperature in <fahrenheit> & <celsius>"` becomes completely different tokens when HTML-escaped. The fix: replace the `json.Marshal` call in `marshalWithSpaces` with `json.NewEncoder` using `SetEscapeHTML(false)`. This pattern already exists in the codebase at `model/renderers/lfm2.go:55-56`.
 
 **Sub-bug B — Key ordering at the `ToolFunctionParameters` level (medium impact):**
-Go's `json.Marshal` outputs struct fields in the order they are declared in the Go source code. In Ollama's `api/types.go:486-491`, the `Required` field is declared before the `Properties` field, so the serialized JSON always outputs `"required"` before `"properties"`. HuggingFace Transformers' `get_json_schema()` function and the OpenAI function calling convention both output `"properties"` before `"required"`. This is a positional encoding mismatch on every tool-using prompt — the model's attention patterns learned one key layout and sees another. The fix: swap the `Required` and `Properties` field declarations in `api/types.go`.
+Go's `json.Marshal` outputs struct fields in declaration order. In `api/types.go:486-491`, `Required` is declared before `Properties`, so serialized JSON always outputs `"required"` before `"properties"`. The official template's `tojson` preserves Python dict insertion order, which places `"properties"` before `"required"` (matching the OpenAI function calling convention). This is a positional encoding mismatch on every tool-using prompt. The fix: swap the `Required` and `Properties` field declarations in `api/types.go`.
 
 **Sub-bug C — Compact separators in `formatToolCallArgument` (medium impact):**
-The `formatToolCallArgument` function (at `qwen3coder.go:195-217`, shared by all renderers for rendering nested map/list values inside XML `<parameter>` tags) uses raw `json.Marshal`, which produces compact JSON without spaces (`{"key":"value"}`). HuggingFace Transformers' `tojson` uses Python's default separators (`(', ', ': ')`), producing spaced JSON (`{"key": "value"}`). The model was trained on the spaced form.
+The `formatToolCallArgument` function at `qwen3coder.go:250` uses raw `json.Marshal` for map/slice/array values inside XML `<parameter>` tags, producing compact JSON (`{"key":"value"}`). The official template at line 122 uses `tojson` which produces spaced JSON (`{"key": "value"}`). Note: this only affects nested structured values in tool call arguments (maps, arrays) — string and scalar arguments are rendered correctly. The `marshalWithSpaces` function used for tool *definitions* already handles spacing correctly; this bug is specifically in the tool call *argument* rendering path.
 
-**Why these bugs matter:** Every time the model uses tools, it sees a prompt format that differs from its training data. This creates a "distribution shift" — the model still works, but tool calling reliability is degraded compared to what it could be. The canonical C++ inference engine llama.cpp gets all three right because it executes the official Jinja2 template directly, producing byte-identical output to HuggingFace Transformers.
+**Why these bugs matter:** Every time the model uses tools, it sees a prompt format that differs from its training data. This creates a distribution shift — the model still works, but tool calling reliability is degraded. llama.cpp avoids all three because it executes the official Jinja2 template directly. These bugs exist identically in upstream Ollama.
 
 ### A.2 — History `<think>` Blocks Incorrectly Gated on the `isThinking` Boolean
 
-Both the fork and upstream Ollama gate the rendering of `<think>` blocks in assistant message history on the `isThinking` boolean (controlled by the API's `think: true/false` parameter). The relevant code is at `qwen35.go:143`:
+Both the fork and upstream Ollama gate the rendering of `<think>` blocks in assistant message history on `isThinking` (controlled by the API's `think: true/false` parameter). This is a two-part bug — the gate appears in both the rendering condition and the reasoning extraction function.
 
+**Part 1 — Rendering condition at `qwen35.go:143`:**
 ```go
 if isThinking && i > lastQueryIndex {
     // render with <think> block
@@ -57,11 +56,37 @@ if isThinking && i > lastQueryIndex {
 }
 ```
 
-The official Qwen 3.5 Jinja2 template (verified from both `Qwen/Qwen3.5-27B` and `Qwen/Qwen3.5-35B-A3B` on HuggingFace — byte-identical `chat_template` fields) does NOT gate history `<think>` blocks on `enable_thinking`. All assistant messages after `last_query_index` ALWAYS include their `<think>` blocks, regardless of whether thinking is enabled or disabled for the current generation turn.
+The official Qwen 3.5 Jinja2 template at line 100 (`/tmp/qwen35_template.jinja2`) uses only:
+```jinja2
+{%- if loop.index0 > ns.last_query_index %}
+```
+No `enable_thinking` check. Assistant messages after `last_query_index` ALWAYS include `<think>` blocks regardless of whether thinking is enabled for the current turn.
 
-**When this bug triggers:** Multi-turn conversations where a user (or an agentic framework) switches from `think: true` to `think: false` between turns. Previous assistant responses had thinking content (stored in `message.Thinking`). With `think: false`, the renderer extracts the reasoning content via `splitQwen35ReasoningContent` and then throws it away because the `isThinking && ...` check fails. The model sees its own previous responses with reasoning stripped out — a prompt format it was never trained on.
+**Part 2 — Reasoning extraction at `qwen35.go:65`:**
+```go
+func splitQwen35ReasoningContent(content, messageThinking string, isThinking bool) (reasoning string, remaining string) {
+    if isThinking && messageThinking != "" {
+        return strings.TrimSpace(messageThinking), content
+    }
+    // fallback: parse <think> tags from content
+}
+```
 
-**The fix:** Remove `isThinking &&` from the condition at `qwen35.go:143`, so that `<think>` blocks are always included for messages after `lastQueryIndex`, matching the official template.
+The official template at lines 91-92 always uses `reasoning_content` when it exists as a string — no `enable_thinking` check:
+```jinja2
+{%- if message.reasoning_content is string %}
+    {%- set reasoning_content = message.reasoning_content %}
+```
+
+When `isThinking=false` and `messageThinking` is non-empty (the normal case when a previous turn produced reasoning), the fork ignores the stored thinking field and falls through to content parsing, which typically finds nothing (since the thinking was stored separately, not embedded in content). The reasoning is silently lost.
+
+**When this bug triggers:** Multi-turn conversations where thinking mode switches between turns — for example, an agentic framework that uses `think: true` for the initial reasoning step and `think: false` for a follow-up. Previous assistant responses had thinking content stored in `message.Thinking`. With `think: false`, both the extraction and the rendering gate fail, and the model sees its own previous responses with reasoning stripped out — a prompt format it was never trained on.
+
+**The fix is two-part:**
+1. Remove `isThinking &&` from the rendering condition at `qwen35.go:143`
+2. Remove `isThinking &&` from `splitQwen35ReasoningContent` at `qwen35.go:65`, so it always uses `messageThinking` when available
+
+**The parser (`qwen35.go` in `model/parsers/`) is unaffected by this bug.** The parser correctly handles both thinking-enabled and thinking-disabled modes: when thinking is enabled, it collects content until `</think>` then delegates tool call parsing to `Qwen3CoderParser`; when thinking is disabled, it starts directly in content collection mode. The parser also correctly ignores tool call XML that appears inside thinking blocks, handles streaming with partial tag boundaries, and strips optional leading `<think>` tags that some checkpoints re-emit. All parser behavior was verified against the official template's expected output format and is correct.
 
 ---
 
@@ -110,12 +135,6 @@ The fork's `qwen3next` model code handles the 27B dense model correctly. It shou
 
 **Why it matters:** If someone loads a Qwen 3.5 0.8B or 4B GGUF into the fork, incorrect layer classification would cause the wrong layer types to be used (recurrent where attention is expected, or vice versa), producing silent output quality degradation.
 
-### C.7 — Read `full_attention_interval` From GGUF Metadata Instead of Hardcoding
-
-The fork hardcodes `full_attention_interval = 4` at `model.go:513` (meaning every 4th layer is a full attention layer, and the other 3 are GatedDeltaNet recurrent layers). The llama.cpp project reads this value from GGUF metadata with a default of 4 via `ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false)`.
-
-**Why it matters:** All current Qwen 3.5 models use an interval of 4, so the hardcoded value is correct today. But if Alibaba changes the architecture pattern in future Qwen 3.5 model variants (or if other `qwen3next`-architecture models use a different interval), the hardcoded value would silently produce incorrect layer classification. The fix is trivial: change `int(c.Uint("full_attention_interval", 4))` to read from metadata with a default of 4 (which is what the fork already does syntactically — but verifying this is actually reading from GGUF metadata rather than just using the default is worth confirming).
-
 ---
 
 ## Section D: Architectural Limitations Worth Understanding
@@ -161,14 +180,6 @@ Ollama's Go server has its own cache system but has no equivalent multi-modal ca
 ---
 
 ## Section E: Upstream Ollama Changes to Sync
-
-### E.11 — Thinking Level Constraint Removal (Upstream Ollama Commit `122c68c`)
-
-Upstream Ollama removed validation in `server/routes.go` that rejected string-valued `think` parameters (such as `"think": "high"`, `"think": "medium"`, `"think": "low"`) for models other than harmony/gptoss. The fork still has this restrictive validation, which means API clients that send string thinking levels receive an HTTP 400 error.
-
-**The nuance:** For Qwen 3.5, string thinking levels are silently mapped to boolean `true` via `ThinkValue.Bool()` (at `api/types.go:1122-1137`), because the method returns `true` for any valid string (`"high"`, `"medium"`, or `"low"`). A user sending `think: "low"` expecting reduced/minimal thinking will instead get full thinking, identical to `think: true`. The error message was arguably more informative than silently accepting the value — but rejecting the request entirely is worse for client compatibility than accepting it with boolean mapping.
-
-**Why it matters:** Some API clients and agentic frameworks send string-valued thinking levels. Removing the validation is a small cherry-pick that improves compatibility, with the understanding that string values are silently treated as `true` for all non-harmony models.
 
 ### E.12 — Qwen3 Vision-Language Thinking Renderer Missing `emitEmptyThinkOnNoThink` Field
 

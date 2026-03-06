@@ -19,9 +19,8 @@ The fork's critical fixes (prefill bug, `mropeInterleaved` default, penalty samp
 3. **History `<think>` blocks bug** — both fork and upstream incorrectly gate history thinking blocks on `isThinking`; the official template always includes them for messages after `lastQueryIndex`, regardless of `enable_thinking`
 4. **Speculative decoding** is confirmed impossible for hybrid recurrent architectures in both llama.cpp and Ollama — the recurrent state fundamentally cannot be rolled back
 5. **Parallelism** is restricted at the scheduler level (`sched.go:450`) despite the runner supporting it — both the fork and upstream have this limitation
-6. **Thinking level constraint** was loosened in upstream — the fork should incorporate this (but it's a hack, not a proper fix)
-7. **KDA chunk size** change doesn't affect Qwen 3.5 (it uses GDA, not KDA)
-8. **Vision prompt caching** was added to llama.cpp's server — Ollama has no equivalent
+6. **KDA chunk size** change doesn't affect Qwen 3.5 (it uses GDA, not KDA)
+7. **Vision prompt caching** was added to llama.cpp's server — Ollama has no equivalent
 
 ---
 
@@ -161,13 +160,7 @@ The penalty sampler in `llama-sampler.cpp` is **byte-identical** between `d969e9
 | `9896e36` | Fix cloud model limit lookups in integrations | None — IDE integration only |
 | `15732f0` | Use native Ollama API endpoint for OpenClaw | None — OpenClaw integration |
 | `562c76d` | Add qwen3.5 context length for launch | Minor — adds `{Context: 262144, Output: 32768}` for IDE integrations |
-| `122c68c` | Loosen thinking level constraint | **Medium** — removes validation that rejected string-valued `think` parameters |
-
-### 2.2 MEDIUM: Thinking Level Constraint (commit `122c68c`) — FORK SHOULD INCORPORATE
-
-Upstream removed the `IsString()` validation from both `GenerateHandler` and `ChatHandler` in `server/routes.go`. This allows passing string thinking levels (e.g., `"think": "detailed"`) to any model, not just harmony/gptoss models.
-
-The fork still has this restrictive validation. While Qwen 3.5 doesn't currently use string thinking levels, removing the constraint is correct — it's a server-level policy that shouldn't restrict model capabilities. **The fork should cherry-pick this.**
+| `122c68c` | Loosen thinking level constraint | None — harmony/gptoss feature |
 
 ### 2.3 CRITICAL BUGS — STILL UNFIXED IN UPSTREAM
 
@@ -368,11 +361,15 @@ All findings from the previous analysis remain valid:
 
 **Qwen 3.5 model family size diversity** (section 1.4): llama.cpp now recognizes 0.8B through 397B Qwen 3.5 variants. The fork should verify that its qwen3next model code handles the full range of layer counts (24, 32, 40, 48, 60, 64) and embedding dimensions (1024, 2560, etc.) without hardcoded assumptions.
 
-**`full_attention_interval` from metadata** (minor): The fork hardcodes `full_attention_interval = 4` at `model.go:513`. llama.cpp reads it from GGUF metadata with a default of 4. For all current Qwen 3.5 models, the value is 4. But future models could use a different interval. The fork should read this from GGUF metadata instead of hardcoding.
-
 ### 6.3 JSON Serialization Bugs (Unchanged)
 
-The 3 JSON serialization bugs identified in the previous report (HTML escaping, key ordering, compact separators) remain unfixed in both the fork and upstream Ollama. llama.cpp continues to get this right by executing the Jinja2 template directly.
+The 3 JSON serialization bugs remain unfixed in both the fork and upstream Ollama. Verified against the official template at `/tmp/qwen35_template.jinja2` (line 50 for tool definitions via `tojson`, line 122 for tool call arguments via `tojson`):
+
+- **HTML escaping:** `marshalWithSpaces` at `json.go:9` correctly adds spacing after `:` and `,` but inherits `json.Marshal`'s HTML escaping of `<>&` — the spacing is right, the escaping is wrong.
+- **Key ordering:** `api/types.go:490-491` declares `Required` before `Properties` — reversed from the official template's `tojson` output.
+- **Compact separators in tool call arguments:** `formatToolCallArgument` at `qwen3coder.go:250` uses raw `json.Marshal` (compact) for map/list values. This is a separate code path from `marshalWithSpaces` — the tool *definition* rendering has correct spacing, but the tool call *argument* rendering does not.
+
+llama.cpp avoids all three by executing the official Jinja2 template directly. Its `tojson` implementation at `common/jinja/value.cpp:179-180` defaults to `", "` and `": "` separators, and at lines 1291-1312 writes `<>&` literally without escaping.
 
 ---
 
@@ -425,16 +422,13 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 |----------|------|--------|---------|
 | **P0** | Adopt CUDA async copy + reduced sync from `ggml-cuda.cu` and `ggml-backend.cpp` | Medium | 1.1 |
 | **P1** | Adopt M-RoPE `can_shift()` guard in vendored `llama-kv-cache.cpp` | Small (3 lines) | 1.2 |
-| **P1** | Cherry-pick thinking level constraint removal from upstream `122c68c` | Small | 2.2 |
-| **P2** | Read `full_attention_interval` from GGUF metadata instead of hardcoding 4 | Small | 6.2 |
 | **P3** | Adopt Vulkan fp16 FA fix for AMD RDNA2 | Small | 1.8 |
 
 ### From Thinking/Non-Thinking Research (Part 9)
 
 | Priority | Item | Effort | Section |
 |----------|------|--------|---------|
-| **P1** | Fix history `<think>` block rendering — remove `isThinking &&` gate, always include for messages after `lastQueryIndex` | Small | 9.3 |
-| **P2** | Adopt thinking level constraint removal from upstream `122c68c` | Small | 9.6 |
+| **P1** | Fix history `<think>` block rendering — remove `isThinking &&` gate at both `qwen35.go:143` (rendering) and `qwen35.go:65` (extraction) | Small (2 lines) | 9.3 |
 | **P3** | Verify `Qwen3VLRenderer` thinking variant needs `emitEmptyThinkOnNoThink` | Research | 9.7 |
 
 ### From Previous Report (Still Open)
@@ -471,7 +465,7 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 | `cmd/config/integrations.go` | qwen3.5 context length, glm-5 | Missing |
 | `cmd/config/opencode.go` | Cloud model limit lookup fix | Missing |
 | `cmd/config/openclaw.go` | Native API endpoint | Missing |
-| `server/routes.go` | Loosen thinking level constraint | **Missing — should adopt** |
+| `server/routes.go` | Loosen thinking level constraint | None — harmony/gptoss feature |
 
 ### Files verified unchanged (no action needed)
 
@@ -541,12 +535,18 @@ When `think: false` → `isThinking = false` → the `if isThinking && i > lastQ
 
 **When this bug triggers:** Multi-turn conversations where a user switches from `think: true` to `think: false` between turns. The previous assistant responses had thinking content (in `message.Thinking` or embedded in `message.Content`). With `think: false`, the renderer strips the reasoning from history, producing a prompt the model was never trained to see.
 
-**The `splitQwen35ReasoningContent` function** (`qwen35.go:64-80`) correctly extracts reasoning from either `message.Thinking` or embedded `<think>...</think>` tags in content. But when `isThinking=false`:
-1. Line 65: `if isThinking && messageThinking != ""` — skipped (isThinking is false)
-2. Lines 69-77: Falls through to content-parsing path — reasoning IS extracted
-3. Line 143: `if isThinking && i > lastQueryIndex` — FALSE → reasoning discarded
+**The `splitQwen35ReasoningContent` function** (`qwen35.go:64-80`) has a matching bug in the extraction path. When `isThinking=false` and `messageThinking` is non-empty (the normal case — a previous turn produced reasoning stored in the separate `message.Thinking` API field):
+1. Line 65: `if isThinking && messageThinking != ""` — skipped because `isThinking` is false
+2. Lines 69-77: Falls through to content-parsing, which looks for `</think>` in the `content` string — but the reasoning is in the separate `messageThinking` field, not embedded in content. The search finds nothing.
+3. Returns `("", content)` — reasoning is silently lost before the rendering condition at line 143 even runs.
 
-The reasoning is extracted and then thrown away. The correct fix is to change the condition to match the official template:
+The official template at lines 91-92 always uses `reasoning_content` when it exists, with no `enable_thinking` gate:
+```jinja2
+{%- if message.reasoning_content is string %}
+    {%- set reasoning_content = message.reasoning_content %}
+```
+
+The correct fix is two-part. First, the rendering condition should match the official template:
 
 ```go
 // CORRECT (matches official template):
@@ -617,52 +617,6 @@ if thinkingEnabled && !assistantPrefill {
 
 This is correct. The parser behavior matches the renderer behavior.
 
-### 9.6 Upstream Commit `122c68c` — Correct Direction, Wrong Execution
-
-**What it does:** Removes the validation that rejected string-valued `think` parameters for non-harmony/gptoss models:
-
-```go
-// REMOVED by 122c68c:
-if req.Think != nil && req.Think.IsString() && m.Config.Parser != "harmony" {
-    c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("think value %q is not supported for this model", ...)})
-    return
-}
-```
-
-**Is it correct?** It's a **pragmatic hack**, not a principled fix.
-
-**What string think values mean for different models:**
-
-| Model Family | `think: "high"/"medium"/"low"` | `think: true/false` |
-|-------------|-------------------------------|---------------------|
-| **harmony/gptoss** | Meaningful — thinking level/budget control via channels | Boolean on/off |
-| **Qwen 3.5** | **Silently maps to `true`** via `ThinkValue.Bool()` (any valid string → true) | Correct boolean control |
-| **Qwen3-Coder** | No thinking support — `isThinking: false`, no `emitEmptyThinkOnNoThink` | No effect |
-| **DeepSeek 3.1** | **Silently maps to `true`** | Boolean on/off |
-
-The `ThinkValue.Bool()` method at `api/types.go:1122-1137`:
-
-```go
-func (t *ThinkValue) Bool() bool {
-    switch v := t.Value.(type) {
-    case bool:
-        return v
-    case string:
-        return v == "high" || v == "medium" || v == "low"  // any valid string → true
-    default:
-        return false
-    }
-}
-```
-
-**The problem:** A user sending `think: "low"` to Qwen 3.5 expects reduced/minimal thinking. Instead they get full thinking (identical to `think: true`). The error was more informative than silently accepting — at least it told the user the value wasn't supported.
-
-**The correct fix would be:**
-1. Keep the validation for models where string values are meaningless
-2. OR: Add a `SupportsThinkingLevels() bool` method to the renderer interface, and only accept strings when the model supports levels
-3. OR: Accept strings universally but document that they map to boolean for non-level-aware models
-
-**Should the fork adopt this?** The fork should adopt it with the understanding that it's a hack. The alternative (keeping the error) is worse for client compatibility. The best long-term fix is to make the API more explicit about what each model supports.
 
 ### 9.7 Qwen3-Coder vs Qwen 3.5: Different Thinking Architectures
 
@@ -711,7 +665,6 @@ Since Qwen3-Coder models don't have an official `enable_thinking` mechanism in t
 | **History `<think>` blocks gated on `isThinking`** — official template includes them unconditionally | Both fork and upstream | **Medium** — distribution shift when switching think modes between turns | **BUG — OPEN in both** |
 | **`emitEmptyThinkOnNoThink` correctly implements prefill** | Fork and upstream | N/A | **Correct** |
 | **Parser correctly handles both modes** | Fork and upstream | N/A | **Correct** |
-| **`think: "low"` silently treated as `think: true`** | All non-harmony models | **Low** — misleading but not harmful | **By design** (after `122c68c`) |
 | **Qwen3-VL-Thinking missing `emitEmptyThinkOnNoThink`** | Fork and upstream | **Low** — think=false produces no prefill at all | **Potential bug** — needs verification against official template |
 | **Fork's Qwen3CoderRenderer has thinking support upstream lacks** | Fork only | **Informational** — extension beyond training data | Fork-specific feature |
 
@@ -719,6 +672,5 @@ Since Qwen3-Coder models don't have an official `enable_thinking` mechanism in t
 
 | Priority | Item | Effort |
 |----------|------|--------|
-| **P1** | Fix history `<think>` block rendering — remove `isThinking &&` gate at `qwen35.go:143`, always include `<think>` blocks for messages after `lastQueryIndex` | Small (1-line change + update `splitQwen35ReasoningContent` to not gate on `isThinking` for history) |
-| **P2** | Adopt thinking level constraint removal from `122c68c` | Small |
+| **P1** | Fix history `<think>` block rendering — remove `isThinking &&` gate at both `qwen35.go:143` (rendering) and `qwen35.go:65` (extraction), matching the official template lines 91-92 and 100 | Small (2 lines) |
 | **P3** | Verify whether `Qwen3VLRenderer` needs `emitEmptyThinkOnNoThink: true` for the thinking variant | Research |

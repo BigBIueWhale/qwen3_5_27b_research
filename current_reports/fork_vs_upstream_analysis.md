@@ -12,7 +12,7 @@ Qwen3-Coder reference: `Qwen/Qwen3-Coder-30B-A3B-Instruct` Jinja2 template ([ver
 
 | Area | Fork | Upstream Ollama @ `82848a78` | Winner |
 |------|------|----------|--------|
-| Qwen 3.5 renderer (tool defs, ordering, think blocks) | Dedicated `Qwen35Renderer` with prefill bug fix | Dedicated `Qwen35Renderer` without prefill bug fix | **Fork** |
+| Qwen 3.5 renderer (tool defs, ordering, think blocks) | Dedicated `Qwen35Renderer` with prefill bug fix; shared `isThinking` gate bug on history think blocks (section 2.5) | Dedicated `Qwen35Renderer` without prefill bug fix; same `isThinking` gate bug | **Fork** (prefill fix) |
 | Image placement in vision messages | All images prepended to front of message — `Images []ImageData` is a flat array with no positional info (see section 2.3 caveat) | Same — all 3 vision renderers (`Qwen35`, `Qwen3VL`, `LFM2`) prepend | Neither (structural Ollama API limitation) |
 | Qwen 3.5 parser (thinking extraction, tool call delegation) | Dedicated `Qwen35Parser` (byte-identical to upstream) | Dedicated `Qwen35Parser` | Tie |
 | Prefill guard (`len(message.ToolCalls)==0`) | Fixed in **all 3** renderers (`qwen35.go`, `qwen3coder.go`, `qwen3vl.go`) | Broken in **all 3** renderers | **Fork** |
@@ -296,21 +296,31 @@ For text-only Unsloth GGUFs (851 tensors, no `vision.block_count`), the model la
 
 **Now**: The dedicated `Qwen35Renderer` has no default system message injection. When tools are present but no system message exists, the system block contains only the tools text and instructions.
 
-### 2.5 FIXED: `</think>` rendering for empty reasoning differs from training template
+### 2.5 PARTIALLY FIXED: `</think>` rendering for empty reasoning — `message.Thinking != ""` sub-condition removed, but `isThinking` gate remains (BUG)
 
 **Was**: The `Qwen3CoderRenderer` only emits think blocks when `message.Thinking != ""`:
 ```go
 if isThinking && message.Thinking != "" && i > lastQueryIndex {
 ```
 
-**Now**: The dedicated `Qwen35Renderer` **always** emits the think block for eligible assistant messages, even with empty reasoning:
+**Now**: The dedicated `Qwen35Renderer` removed the `message.Thinking != ""` sub-condition — empty reasoning now correctly produces `<think>\n\n</think>\n\n`:
 ```go
 if isThinking && i > lastQueryIndex {
     sb.WriteString(imStartTag + message.Role + "\n<think>\n" + contentReasoning + "\n</think>\n\n" + content)
 }
 ```
 
-The official Qwen 3.5 template unconditionally emits `<think>\n{reasoning}\n</think>\n\n` for all assistant messages after `last_query_index`. An empty reasoning produces `<think>\n\n</think>\n\n`. llama.cpp (`d969e933`) handles this correctly via the Jinja2 template.
+**REMAINING BUG — the `isThinking` gate itself is wrong.** The official Qwen 3.5 template (line 100: `{%- if loop.index0 > ns.last_query_index %}`) emits `<think>` blocks for ALL assistant messages after `lastQueryIndex`, **regardless of `enable_thinking`**. The `enable_thinking` flag only controls the prefill at the very end of the prompt (lines 147-153): `<think>\n` when thinking, `<think>\n\n</think>\n\n` when not. Historical messages always get their `<think>` blocks.
+
+This is a **two-part bug** affecting both fork (`qwen35.go`) and upstream (`qwen35.go`), at identical line numbers:
+
+1. **Line 143**: `if isThinking && i > lastQueryIndex` — the `isThinking &&` prefix should be removed. When `think: false` → `isThinking = false` → the condition fails → the `else` branch (line 146) renders the assistant message WITHOUT `<think>` blocks, silently discarding `contentReasoning`.
+
+2. **Line 65**: `splitQwen35ReasoningContent()` — `if isThinking && messageThinking != ""` gates extraction of the `messageThinking` field on `isThinking`. When `isThinking = false`, the function skips the `messageThinking` field entirely, falls through to content-parsing (lines 69-77) which looks for `</think>` in `content` — but when reasoning is stored in the separate `messageThinking` field (not embedded in content), the search finds nothing. Historical reasoning is silently lost.
+
+**When this matters**: A multi-turn conversation where earlier turns used `think: true` (producing messages with `Thinking` field populated), then the user sends a new request with `think: false`. The official template still renders `<think>reasoning</think>` for those historical messages — the model sees the full conversation context. The fork and upstream silently drop the reasoning from history, presenting the model with a conversation that looks like the assistant never thought — a distribution shift from training.
+
+llama.cpp (`d969e933`) handles this correctly because it executes the Jinja2 template directly, which has no `isThinking` gate on history rendering.
 
 **Note on Qwen3-Next-Thinking**: The `Qwen3CoderRenderer`'s conditional `message.Thinking != ""` gating is actually **correct for Qwen3-Next-Thinking** models, whose official template ([`Qwen/Qwen3-Next-80B-A3B-Thinking`](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking/raw/main/tokenizer_config.json), line 44) only emits think blocks for non-last messages when `reasoning_content` is non-empty. The two model families (Qwen 3.5 and Qwen3-Next-Thinking) were trained on contradictory thinking block semantics. Having separate renderers solves this cleanly — `Qwen35Renderer` uses unconditional think blocks, `Qwen3CoderRenderer` uses conditional. If a future `"qwen3-coder-thinking"` routing is needed, `Qwen3CoderRenderer`'s existing thinking code is ready.
 
@@ -474,9 +484,10 @@ Both codebases have this bug. Zero priority for either.
 | **P0** | Fix HTML escaping in `marshalWithSpaces` (`json.go`) and `formatToolCallArgument` (`qwen3coder.go:195-217`) | Small — replace `json.Marshal` with `json.NewEncoder` + `SetEscapeHTML(false)` in both functions. Reference: Ollama's own `LFM2Renderer` at [`lfm2.go:55-56`](https://github.com/ollama/ollama/blob/82848a78/model/renderers/lfm2.go#L55-L56). | 3.1 Bug A | **OPEN** — empirically verified: Go outputs `\u003c` where model was trained on literal `<`. |
 | **P0** | Fix `required`/`properties` key ordering in `ToolFunctionParameters` | Small — swap the `Required` and `Properties` field declarations in `api/types.go:486-491` so `Properties` comes before `Required`, matching HuggingFace [`get_json_schema`](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/utils/chat_template_utils.py#L210-L213) and the OpenAI function calling convention. | 3.1 Bug B | **OPEN** — empirically verified: Go outputs `"required", "properties"` where model was trained on `"properties", "required"`. |
 | **P1** | Fix compact separators in `formatToolCallArgument` | Small — apply the same `marshalWithSpaces`-style spacing to `formatToolCallArgument` at `qwen3coder.go:195-217`. Currently uses raw `json.Marshal` (compact `{k:v}`) where model was trained on spaced `{k: v}`. | 3.1 Bug C | **OPEN** — empirically verified. |
+| **P1** | Fix `isThinking` gate on history `<think>` block rendering (two-part fix) | Tiny — remove `isThinking &&` from line 143 condition, remove `isThinking &&` from line 65 condition in `splitQwen35ReasoningContent()`. Both in `qwen35.go`. | 2.5 | **OPEN** — both fork and upstream have this bug. Official template (line 100) has no `enable_thinking` gate on history rendering. |
 | **P2** | Add a dedicated test in `qwen35_test.go` for the prefill bug fix | Small — test where last message is `{Role: "assistant", ToolCalls: [...]}`, assert `<\|im_end\|>` IS emitted and `<\|im_start\|>assistant\n<think>\n` IS appended | 1.1 | **OPEN** — the fork's single differentiating line (`qwen35.go:136`: `&& len(message.ToolCalls) == 0`) currently has no dedicated test in the qwen35 test suite; it is only tested indirectly via `qwen3coder_test.go:327-376` |
 
-All other previously-open items (P0: JSON tool definitions, P0: tools-first ordering, P2: image support, P3: default system message, P3: unconditional think blocks, P3: lastQueryIndex tool_response filtering) are now **RESOLVED** by the dedicated `Qwen35Renderer`/`Qwen35Parser`. The JSON serialization bugs (Bugs A/B/C in section 3.1) are the only remaining template fidelity gaps — every other aspect of the rendered output is byte-identical to the official Qwen 3.5 training template.
+All other previously-open items (P0: JSON tool definitions, P0: tools-first ordering, P2: image support, P3: default system message, P3: unconditional think blocks, P3: lastQueryIndex tool_response filtering) are now **RESOLVED** by the dedicated `Qwen35Renderer`/`Qwen35Parser`. The remaining template fidelity gaps are: the `isThinking` gate on history think blocks (section 2.5), and the JSON serialization bugs (Bugs A/B/C in section 3.1).
 
 ---
 
@@ -488,6 +499,7 @@ All other previously-open items (P0: JSON tool definitions, P0: tools-first orde
 | **P0** | **`mropeInterleaved` defaults to `false`** — wrong for ALL third-party Qwen 3.5 GGUFs (Unsloth, bartowski, llama.cpp converter) | Silent data corruption: RoPE type 8 (MROPE) instead of 40 (IMROPE) in every full-attention layer. Model loads and runs but positional encoding is wrong. Users blame model quality. | **Fork**: architecture-based default. **llama.cpp**: hardcoded per arch (`LLAMA_ROPE_TYPE_IMROPE`) | 1.3 |
 | **P1** | **`repeat_last_n` API parameter silently ignored** in Go runner — accepted by API, never wired to sampler | Dead API field. Users setting `repeat_last_n: 128` get no effect. | **Fork**: wired as 9th parameter to `NewSampler`. **llama.cpp**: `penalty_last_n` correctly wired | 1.5 |
 | **P1** | **`</think>` not always closed** in `Qwen3VLRenderer` — gated on `content != ""` | Unclosed `<think>` tag for thinking-only responses in `qwen3-vl-instruct` and `qwen3-vl-thinking` models | **Fork**: always closes. **llama.cpp**: always closes via Jinja2 template | 1.2 |
+| **P1** | **History `<think>` blocks incorrectly gated on `isThinking`** — `Qwen35Renderer` (`qwen35.go:143`) uses `if isThinking && i > lastQueryIndex`, but the official template (line 100) has NO `enable_thinking` gate on history rendering. Two-part bug: line 143 (rendering) + line 65 in `splitQwen35ReasoningContent()` (extraction). When `think: false`, all historical reasoning is silently dropped. | Distribution shift in multi-turn thinking/non-thinking conversations. Model sees history without `<think>` blocks that were present during training. | **Fork**: same bug. **llama.cpp**: correct (executes Jinja2 template directly) | 2.5 |
 | **P0** | **JSON serialization wrong in ALL tool-using renderers** — three bugs: (A) Go's `json.Marshal` HTML-escapes `<>&` to `\u003c\u003e\u0026` where model was trained on literal characters, (B) `ToolFunctionParameters` struct outputs `required` before `properties` where model was trained on `properties` before `required`, (C) `formatToolCallArgument` uses compact separators where model was trained on spaced JSON. Empirically verified against `transformers` [v5.2.0](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/utils/chat_template_utils.py#L463-L466) — HuggingFace's `tojson` override uses `json.dumps(sort_keys=False, ensure_ascii=False)`, NOT stock Jinja2's `tojson` which sorts alphabetically and HTML-escapes. | Distribution shift on every tool-using prompt. Bug A affects any tool description containing `<>&` (6 bytes per char instead of 1). Bug B is a positional encoding mismatch at the parameters level. Bug C affects nested map/list values inside tool call arguments. | **Fork**: same bugs. **llama.cpp**: correct (executes Jinja2 directly with HuggingFace's `tojson` override) | 3.1, 2.1 |
 | **P1** | **Penalty sampler feeds prompt tokens into penalty window** via public `Accept()` — `repeatPenalty`, `presencePenalty`, AND `frequencyPenalty` all corrupted | With any penalty > 0/1.0, tool names, JSON tokens, and previous results in the prompt are penalized during generation. Forces `repeat_penalty: 1.0` default (disabled). Makes `presence_penalty` and `frequency_penalty` unsafe for agentic use. | **Fork**: private `recordToken()`, generated-only ring buffer. **llama.cpp**: same bug as upstream Ollama | 1.4 |
 | **P2** | **GGUF converter conditional KV emission** — `rope.mrope_interleaved` and `ssm.v_head_reordered` only written when `true` | Third-party GGUFs that omit these ollama-internal keys fall through to wrong defaults (see P0 mropeInterleaved above) | **Fork**: unconditional emission. **llama.cpp**: N/A (doesn't use these keys) | 1.7 |
