@@ -436,35 +436,11 @@ The Unsloth Dynamic 2.0 `UD-Q4_K_XL` GGUF at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` 
 
 ### 6.6 Tool Call Parser Architecture: Ollama's Free-Form Parser vs llama.cpp's Grammar-Constrained Parser
 
-Both Ollama and llama.cpp parse the same Qwen 3.5 tool call format — the XML-style `<tool_call>/<function=name>/<parameter=name>` structure defined in the official template (lines 105-128 of `/tmp/qwen35_template.jinja2`). Both the official HuggingFace template and the Unsloth GGUF template at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` produce identical tool call formatting (the Unsloth modifications only affect how tool call arguments are iterated inside the template, not the output format). llama.cpp correctly detects this format by checking the GGUF-embedded template for `<tool_call>`, `<function=`, and `<parameter=` markers at `chat.cpp:3118-3120`, routing to the `common_chat_params_init_qwen3_coder` handler. Ollama routes Qwen 3.5 to `Qwen35Parser` (at `parsers/parsers.go:53`) which wraps `Qwen3CoderParser` (at `parsers/qwen3coder.go`).
+**Full plan:** See dedicated report [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md).
 
-The critical difference is **how** they parse:
+Ollama's tool call parser is a free-form streaming state machine (`parsers/qwen3coder.go`) that trusts the model to produce well-formed output. llama.cpp builds a PEG grammar from the declared tool schemas (`chat.cpp:1555-1616` at reference commit `a0ed91a`) and applies it as logit masks during generation — the model literally cannot produce malformed tool calls.
 
-**llama.cpp — Grammar-constrained PEG parser (`chat.cpp:1555-1616`):**
-llama.cpp builds a PEG (Parsing Expression Grammar) at render time from the declared tool schemas. At `chat.cpp:1580`, each tool becomes a grammar rule: `"<function=" + literal(name) + ">\n"`. Each parameter becomes a grammar rule at line 1592: `"<parameter=" + literal(param_name) + ">\n"`. String parameters accept free text (line 1597: `p.tool_arg_string_value(arg_string)`); non-string parameters are constrained to match their JSON schema (line 1599: `p.schema(p.json(), rule_name + "-schema", param_schema)`). Required parameters must appear exactly once (line 1604: `min = 1, max = 1`); optional parameters appear zero or one times.
-
-This grammar is applied **during token generation** — the model's logits are masked at each step so it can only produce tokens that continue a valid parse. The model literally cannot generate a malformed tool call. If the model tries to hallucinate a function name that wasn't declared, the grammar prevents it. If it tries to output a string where the schema expects a JSON object, the grammar forces valid JSON. The output is guaranteed to be a syntactically valid tool call with correct parameter names and type-conforming values.
-
-**Ollama — Free-form streaming parser (`parsers/qwen3coder.go:150-317`, `parsers/qwen35.go:84-238`):**
-Ollama's parser is a state machine that processes the model's raw text output token by token after generation. The `Qwen35Parser` first handles `<think>`/`</think>` extraction (states: `CollectingThinking` → `ThinkingDoneEatingWhitespace` → `CollectingContent`), then delegates post-thinking content to `Qwen3CoderParser`. The `Qwen3CoderParser` scans for `<tool_call>` open tags (state `LookingForToolStart` at line 249), accumulates everything until `</tool_call>` (state `CollectingToolContent` at line 293), then passes the raw content between these tags to `parseToolCall()` at line 341.
-
-`parseToolCall()` transforms the XML-like `<function=name>` / `<parameter=name>` tags into standard XML via regex replacement (`transformToXML` at line 520: `<tag=abc>` → `<tag name="abc">`), then calls Go's `xml.Unmarshal` to parse. Parameter values are type-coerced by `parseValue()` at line 404, which tries each declared type in precedence order (boolean → integer → number → array → object → string).
-
-**The problem is what happens when the model misbehaves.** The model's output is untrusted — it can generate anything. With llama.cpp's grammar-constrained approach, "anything" is limited to the set of valid parses. With Ollama's free-form approach, the model can generate:
-
-1. **A function name that doesn't exist in the declared tools.** llama.cpp: impossible — the grammar only allows declared names. Ollama: the `<function=hallucinated_name>` tag is parsed by `transformToXML`, `xml.Unmarshal` succeeds, and `parseToolCall` produces an `api.ToolCall` with `Function.Name = "hallucinated_name"`. The tool matching loop at line 358 sets `matchedTool = nil`, so all parameters are parsed without type information (defaulting to raw strings at line 416). This phantom tool call propagates through the API to the client, which must handle a tool call for a function it never declared.
-
-2. **Malformed XML between `<tool_call>` and `</tool_call>`.** llama.cpp: impossible. Ollama: if the model generates `<tool_call>\nsome garbage that isn't valid XML\n</tool_call>`, the `transformToXML` regex may partially match, `xml.Unmarshal` may fail (returning an error at line 349), and `parseToolCall` returns the error. This propagates up through `Qwen3CoderParser.Add()` at line 84-85, which logs a warning and returns the error. The runner then has an error for a turn that looked like it might have tool calls — the recovery path is unclear.
-
-3. **A `<tool_call>` open tag with no matching `</tool_call>`.** llama.cpp: impossible — the grammar requires `</tool_call>` + whitespace at line 1612. Ollama: the `CollectingToolContent` state at line 293 accumulates forever, waiting for `</tool_call>`. If the model generates content after the unclosed `<tool_call>` and then stops (EOS), the accumulated content is never emitted as either a tool call or as content — it's silently lost in the parser's buffer.
-
-4. **Tool call XML appearing inside `<think>` blocks.** The `Qwen35Parser` handles this correctly: when in `CollectingThinking` state, the `Qwen3CoderParser` is not active, so `<tool_call>` inside thinking is treated as thinking content, not parsed as a tool call. However, the `Qwen3CoderParser` (used standalone for qwen3-coder models) does check for `<tool_call>` during thinking collection at line 182 — if a tool call open tag appears before `</think>`, it treats the tool call boundary as the end of thinking. This is a design choice for Qwen3-Coder (which may legitimately produce tool calls during reasoning), but is handled by the `Qwen35Parser` wrapper for Qwen 3.5.
-
-5. **Parameter values that don't match declared types.** llama.cpp: impossible for non-string parameters — the grammar constrains values to match the JSON schema. Ollama: `parseValue()` at line 404 does best-effort type coercion. If the schema says `"type": "integer"` and the model outputs `"not a number"`, `strconv.ParseInt` fails at line 445, and since integer is the only type, it falls back to returning the raw string at line 454. The caller receives a `string` where it expected an `int` — a type mismatch that propagates silently through `api.ToolCall.Function.Arguments`.
-
-**Why this matters in practice:** Qwen 3.5 is a well-trained model that usually generates valid tool calls. But "usually" is not "always" — especially under adversarial prompts, long context degradation, low temperature with unlucky sampling, or quantization artifacts (the Unsloth `UD-Q4_K_XL` is a 4-bit quantization, which inherently has higher error rates than FP16). When the model does produce a malformed tool call, the difference between the two approaches determines whether the error is caught at generation time (llama.cpp — the grammar prevents it from being generated in the first place) or propagated silently through the system (Ollama — the malformed output becomes a malformed `api.ToolCall` that the client must handle).
-
-In an agentic workflow where tool call results feed back into the conversation, a single malformed tool call can cascade: the client receives a phantom function call, fails to execute it (or worse, misroutes it), sends back an error or garbage result, and the model's next turn is conditioned on this corrupted history. llama.cpp's grammar-constrained approach prevents this entire failure cascade at the source.
+The fork will implement grammar-constrained tool call generation for Qwen 3.5, matching what llama.cpp does correctly. No other model in Ollama has this. The dedicated plan covers the full infrastructure audit, constraint comparison table (what llama.cpp validates vs. what we will/won't match), all error handling paths, and the step-by-step implementation plan (~265-415 lines total).
 
 ---
 
@@ -526,11 +502,11 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 | **P1** | Fix history `<think>` block rendering — remove `isThinking &&` gate at both `qwen35.go:143` (rendering) and `qwen35.go:65` (extraction) | Small (2 lines) | 9.3 |
 | **P3** | Verify `Qwen3VLRenderer` thinking variant needs `emitEmptyThinkOnNoThink` | Research | 9.7 |
 
-### Parser Architecture (Structural Limitation — Not a Simple Fix)
+### Grammar-Constrained Tool Call Generation (Qwen-Scoped)
 
 | Priority | Item | Effort | Section |
 |----------|------|--------|---------|
-| **P2** | Investigate grammar-constrained tool call generation (Ollama's free-form parser silently propagates malformed tool calls; llama.cpp's PEG parser prevents them at generation time) | Very High (architectural change to the Go runner's sampling pipeline) | 6.6 |
+| **P0** | Implement grammar-constrained tool call generation for Qwen 3.5. See dedicated plan: [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md) | Medium (~265-415 lines, Qwen-scoped) | 6.6 |
 
 ### From Previous Report (Still Open — Revised Effort Estimates)
 
@@ -549,7 +525,7 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 | **llama.cpp** | Prompt tokens contaminate penalty sampler ring buffer | Medium (masked by defaults) | 1.11, 6.4 Bug 2 |
 | **llama.cpp** | No model-specific sampler defaults | Low | 6.4 Bug 3 |
 | **llama.cpp** | Float precision loss in `tojson` (6 digits vs 17) | Very Low | 6.4 Bug 4 |
-| **Fork + Upstream Ollama** | Free-form tool call parser silently propagates malformed model output (phantom function names, type mismatches, unclosed tags) — llama.cpp prevents this via grammar-constrained generation | Structural limitation | 6.6 |
+| **Fork + Upstream Ollama** | Free-form tool call parser silently propagates malformed model output — llama.cpp prevents this via grammar-constrained generation. **Fork will fix this:** see [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md). | Structural limitation (being fixed) | 6.6 |
 | **Unsloth GGUF** | Modified template (defensive `is mapping` + key iteration) — functionally equivalent | Informational | 6.5 |
 
 ---

@@ -80,6 +80,7 @@
 |------|-------|-------------|
 | `fork_vs_upstream_analysis.md` | 348 | Fork vs upstream analysis pinned to upstream `82848a78`. Covers what the fork should fix (P0-P3), what upstream should fix, and critical architectural differences (penalty sampling, ring buffer, KV emission). |
 | `fork_vs_latest_upstream_and_llama_cpp.md` | 724 | Fork vs latest upstream Ollama (`9896e36`) and llama.cpp (`a0ed91a`). Covers CUDA async copy, M-RoPE can_shift, speculative decoding, parallelism, vision, sampler, thinking/non-thinking modes, and correctness. |
+| `grammar_constrained_tool_calls_plan.md` | 455 | Dedicated implementation plan for grammar-constrained tool call generation. Covers why (Ollama trusts model, llama.cpp doesn't), full infrastructure audit (what's already in place), constraint comparison table (llama.cpp vs fork), all error handling paths, step-by-step implementation plan (~265-415 lines), and future JSON schema enhancement path. Pinned to llama.cpp reference `a0ed91a`. |
 
 ### Other research documents (parent directory)
 
