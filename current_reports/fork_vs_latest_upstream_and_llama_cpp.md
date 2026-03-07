@@ -360,7 +360,7 @@ All findings from the previous analysis remain valid:
 | History `<think>` blocks gated on thinking mode | **BROKEN** (gated on `isThinking`) | **BROKEN** (identical code) | **Correct** (template handles it) |
 | Model-specific sampler defaults | Not implemented | Not implemented | **Not implemented** (`common.h:186-198` — same defaults for all models) |
 | Float precision in `tojson` | N/A (Go renderer) | N/A (Go renderer) | **Minor flaw** — 6 sig digits vs Python's ~17 (`value.cpp:1290`) |
-| Tool call parser robustness | **Free-form** — accepts any model output, parses after the fact; malformed tool calls silently produce garbage `api.ToolCall` structs that propagate | **Free-form** (identical code) | **Grammar-constrained** — PEG parser forces model to produce syntactically valid tool calls during generation; malformed output is structurally impossible |
+| Tool call parser robustness | **Free-form** — accepts any model output, parses after the fact; malformed tool calls silently produce garbage `api.ToolCall` structs that propagate. **Grammar builder (Step 3) DONE** in `llama/sampling_ext.cpp`. | **Free-form** (identical code) | **Grammar-constrained** — PEG parser forces model to produce syntactically valid tool calls during generation; malformed output is structurally impossible |
 
 ### 6.2 New Correctness Considerations
 
@@ -438,6 +438,8 @@ The Unsloth Dynamic 2.0 `UD-Q4_K_XL` GGUF at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` 
 
 **Full plan:** See dedicated report [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md).
 
+**Status:** Step 3 (GBNF Grammar Builder) is **DONE** — `tool_call_grammar_from_json()` implemented in `llama/sampling_ext.cpp` (~230 lines C++). Converts a JSON array of tool definitions into a GBNF grammar constraining generation to well-formed Qwen 3.5 XML tool calls. Uses vendored `build_grammar()` + `gbnf_format_literal()` APIs, plus a ported trie-based exclusion pattern generator. Steps 1-2, 4-6 remain.
+
 Ollama's tool call parser is a free-form streaming state machine (`parsers/qwen3coder.go`) that trusts the model to produce well-formed output. llama.cpp builds a PEG grammar from the declared tool schemas (`chat.cpp:1555-1616` at reference commit `a0ed91a`) and applies it as logit masks during generation — the model literally cannot produce malformed tool calls.
 
 The fork will implement grammar-constrained tool call generation for Qwen 3.5, matching what llama.cpp does correctly. No other model in Ollama has this. The dedicated plan covers the full infrastructure audit, constraint comparison table (what llama.cpp validates vs. what we will/won't match), all error handling paths, and the step-by-step implementation plan (~265-415 lines total).
@@ -506,7 +508,7 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 
 | Priority | Item | Effort | Section |
 |----------|------|--------|---------|
-| **P0** | Implement grammar-constrained tool call generation for Qwen 3.5. See dedicated plan: [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md) | Medium (~265-415 lines, Qwen-scoped) | 6.6 |
+| **P0** | Implement grammar-constrained tool call generation for Qwen 3.5. See dedicated plan: [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md). **Step 3 (GBNF builder) DONE** — `llama/sampling_ext.cpp`. Steps 1-2, 4-6 remain. | Medium (~265-415 lines, Qwen-scoped) | 6.6 |
 
 ### From Previous Report (Still Open — Revised Effort Estimates)
 
@@ -525,7 +527,7 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 | **llama.cpp** | Prompt tokens contaminate penalty sampler ring buffer | Medium (masked by defaults) | 1.11, 6.4 Bug 2 |
 | **llama.cpp** | No model-specific sampler defaults | Low | 6.4 Bug 3 |
 | **llama.cpp** | Float precision loss in `tojson` (6 digits vs 17) | Very Low | 6.4 Bug 4 |
-| **Fork + Upstream Ollama** | Free-form tool call parser silently propagates malformed model output — llama.cpp prevents this via grammar-constrained generation. **Fork will fix this:** see [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md). | Structural limitation (being fixed) | 6.6 |
+| **Fork + Upstream Ollama** | Free-form tool call parser silently propagates malformed model output — llama.cpp prevents this via grammar-constrained generation. **Fork fixing this: Step 3 (GBNF builder) DONE**, Steps 1-2, 4-6 remain. See [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md). | Structural limitation (being fixed) | 6.6 |
 | **Unsloth GGUF** | Modified template (defensive `is mapping` + key iteration) — functionally equivalent | Informational | 6.5 |
 
 ---

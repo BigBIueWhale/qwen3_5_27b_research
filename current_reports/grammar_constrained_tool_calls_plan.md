@@ -310,30 +310,43 @@ Add `NewGrammarLazy(grammarStr, vocabIds, pieces, eogTokens, triggerPatterns, tr
 
 Add `NewGrammarSamplerLazy(...)` that mirrors `NewGrammarSampler` but uses the lazy init path.
 
-### Step 3: Build GBNF Grammar from Tool Schemas (~150-250 lines)
+### Step 3: Build GBNF Grammar from Tool Schemas (~150-250 lines) --- COMPLETED 2026-03-07
 
-**New file:** `model/parsers/qwen3coder_grammar.go` (or similar)
+> **Implementation note:** This step was implemented as a C++ bridge function in `llama/sampling_ext.cpp` rather than as Go code. This approach calls the vendored `build_grammar()` / `gbnf_format_literal()` API from `json-schema-to-grammar.h` directly, avoiding the need to reimplement GBNF construction in Go. The trie-based exclusion pattern for free-text parameter values was ported from `peg-parser.cpp` (~80 lines) because it is `static` (file-local) and not exposed in any header.
 
-A function that takes `[]api.Tool` and produces a GBNF grammar string encoding the Qwen `<tool_call>/<function=name>/<parameter=name>` XML format.
+**Files changed:** `llama/sampling_ext.cpp` (~230 lines added), `llama/sampling_ext.h` (~70 lines added)
 
-The grammar structure (pseudocode GBNF):
+**Function:** `tool_call_grammar_from_json(tools_json, grammar_out, grammar_max_len, error_out, error_max_len)` — takes a JSON array of `api.Tool` definitions, returns a GBNF grammar string.
+
+**Defensive validation (11 error codes):** null pointers, zero-length buffers, invalid/non-array/empty JSON, missing or malformed `function`/`name`/`parameters`/`properties`/`required`, empty names, null bytes, forbidden characters (`>`, `<`, `\n`, `\r`), duplicate function names, duplicate parameter names, required parameters not in properties, output truncation, grammar build exceptions.
+
+**Produced GBNF grammar (verified output for get_weather + search example):**
 ```
-root ::= tool-call+
-tool-call ::= "<tool_call>\n" tool-choice "</tool_call>" space
-tool-choice ::= tool-get-weather | tool-search | ...
-tool-get-weather ::= "<function=" "get_weather" ">\n" param-location param-unit? "</function>\n"
-param-location ::= "<parameter=" "location" ">\n" free-text "\n</parameter>\n"
-param-unit ::= "<parameter=" "unit" ">\n" free-text "\n</parameter>\n"
-free-text ::= [^\n<]* (... characters that aren't tag openers ...)
-space ::= " " | "\n"
+root             ::= tool-call+
+tool-call        ::= "<tool_call>\n" tool-choice "</tool_call>" ws
+tool-choice      ::= tool-get-weather | tool-search
+tool-get-weather ::= "<function=get_weather>\n" tool-get-weather-arg-location
+                     tool-get-weather-arg-unit? "</function>\n"
+tool-get-weather-arg-location ::= "<parameter=location>\n" xml-arg-string "\n"
+                                  ("</parameter>\n")?
+tool-get-weather-arg-unit     ::= "<parameter=unit>\n" xml-arg-string "\n"
+                                  ("</parameter>\n")?
+tool-search      ::= "<function=search>\n" tool-search-arg-query "</function>\n"
+tool-search-arg-query ::= "<parameter=query>\n" xml-arg-string "\n"
+                          ("</parameter>\n")?
+xml-arg-string   ::= (trie-based exclusion pattern for \n</parameter>, \n<parameter=, \n</function>)
+ws               ::= [ \t\n]*
 ```
 
-Key decisions:
+Key decisions (all match the original plan):
 - Function names: literal alternation of declared tool names
 - Parameter names: literal alternation of declared parameter names per tool
 - Parameter values: free text (no JSON schema grammar constraints — see Section 3.2)
 - `</parameter>` closing tag: optional (matching llama.cpp)
 - Parallel tool calls: `tool-call+` repetition
+- Required parameters: no `?` suffix; optional parameters: `?` suffix
+
+**Upstream compatibility note (verified 2026-03-07):** The latest llama.cpp (`c5a7788`) upgraded the trie from `unsigned char` to `uint32_t` for Unicode codepoint support, and refactored the tool grammar builder from inline `chat.cpp` to `chat-peg-parser.cpp` with parameterized XML markers. The public API we depend on (`build_grammar`, `gbnf_format_literal`, `common_grammar_builder` in `json-schema-to-grammar.h`) is byte-for-byte identical. Our trie handles ASCII-only delimiters correctly; the Unicode upgrade would only matter for non-ASCII tool/parameter names.
 
 ### Step 4: Wire into the Server (~20 lines)
 
@@ -379,47 +392,30 @@ if allRejected {
 
 ### Total Effort
 
-| Step | Lines | Scope |
-|------|-------|-------|
-| 1. C bridge extension | ~20 | Generic (any model) |
-| 2. Go wrapper extension | ~20 | Generic (any model) |
-| 3. GBNF grammar builder | ~150-250 | Qwen-specific |
-| 4. Server wiring | ~20 | Qwen-specific |
-| 5. Strict parser validation | ~50-100 | Qwen-specific |
-| 6. Dead-end error detection | ~5 | Generic (any model) |
-| **Total** | **~265-415** | |
+| Step | Lines | Scope | Status |
+|------|-------|-------|--------|
+| 1. C bridge extension | ~20 | Generic (any model) | TODO |
+| 2. Go wrapper extension | ~20 | Generic (any model) | TODO |
+| 3. GBNF grammar builder | ~230 (C++) | Generic C bridge | **DONE** (2026-03-07) |
+| 4. Server wiring | ~20 | Qwen-specific | TODO |
+| 5. Strict parser validation | ~50-100 | Qwen-specific | TODO |
+| 6. Dead-end error detection | ~5 | Generic (any model) | TODO |
 
 ### Sequencing
 
+- **Step 3 (GBNF grammar builder) is complete** — implemented as C++ in `llama/sampling_ext.cpp`
 - Step 5 (strict parser) can be implemented immediately as a standalone improvement
-- Steps 1-4 (grammar-constrained generation) depend on each other and should be implemented together
+- Steps 1-2 (lazy grammar C bridge + Go wrapper) are needed to wire Step 3's output into the sampling pipeline
+- Step 4 (server wiring) depends on Steps 1-2
 - Step 6 (error detection) can be done at any time
 
 ---
 
-## 6. Future Enhancement: Full JSON Schema Constraints via C++ Bridge
+## 6. Future Enhancement: Full JSON Schema Constraints for Non-String Parameter Values
 
-If we later want to match llama.cpp's full JSON schema validation at the grammar level (non-string parameter values constrained to match their declared types), the cleanest path is:
+> **Note:** The C++ bridge function `tool_call_grammar_from_json()` described in the original plan as a "future enhancement" was **implemented in Step 3** (2026-03-07). The function now exists in `llama/sampling_ext.cpp` and handles XML framing + literal name constraints. What remains as a future enhancement is adding **per-parameter JSON schema type constraints** (integers producing only digits, booleans only `true`/`false`, etc.).
 
-**New C bridge function** (~50-80 lines of C++ in `sampling_ext.cpp`):
-```c
-int tool_call_grammar_from_json(
-    const char* tools_json,    // JSON array of tool definitions
-    const char* format,        // "qwen35" or "qwen3coder"
-    char* grammar_out,         // output GBNF string
-    size_t max_len
-);
-```
-
-This function would:
-1. Parse the tools JSON
-2. Call `build_grammar()` with a callback that:
-   - Adds custom GBNF rules for XML framing (`<tool_call>`, `<function=...>`, etc.)
-   - Calls `builder.add_schema(name, param_schema)` for each non-string parameter to get type-constrained GBNF rules from `json-schema-to-grammar.cpp`
-   - Composes everything into a unified grammar
-3. Return the complete GBNF string
-
-The `json-schema-to-grammar.cpp` code is already vendored and functional. No porting needed — just a thin C++ function that orchestrates the existing pieces.
+To add JSON schema constraints for non-string parameter values, the existing `tool_call_grammar_from_json()` would be extended to call `builder.add_schema(name, param_schema)` for each non-string parameter instead of using the free-text `xml-arg-string` rule. The `json-schema-to-grammar.cpp` code is already vendored and functional — the `add_schema` callback on `common_grammar_builder` is already available. The change would be ~20-30 lines in the existing function.
 
 ---
 

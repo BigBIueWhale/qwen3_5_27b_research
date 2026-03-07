@@ -25,6 +25,8 @@
 | `tokenizer/special.go` | Special token splitting with `strings.Contains` early-out (perf) |
 | `tokenizer/vocabulary.go` | Stack buffer in `Merge()` BPE hot path (perf) |
 | `api/types.go` | `RepeatPenalty: 1.1` default (line 1066) |
+| `llama/sampling_ext.h` | C bridge header — added `tool_call_grammar_from_json()` declaration + 11 error codes (Step 3 of grammar plan) |
+| `llama/sampling_ext.cpp` | C bridge impl — added `tool_call_grammar_from_json()` (~230 lines): trie-based exclusion patterns, GBNF grammar builder for Qwen 3.5 XML tool calls |
 
 ---
 
@@ -63,6 +65,12 @@
 | Path | Description |
 |------|-------------|
 | `/tmp/llama-cpp-latest/` | `ggml-org/llama.cpp` master @ `a0ed91a`. Full clone. Contains CUDA async copy optimization (`2cd20b7`), M-RoPE `can_shift()` guard (`99bd67c`), KDA chunk size 16 vs GDA chunk size 64, and speculative decoding compatibility checks. |
+
+## Newest llama.cpp Clone
+
+| Path | Description |
+|------|-------------|
+| `/tmp/llama_cpp_up_to_date/` | `ggml-org/llama.cpp` master @ `c5a7788` ("ggml: add GATED_DELTA_NET op"). Shallow clone (`--depth=1`). Trie upgraded to `uint32_t` Unicode codepoints in `peg-parser.cpp`. Tool grammar builder refactored from `chat.cpp` into new `chat-peg-parser.cpp` with parameterized markers. Public API (`json-schema-to-grammar.h`) byte-for-byte identical to vendored version. |
 
 ## Stale Upstream Bare Clone
 
