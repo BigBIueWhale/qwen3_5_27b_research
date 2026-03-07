@@ -169,18 +169,19 @@ struct llama_grammar {
 
 ### 3.1 Constraint Comparison Table
 
-| Constraint | llama.cpp (grammar) | Fork: grammar | Fork: strict parser | Notes |
-|------------|---------------------|---------------|---------------------|-------|
-| **XML structure** — `<tool_call>`, `</tool_call>`, `<function=...>`, `</function>`, `<parameter=...>`, `</parameter>` well-formed | **Yes** | **Yes** — GBNF literals | **Yes** — `xml.Unmarshal` rejects malformed XML | Grammar prevents malformed tags from ever being generated |
-| **Function name** — only declared tool names | **Yes** — `p.literal(name)` alternation (`chat.cpp:1580`) | **Yes** — literal alternation in GBNF | **Yes** — reject when `matchedTool == nil` (currently silently accepts; fix needed) | Highest-value constraint. Prevents phantom function calls. |
-| **Parameter name** — only declared param names | **Yes** — `p.literal(param_name)` per parameter (`chat.cpp:1592`) | **Yes** — literal alternation per tool | **Yes** — validate against tool schema (currently accepts unknown params; fix needed) | Prevents invented parameter names |
-| **Lazy trigger activation** | **Yes** — `grammar_lazy = true`, trigger on `<tool_call>` word (`chat.cpp:1626-1639`) | **Yes** — vendored C++ fully supports this; needs C bridge exposure (~20 lines) | N/A (parser is post-generation) | Without lazy, grammar would constrain ALL output including thinking/content |
-| **Required parameters present** | **Yes** — `p.repeat(arg_rule, 1, 1)` forces exactly-once in declaration order (`chat.cpp:1604`) | **No** — not implementing | **Partially** — can check completeness after parsing | Forces fixed parameter ordering which may fight model's learned order |
-| **Optional parameters** | **Yes** — `p.repeat(arg_rule, 0, 1)` | **No** — not implementing | **No** — harmless: duplicate optional param overwrites previous | Same ordering concern |
-| **String parameter values** | **Unconstrained** — `p.until_one_of(delimiters)` accepts any text (`chat.cpp:1596-1597`) | **Unconstrained** — free text until `</parameter>` | **No change needed** | Neither validates string content against patterns/minLength/maxLength/enum |
-| **Non-string parameter values** (int, number, bool, object, array) | **Yes** — `p.schema()` converts JSON schema to GBNF (`chat.cpp:1599`), using `json-schema-to-grammar.cpp` | **No** — not implementing at grammar level | **Yes** — `parseValue()` returns errors on type mismatch instead of silent fallback | See Section 3.2 for why we skip this in grammar |
-| **`</parameter>` closing tag** | **Optional** — `p.optional(p.tool_arg_close(...))` at `chat.cpp:1603` | **Match llama.cpp** — optional in grammar | **Yes** — `xml.Unmarshal` handles both | Some model checkpoints omit closing parameter tags |
-| **Parallel tool calls** | **Yes** — `p.repeat(tool_call, min, max)` (`chat.cpp:1610-1613`) | **Yes** — GBNF repetition rule | **Yes** — parser already loops back to `LookingForToolStart` after each `</tool_call>` | Both support parallel calls |
+| Constraint | llama.cpp (grammar) | Fork: grammar | Notes |
+|------------|---------------------|---------------|-------|
+| **XML structure** — `<tool_call>`, `</tool_call>`, `<function=...>`, `</function>`, `<parameter=...>`, `</parameter>` well-formed | **Yes** | **Yes** — GBNF literals | Grammar prevents malformed tags from ever being generated |
+| **Function name** — only declared tool names | **Yes** — `p.literal(name)` alternation (`chat.cpp:1580`) | **Yes** — literal alternation in GBNF | Highest-value constraint. Prevents phantom function calls. |
+| **Parameter name** — only declared param names | **Yes** — `p.literal(param_name)` per parameter (`chat.cpp:1592`) | **Yes** — literal alternation per tool | Prevents invented parameter names |
+| **Lazy trigger activation** | **Yes** — `grammar_lazy = true`, trigger on `<tool_call>` word (`chat.cpp:1626-1639`) | **Yes** — vendored C++ fully supports this; needs C bridge exposure (~20 lines) | Without lazy, grammar would constrain ALL output including thinking/content |
+| **Unclosed `<tool_call>` / premature EOS** | **Yes** — grammar only allows EOS after complete `</tool_call>` | **Yes** — `root ::= tool-call+` requires at least one complete `<tool_call>...</tool_call>` before EOS is allowed | The model cannot stop mid-tool-call. Grammar forces the full XML structure to completion before end-of-sequence is a valid token. |
+| **Required parameters present** | **Yes** — `p.repeat(arg_rule, 1, 1)` forces exactly-once in declaration order (`chat.cpp:1604`) | **No** — not implementing | Forces fixed parameter ordering which may fight model's learned order |
+| **Optional parameters** | **Yes** — `p.repeat(arg_rule, 0, 1)` | **No** — not implementing | Same ordering concern |
+| **String parameter values** | **Unconstrained** — `p.until_one_of(delimiters)` accepts any text (`chat.cpp:1596-1597`) | **Unconstrained** — free text until `</parameter>` | Neither validates string content against patterns/minLength/maxLength/enum |
+| **Non-string parameter values** (int, number, bool, object, array) | **Yes** — `p.schema()` converts JSON schema to GBNF (`chat.cpp:1599`), using `json-schema-to-grammar.cpp` | **No** — not implementing at grammar level | See Section 3.2 for why we skip this in grammar |
+| **`</parameter>` closing tag** | **Optional** — `p.optional(p.tool_arg_close(...))` at `chat.cpp:1603` | **Match llama.cpp** — optional in grammar | Some model checkpoints omit closing parameter tags |
+| **Parallel tool calls** | **Yes** — `p.repeat(tool_call, min, max)` (`chat.cpp:1610-1613`) | **Yes** — GBNF repetition rule | Both support parallel calls |
 
 ### 3.2 Why We Skip Non-String JSON Schema Constraints in the Grammar
 
@@ -192,11 +193,9 @@ We will NOT replicate this because:
 
 2. **The `build_grammar()` callback API is not exposed to Go.** It's a C++ function that takes a `std::function` callback. Exposing it through CGo requires a C function pointer shim. This is doable (~50-80 lines of new C bridge code that takes tool definitions JSON, builds the grammar internally using `build_grammar()` + `add_schema()`, and returns the complete GBNF string) but adds complexity.
 
-3. **The strict parser catches type mismatches anyway.** The model may waste a few tokens producing an invalid value, but the parser rejects it before propagating. For a well-trained model like Qwen 3.5, non-string type mismatches are rare.
+3. **Diminishing returns.** The two most damaging failure modes — hallucinated function names and hallucinated parameter names — are already blocked by the grammar. A parameter type mismatch is a tolerable imperfection; a phantom function call is not. For a well-trained model like Qwen 3.5, non-string type mismatches are rare in practice.
 
-4. **Diminishing returns.** The two most damaging failure modes — hallucinated function names and hallucinated parameter names — are already blocked by the grammar. A parameter type mismatch is a recoverable error; a phantom function call is not.
-
-**Future option:** If we later want JSON schema constraints, the cleanest path is a new C bridge function `tool_call_grammar_from_json(const char* tools_json)` that takes the Ollama `[]api.Tool` JSON, calls `build_grammar()` internally with `add_rule()` for XML framing and `add_schema()` for parameter schemas, and returns the complete GBNF string. ~50-80 lines of C++. The `json-schema-to-grammar.cpp` code is already vendored and functional — no porting needed.
+**Future option:** If we later want JSON schema constraints for non-string parameter values, the existing `tool_call_grammar_from_json()` in `sampling_ext.cpp` can be extended to call `builder.add_schema(name, param_schema)` for each non-string parameter instead of using the free-text `xml-arg-string` rule. ~20-30 lines. The `json-schema-to-grammar.cpp` code is already vendored and functional.
 
 ### 3.3 Summary
 
@@ -204,19 +203,13 @@ We will NOT replicate this because:
 - Function names are one of the declared tool names (literal alternation)
 - Parameter names are one of the declared parameter names for that function (literal alternation)
 - XML structure is well-formed (`<tool_call>`, `<function=...>`, `<parameter=...>` tags properly nested)
+- Unclosed `<tool_call>` tags are impossible — `root ::= tool-call+` requires at least one complete `<tool_call>...</tool_call>` before end-of-sequence is a valid token. The model cannot stop mid-tool-call.
 - Lazy activation: grammar only constrains output after `<tool_call>` trigger, leaving content/thinking unconstrained
 - Parallel tool calls supported via GBNF repetition
 
-**What the fork WILL enforce at the parser level (after generation — model may waste tokens, but errors are caught):**
-- Function name matches a declared tool (error if not)
-- Parameter names match declared parameters (error if not)
-- Parameter value types match declared schema types (error instead of silent fallback to string)
-- Unclosed `<tool_call>` tags surfaced as errors when generation ends
-- Malformed XML between `<tool_call>` and `</tool_call>` surfaced as errors
-
 **What the fork will NOT enforce (llama.cpp does, but too much work for the return):**
-- JSON schema validation for non-string parameter values at the grammar level (integers producing only digits, booleans only `true`/`false`, etc.). Strict parser catches these after generation.
-- Required parameter completeness at the grammar level (forcing exactly-once in declaration order). Strict parser can validate completeness after parsing.
+- JSON schema validation for non-string parameter values at the grammar level (integers producing only digits, booleans only `true`/`false`, etc.). Type mismatches are rare for well-trained models and are a tolerated tradeoff (see Section 3.2).
+- Required parameter completeness at the grammar level (forcing exactly-once in declaration order). Forces fixed parameter ordering which may fight model's learned order.
 - Required/optional parameter count constraints at the grammar level (same ordering concern).
 
 ---
@@ -232,8 +225,6 @@ We will NOT replicate this because:
 5. From here, every token is constrained: only declared function names, only declared parameter names, well-formed XML tags
 6. Model generates `</tool_call>` — grammar reaches a completion state, allows EOS
 7. Parser receives well-formed tool call, parses it, returns valid `api.ToolCall` to client
-
-The parser is belt-and-suspenders — it validates what the grammar already enforced. In the happy path, the parser should never see an invalid tool call.
 
 ### 4.2 Grammar Dead-End (Bug in Grammar Construction)
 
@@ -273,7 +264,7 @@ GGML_ABORT("grammar error: end of grammar token received but grammar stack is no
 
 This fires if an EOS token is accepted while the grammar hasn't reached a completion state. In practice this means the generation tried to end in the middle of a tool call (e.g., after `<tool_call>` but before `</tool_call>`). The `GGML_ABORT` kills the process — this is a crash, not a graceful error.
 
-**Mitigation:** A correctly-constructed grammar should never hit this — it allows EOS only at valid completion points (after `</tool_call>` or after content with no tool call trigger). But if it does happen, the process crash is the correct signal that the grammar has a bug.
+**Mitigation:** A correctly-constructed grammar prevents this for the active (non-lazy) phase. Once the lazy trigger fires on `<tool_call>` and the grammar becomes active, the `root ::= tool-call+` rule requires at least one complete `<tool_call>...</tool_call>` before end-of-sequence is a valid token — `grammar_apply` sets EOS to `-inf` mid-tool-call, so the sampler cannot select it. (Before the trigger fires, the grammar is in `awaiting_trigger` state and follows a different code path in `llama_grammar_accept_impl` that does not check the grammar stack — so this assertion is not reached.) This assertion should only fire if the grammar itself has a construction bug, in which case the process crash is the correct signal.
 
 ---
 
@@ -360,19 +351,7 @@ In the chat completion handler, after parser initialization (~line 2199-2212), w
 
 The existing `GrammarSampler` creation path at `runner/ollamarunner/runner.go:879-888` handles the rest.
 
-### Step 5: Strict Parser Validation as Defense-in-Depth (~50-100 lines)
-
-**File:** `model/parsers/qwen3coder.go`
-
-Changes to existing parser functions:
-- `parseToolCall()` (line 341): Return an error when `matchedTool == nil` instead of silently accepting
-- `parseToolCall()`: Reject parameters whose names don't match any declared parameter
-- `parseValue()` (line 404): Return errors on type mismatch instead of falling back to raw strings
-- `eat()` (line 150): Surface unclosed `<tool_call>` as an error when `done=true`
-
-This step can be implemented immediately as a standalone improvement, independent of the grammar steps.
-
-### Step 6 (Recommended): Better Dead-End Error Detection (~5 lines)
+### Step 5: Better Dead-End Error Detection (~5 lines)
 
 **File:** `sample/samplers.go`
 
@@ -398,16 +377,14 @@ if allRejected {
 | 2. Go wrapper extension | ~20 | Generic (any model) | TODO |
 | 3. GBNF grammar builder | ~230 (C++) | Generic C bridge | **DONE** (2026-03-07) |
 | 4. Server wiring | ~20 | Qwen-specific | TODO |
-| 5. Strict parser validation | ~50-100 | Qwen-specific | TODO |
-| 6. Dead-end error detection | ~5 | Generic (any model) | TODO |
+| 5. Dead-end error detection | ~5 | Generic (any model) | TODO |
 
 ### Sequencing
 
 - **Step 3 (GBNF grammar builder) is complete** — implemented as C++ in `llama/sampling_ext.cpp`
-- Step 5 (strict parser) can be implemented immediately as a standalone improvement
 - Steps 1-2 (lazy grammar C bridge + Go wrapper) are needed to wire Step 3's output into the sampling pipeline
 - Step 4 (server wiring) depends on Steps 1-2
-- Step 6 (error detection) can be done at any time
+- Step 5 (error detection) can be done at any time
 
 ---
 
@@ -429,9 +406,7 @@ To add JSON schema constraints for non-string parameter values, the existing `to
 | `llama/sampling_ext.h` | ~5 new | Header for lazy grammar init |
 | `llama/llama.go` | ~20 new | Go wrapper for lazy grammar |
 | `sample/samplers.go` | ~25 new | Lazy grammar sampler + dead-end detection |
-| `model/parsers/qwen3coder_grammar.go` | ~150-250 new | GBNF grammar builder from tool schemas |
 | `server/routes.go` | ~20 changed | Wire grammar into tool call path |
-| `model/parsers/qwen3coder.go` | ~50-100 changed | Strict parser validation |
 
 ### Vendored C++ files (read-only reference — already functional)
 
