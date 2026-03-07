@@ -1,7 +1,8 @@
 # Grammar-Constrained Tool Call Generation: Implementation Plan
 
-**Date:** 2026-03-07
-**Fork:** `BigBIueWhale/ollama` @ commit `57e3f80f` (8 commits atop the Ollama `v0.17.4` merge base `cc90a035`)
+**Date:** 2026-03-07 (plan), 2026-03-08 (implementation complete)
+**Fork:** `BigBIueWhale/ollama` @ commit `4044b63f` (11 commits atop the Ollama `v0.17.4` merge base `cc90a035`)
+**Implementation commits:** `b1038b91` (Step 3 GBNF builder), `59d1b367` (header cleanup), `4044b63f` (Steps 1-2, 4-5 + renderer fix)
 **Reference llama.cpp:** `ggml-org/llama.cpp` @ `a0ed91a` (local clone at `/tmp/llama-cpp-latest/`)
 **Vendored llama.cpp in fork:** Effectively at GGML `a5bb8ba4` level (Ollama upstream commit `ef00199f`, with subsequent revert `b1fccabb` that rolled back a b7847 bump)
 
@@ -88,8 +89,8 @@ This callback API is what llama.cpp's `chat.cpp` uses to compose custom XML wrap
 
 ### 2.2 C Bridge — Already Partially Exposed
 
-**File:** `llama/sampling_ext.cpp` (137 lines)
-**Header:** `llama/sampling_ext.h` (47 lines)
+**File:** `llama/sampling_ext.cpp`
+**Header:** `llama/sampling_ext.h`
 
 Currently exposed:
 
@@ -235,9 +236,9 @@ If the grammar has a bug (reaches a state with no valid continuations):
 3. Line 139: `math.IsNaN(float64(sum))` returns `true` → `errors.New("sample: logits sum to NaN, check model output")`
 4. `Sample()` returns the error, which propagates up through the runner
 
-**Current state:** The `NaN` check exists but its error message is misleading ("logits sum to NaN, check model output") — it doesn't mention grammar. This is accidental error detection, not intentional.
+**Previous state:** The `NaN` check existed but its error message was misleading ("logits sum to NaN, check model output") — it didn't mention grammar. This was accidental error detection, not intentional.
 
-**Recommended improvement (~5 lines):** After `s.grammar.Apply(tokens)` at line 76, check if all tokens are `-inf`. If so, return a clear error: `"grammar rejected all tokens — possible grammar construction bug"`. This catches the issue before it becomes a cryptic NaN.
+**Fixed (Step 5, 2026-03-08):** After `s.grammar.Apply(tokens)` at line 76, we now check if all tokens are `-inf` and return a clear error: `"grammar rejected all tokens — grammar may be malformed or the generation reached an impossible state"`. This catches the issue before it becomes a cryptic NaN and benefits all models using grammar-constrained generation.
 
 ### 4.3 Model Outputs Content Only (No Tool Call)
 
@@ -253,7 +254,7 @@ This is the correct behavior when the model decides not to call any tools.
 
 If the user sends both `tools` AND `format` (structured output), both would try to set `req.Grammar`. Currently `format` is handled at `llm/server.go:1539-1558` and tools are handled by the parser at `server/routes.go:2199-2212`.
 
-**Resolution:** When tools are present, the tool call grammar takes precedence. The grammar includes a lazy trigger, so content before `<tool_call>` is unconstrained — the model can produce JSON-formatted content if it wants. If the user specifically needs grammar-constrained JSON AND grammar-constrained tool calls, that's a fundamentally different grammar (not supported in the initial implementation). ~3 lines of conditional logic.
+**Fixed (Step 2, 2026-03-08):** When tools are present, the tool call grammar takes precedence. In `llm/server.go:Completion()`, the Format→Grammar conversion is now guarded by `if req.Grammar == "" && len(req.Format) > 0` — so it only builds a format grammar when no tool grammar was already set. The grammar includes a lazy trigger, so content before `<tool_call>` is unconstrained — the model can produce JSON-formatted content if it wants. If the user specifically needs grammar-constrained JSON AND grammar-constrained tool calls, that's a fundamentally different grammar (not supported).
 
 ### 4.5 Grammar Accepts Token, Then Grammar State Becomes Invalid
 
@@ -272,34 +273,42 @@ This fires if an EOS token is accepted while the grammar hasn't reached a comple
 
 All changes are Qwen-scoped except the thin C bridge extension (step 1-2), which is a generic improvement any model could use.
 
-### Step 1: Extend the C Bridge (~20 lines)
+### Step 1: Extend the C Bridge (~36 lines) --- COMPLETED 2026-03-08
 
 **Files:** `llama/sampling_ext.cpp`, `llama/sampling_ext.h`
 
-Add `grammar_init_lazy` (or extend `grammar_init` with additional parameters):
+Added `grammar_init_lazy` with a simplified signature — `lazy` is implicit (always `true` when calling this function), and `trigger_tokens` was omitted since we only use regex trigger patterns:
 ```c
 struct llama_grammar *grammar_init_lazy(
     char* grammar,
     uint32_t* tokens, size_t n_tokens,
     const char** pieces,
     uint32_t* eog_tokens, size_t n_eog_tokens,
-    bool lazy,
-    const char** trigger_patterns, size_t n_trigger_patterns,
-    llama_token* trigger_tokens, size_t n_trigger_tokens
+    const char** trigger_patterns, size_t n_trigger_patterns
 );
 ```
 
-This calls `llama_grammar_init_impl` with `lazy=true` and the trigger arrays instead of hardcoding `false`/`nullptr`.
+Calls `llama_grammar_init_impl` with `lazy=true`, the trigger patterns array, and `nullptr`/`0` for trigger tokens. Includes null-grammar check, `try/catch` for exception safety, and proper `ollama_vocab` cleanup on failure.
 
-### Step 2: Extend the Go Wrapper (~20 lines)
+> **Implementation note:** The original plan included `bool lazy` and `trigger_tokens` parameters. During implementation, these were dropped for simplicity: `lazy` is always `true` (the non-lazy path already exists via `grammar_init`), and trigger tokens are unnecessary since our trigger mechanism uses regex patterns exclusively.
+
+### Step 2: Extend the Go Wrapper (~58 lines in llama.go, ~30 lines in samplers.go) --- COMPLETED 2026-03-08
 
 **File:** `llama/llama.go`
 
-Add `NewGrammarLazy(grammarStr, vocabIds, pieces, eogTokens, triggerPatterns, triggerTokens)` that calls the new C binding. The lazy grammar behavior is internal to the C++ engine — the existing `Apply`/`Accept` methods on `GrammarSampler` work transparently with lazy grammars because the engine handles trigger detection, buffering, and constraint activation internally.
+Added `NewGrammarLazy(grammar, vocabIds, vocabValues, eogTokens, triggerPatterns)` and `ToolCallGrammarFromJSON(toolsJSON)`. Both `NewGrammar` and `NewGrammarLazy` delegate to a shared private `newGrammar(grammar, vocabIds, vocabValues, eogTokens, triggerPatterns)` — the branch between `grammar_init` and `grammar_init_lazy` is a single `if len(triggerPatterns) > 0` inside the shared function, eliminating all duplicated vocab marshaling code.
+
+`ToolCallGrammarFromJSON` wraps the C++ `tool_call_grammar_from_json()` via CGo — uses a 64KB grammar buffer and 1KB error buffer, returns the GBNF string or an error with the C++ error code and message.
 
 **File:** `sample/samplers.go`
 
-Add `NewGrammarSamplerLazy(...)` that mirrors `NewGrammarSampler` but uses the lazy init path.
+Added `NewGrammarSamplerLazy(tok, grammarStr, triggerPatterns)`. Same consolidation pattern: both `NewGrammarSampler` and `NewGrammarSamplerLazy` delegate to `newGrammarSampler(tok, grammarStr, triggerPatterns)`.
+
+**File:** `llm/server.go`
+
+Added `ToolCallGrammarFromJSON` passthrough (routes.go can't import `llama` directly due to CGo). Added `GrammarTriggerPatterns []string` field to `CompletionRequest`. Added guard `if req.Grammar == "" && len(req.Format) > 0` so Format-derived grammar doesn't overwrite a tool call grammar.
+
+> **Implementation note:** The original plan didn't mention `llm/server.go` changes or the Format→Grammar guard. These were identified during implementation as necessary for correct wiring: `routes.go` needs the passthrough function to avoid importing `llama`, and the Format guard prevents structured output from clobbering the tool grammar when both `tools` and `format` are present in a request.
 
 ### Step 3: Build GBNF Grammar from Tool Schemas (~150-250 lines) --- COMPLETED 2026-03-07
 
@@ -339,52 +348,61 @@ Key decisions (all match the original plan):
 
 **Upstream compatibility note (verified 2026-03-07):** The latest llama.cpp (`c5a7788`) upgraded the trie from `unsigned char` to `uint32_t` for Unicode codepoint support, and refactored the tool grammar builder from inline `chat.cpp` to `chat-peg-parser.cpp` with parameterized XML markers. The public API we depend on (`build_grammar`, `gbnf_format_literal`, `common_grammar_builder` in `json-schema-to-grammar.h`) is byte-for-byte identical. Our trie handles ASCII-only delimiters correctly; the Unicode upgrade would only matter for non-ASCII tool/parameter names.
 
-### Step 4: Wire into the Server (~20 lines)
+### Step 4: Wire into the Server (~59 lines in routes.go, ~6 lines in runner.go) --- COMPLETED 2026-03-08
 
-**File:** `server/routes.go`
+**Files:** `server/routes.go`, `runner/ollamarunner/runner.go`
 
-In the chat completion handler, after parser initialization (~line 2199-2212), when the parser is `"qwen3.5"` (or `"qwen3coder"`) and `len(req.Tools) > 0`:
+In `ChatHandler` at `routes.go`, after parser initialization, gated on `m.Config.Parser == "qwen3.5"` (not `"qwen3coder"` — only Qwen 3.5):
 
-1. Call the grammar builder from step 3 to produce the GBNF string
-2. Set the GBNF string on the `CompletionRequest` so it flows to the runner
-3. Configure lazy trigger on `<tool_call>`
+1. Serialize `req.Tools` to JSON, call `llm.ToolCallGrammarFromJSON()` to build the GBNF string
+2. Select mode-dependent trigger patterns based on `req.Think`:
+   - **Thinking mode** (`req.Think.Bool() == true`): `[\s\S]*</think>[\s\S]*?(<tool_call>[\s\S]*)` — requires `</think>` before `<tool_call>` so the grammar doesn't activate on hallucinated tool calls inside thinking text
+   - **Non-thinking mode** (`req.Think.Bool() == false`): `[\s\S]*?(<tool_call>[\s\S]*)` — no `</think>` required since the renderer prefills `<think>\n\n</think>\n\n` (it's in the prompt, not generated text)
+3. Set `Grammar` and `GrammarTriggerPatterns` on the `CompletionRequest`
 
-The existing `GrammarSampler` creation path at `runner/ollamarunner/runner.go:879-888` handles the rest.
+In `runner.go`, the grammar sampler creation branches on `len(req.GrammarTriggerPatterns) > 0` to choose lazy vs eager grammar initialization.
 
-### Step 5: Better Dead-End Error Detection (~5 lines)
+> **Implementation note:** The original plan did not mention mode-dependent trigger patterns. This was identified during implementation by tracing the Qwen 3.5 renderer's different prefill behavior: thinking mode prefills `<think>\n` (model generates `</think>` in output), non-thinking mode prefills `<think>\n\n</think>\n\n` (`</think>` is in the prompt, not output). A single trigger pattern would either break non-thinking mode (if it requires `</think>`) or activate on hallucinated tool calls inside thinking (if it doesn't). The mode-dependent approach handles both correctly.
+
+> **Scope note:** The plan originally mentioned `"qwen3coder"` as a potential target. During implementation, this was intentionally scoped to `"qwen3.5"` only — Qwen3-Coder uses a different tool call format and would need its own grammar builder.
+
+### Step 5: Better Dead-End Error Detection (~10 lines) --- COMPLETED 2026-03-08
 
 **File:** `sample/samplers.go`
 
 After `s.grammar.Apply(tokens)` at line 76, before calling `s.sample(tokens)`:
 ```go
 allRejected := true
-for _, t := range tokens {
-    if !math.IsInf(float64(t.value), -1) {
+for _, tok := range tokens {
+    if !math.IsInf(float64(tok.value), -1) {
         allRejected = false
         break
     }
 }
 if allRejected {
-    return -1, errors.New("sample: grammar rejected all tokens — grammar may be malformed")
+    return -1, errors.New("sample: grammar rejected all tokens — grammar may be malformed or the generation reached an impossible state")
 }
 ```
+
+This benefits **all models** that use grammar-constrained generation (structured output via JSON format, and now tool call grammars). Previously, a grammar dead-end would produce a cryptic "logits sum to NaN" error via the NaN check at line 149.
 
 ### Total Effort
 
 | Step | Lines | Scope | Status |
 |------|-------|-------|--------|
-| 1. C bridge extension | ~20 | Generic (any model) | TODO |
-| 2. Go wrapper extension | ~20 | Generic (any model) | TODO |
-| 3. GBNF grammar builder | ~230 (C++) | Generic C bridge | **DONE** (2026-03-07) |
-| 4. Server wiring | ~20 | Qwen-specific | TODO |
-| 5. Dead-end error detection | ~5 | Generic (any model) | TODO |
+| 1. C bridge extension | ~36 (C++) | Generic (any model) | **DONE** (2026-03-08) |
+| 2. Go wrapper extension | ~58 (llama.go) + ~30 (samplers.go) + ~25 (server.go) | Generic + Qwen wiring | **DONE** (2026-03-08) |
+| 3. GBNF grammar builder | ~230 (C++) | Qwen 3.5 XML format | **DONE** (2026-03-07) |
+| 4. Server wiring | ~59 (routes.go) + ~6 (runner.go) | Qwen 3.5 only | **DONE** (2026-03-08) |
+| 5. Dead-end error detection | ~10 (samplers.go) | Generic (all models) | **DONE** (2026-03-08) |
 
-### Sequencing
+**Actual total: 8 files changed, +212/-19 lines.** Additional changes beyond the original plan: renderer fix (unconditional `<think>` wrapping in history), Format→Grammar guard, mode-dependent trigger patterns, consolidated Go helpers to eliminate duplication.
 
-- **Step 3 (GBNF grammar builder) is complete** — implemented as C++ in `llama/sampling_ext.cpp`
-- Steps 1-2 (lazy grammar C bridge + Go wrapper) are needed to wire Step 3's output into the sampling pipeline
-- Step 4 (server wiring) depends on Steps 1-2
-- Step 5 (error detection) can be done at any time
+### Bonus: Renderer Fix (not in original plan)
+
+**File:** `model/renderers/qwen35.go`
+
+During implementation, we discovered that the renderer incorrectly gated `<think>...</think>` wrapping of assistant message history on the `isThinking` boolean. The official Qwen 3.5 Jinja2 template unconditionally wraps recent assistant messages in `<think>...</think>` regardless of `enable_thinking`. Both upstream Ollama versions have this bug. Fixed by removing `isThinking &&` from two places (the rendering condition and `splitQwen35ReasoningContent`). This was bug A.2 from `prioritized_research_topics_and_action_items.md`.
 
 ---
 
@@ -398,15 +416,18 @@ To add JSON schema constraints for non-string parameter values, the existing `to
 
 ## Appendix: Key Source Files Reference
 
-### Fork files to modify
+### Fork files modified (all complete)
 
-| File | Lines to Change | What |
-|------|----------------|------|
-| `llama/sampling_ext.cpp` | ~20 new | Lazy grammar init C bridge |
-| `llama/sampling_ext.h` | ~5 new | Header for lazy grammar init |
-| `llama/llama.go` | ~20 new | Go wrapper for lazy grammar |
-| `sample/samplers.go` | ~25 new | Lazy grammar sampler + dead-end detection |
-| `server/routes.go` | ~20 changed | Wire grammar into tool call path |
+| File | Lines Changed | What |
+|------|--------------|------|
+| `llama/sampling_ext.cpp` | +38/-1 | Lazy grammar init C bridge + null-properties fix |
+| `llama/sampling_ext.h` | +7 | Header for lazy grammar init |
+| `llama/llama.go` | +58/-1 | Go wrappers: `NewGrammarLazy`, `ToolCallGrammarFromJSON`, consolidated `newGrammar` |
+| `llm/server.go` | +25/-3 | `ToolCallGrammarFromJSON` passthrough, `GrammarTriggerPatterns` field, Format→Grammar guard |
+| `sample/samplers.go` | +30/-1 | Lazy grammar sampler, dead-end detection, consolidated `newGrammarSampler` |
+| `runner/ollamarunner/runner.go` | +6/-1 | Lazy vs eager grammar sampler branch |
+| `server/routes.go` | +59/-6 | Grammar building, mode-dependent triggers, CompletionRequest wiring |
+| `model/renderers/qwen35.go` | +8/-8 | Unconditional `<think>` wrapping in history (renderer fix) |
 
 ### Vendored C++ files (read-only reference — already functional)
 

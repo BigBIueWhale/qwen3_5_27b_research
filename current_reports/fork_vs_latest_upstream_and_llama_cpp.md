@@ -1,7 +1,7 @@
 # Qwen 3.5 Fork vs Latest Upstream: Comprehensive Research Report
 
-**Date:** 2026-03-06
-**Fork:** `BigBIueWhale/ollama` @ `57e3f80f` (8 commits atop `v0.17.4` merge base `cc90a035`)
+**Date:** 2026-03-08
+**Fork:** `BigBIueWhale/ollama` @ `4044b63f` (11 commits atop `v0.17.4` merge base `cc90a035`)
 **Upstream Ollama (previous):** `82848a78` (analyzed in `fork_vs_upstream_analysis.md`)
 **Upstream Ollama (latest):** `9896e36` (4 commits newer than `82848a78`)
 **llama.cpp (previous):** `d969e933`
@@ -360,7 +360,7 @@ All findings from the previous analysis remain valid:
 | History `<think>` blocks gated on thinking mode | **BROKEN** (gated on `isThinking`) | **BROKEN** (identical code) | **Correct** (template handles it) |
 | Model-specific sampler defaults | Not implemented | Not implemented | **Not implemented** (`common.h:186-198` — same defaults for all models) |
 | Float precision in `tojson` | N/A (Go renderer) | N/A (Go renderer) | **Minor flaw** — 6 sig digits vs Python's ~17 (`value.cpp:1290`) |
-| Tool call parser robustness | **Free-form** — accepts any model output, parses after the fact; malformed tool calls silently produce garbage `api.ToolCall` structs that propagate. **Grammar builder (Step 3) DONE** in `llama/sampling_ext.cpp`. | **Free-form** (identical code) | **Grammar-constrained** — PEG parser forces model to produce syntactically valid tool calls during generation; malformed output is structurally impossible |
+| Tool call parser robustness | Free-form parser + **grammar-constrained generation FULLY DONE** (commit `4044b63f`): lazy GBNF grammar activates on `<tool_call>`, enforces valid function/parameter names and XML structure. Mode-dependent triggers, dead-end detection. | **Free-form** (identical parser code, trusts model output) | **Grammar-constrained** — PEG parser forces model to produce syntactically valid tool calls during generation; malformed output is structurally impossible |
 
 ### 6.2 New Correctness Considerations
 
@@ -376,7 +376,17 @@ The 3 JSON serialization bugs remain unfixed in both the fork and upstream Ollam
 - **Key ordering:** `api/types.go:490-491` declares `Required` before `Properties` — reversed from the official Qwen 3.5 template's `tojson` output. However, `ToolFunctionParameters` is a shared struct used by ALL tool-calling renderers. Python's `tojson` preserves dict insertion order, meaning the `"properties"`-before-`"required"` ordering is specific to how Qwen 3.5's template constructs its dicts. Other models' templates may construct dicts in different orders. Changing this shared struct without verifying every model's template could make serialization WORSE for non-Qwen models. This is not a "swap two fields" fix — it's a design problem requiring either per-model verification or a renderer-local marshaling approach. See Section A.1 in `prioritized_research_topics_and_action_items.md` for the full analysis and required prerequisite research.
 - **Compact separators in tool call arguments:** `formatToolCallArgument` at `qwen3coder.go:250` uses raw `json.Marshal` (compact) for map/list values. This is a separate code path from `marshalWithSpaces` — the tool *definition* rendering has correct spacing, but the tool call *argument* rendering does not. This is the safest bug to fix because `formatToolCallArgument` is only shared across the Qwen model family.
 
-**KV cache round-trip danger:** Sub-bugs A and C have a second, more severe failure mode beyond training distribution shift. In multi-turn conversations with tool calls, the renderer re-serializes tool call arguments from parsed Go types. If the re-serialized bytes don't match what the model originally generated, the KV cache cannot reuse the cached computation — the engine must reprocess everything from the divergence point. For a 20-turn agentic coding conversation with structured tool arguments, this means reprocessing potentially tens of thousands of tokens on every new turn. The user sees progressively slower response times with no visible cause — a scaling catastrophe that is invisible in simple testing because it only manifests at conversation length and produces correct output regardless. Fixing Sub-bug C (spaced JSON) actually *improves* the round-trip (model generates spaced, renderer re-serializes spaced → match), but the fix must be validated end-to-end across the parse→store→re-render cycle.
+**KV cache round-trip danger — empirically verified 2026-03-08:** The full `parseValue()` → Go type → `formatToolCallArgument()` round-trip was tested for every parameter type. Scalar types (`string`, `integer`, `number`, `boolean`, `null`) and untyped parameters all round-trip **perfectly** — no KV cache impact. But every `object` and `array` parameter suffers **3 simultaneous corruptions**:
+
+1. **Spacing removed**: `{"city": "Paris"}` → `{"city":"Paris"}` (every `:` and `,` loses its trailing space)
+2. **Keys alphabetized**: `{"zebra": 1, "apple": 2}` → `{"apple":2,"zebra":1}` (`json.Unmarshal` into `map[string]any` destroys insertion order; `json.Marshal` sorts alphabetically per Go spec)
+3. **HTML escaping injected**: `{"query": "x < 5 & y > 3"}` → `{"query":"x \u003c 5 \u0026 y \u003e 3"}` (Go's `json.Marshal` HTML-safety escaping)
+
+In coding/agentic contexts, `<`, `>`, `&` appear constantly (HTML tags, XML, comparison operators, generic type parameters, logical operators, template syntax). A single parameter like `{"file": "src/App.tsx", "content": "if (x < 5 && y > 3) { ... }"}` suffers all three corruptions simultaneously — the re-rendered prompt is unrecognizable compared to what the model generated.
+
+The KV cache impact: `countCommonPrefix()` at `cache.go:229` does token-by-token comparison and stops at the first mismatch. Everything after the mismatch is reprocessed. In a 20-turn agentic conversation, the first corrupted tool call parameter (which could be in turn 1) forces reprocessing of all subsequent tokens on every new turn — a cost that grows linearly with conversation length. This is invisible in testing because it produces correct output regardless.
+
+Fixing Sub-bug C (spaced JSON) and Sub-bug A (HTML escaping) directly *improves* the round-trip — but key ordering (corruption 2) requires either preserving raw JSON strings through the parse→store→render cycle, or using ordered maps for nested objects. The fix must be validated end-to-end across the parse→store→re-render cycle.
 
 llama.cpp avoids all three JSON serialization bugs by executing the official Jinja2 template directly. Its `tojson` implementation at `common/jinja/value.cpp:179-180` defaults to `", "` and `": "` separators, preserves dict insertion order (at line 1330: `as_ordered_object()` with comment "IMPORTANT: need to keep exact order"), and at lines 1291-1312 writes `<>&` literally without escaping.
 
@@ -438,7 +448,7 @@ The Unsloth Dynamic 2.0 `UD-Q4_K_XL` GGUF at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` 
 
 **Full plan:** See dedicated report [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md).
 
-**Status:** Step 3 (GBNF Grammar Builder) is **DONE** — `tool_call_grammar_from_json()` implemented in `llama/sampling_ext.cpp` (~230 lines C++). Converts a JSON array of tool definitions into a GBNF grammar constraining generation to well-formed Qwen 3.5 XML tool calls. Uses vendored `build_grammar()` + `gbnf_format_literal()` APIs, plus a ported trie-based exclusion pattern generator. Steps 1-2, 4-6 remain.
+**Status: ALL 5 STEPS DONE** (commit `4044b63f`, 8 files, ~212 lines). Full pipeline: C bridge `grammar_init_lazy()`, Go wrappers `NewGrammarLazy()`/`ToolCallGrammarFromJSON()`, server wiring with mode-dependent trigger patterns (thinking mode requires `</think>` before `<tool_call>`), dead-end detection (clear error when grammar rejects all tokens), Format→Grammar guard. The GBNF grammar builder `tool_call_grammar_from_json()` in `llama/sampling_ext.cpp` (~230 lines C++) converts tool definitions into a grammar constraining generation to well-formed Qwen 3.5 XML tool calls.
 
 Ollama's tool call parser is a free-form streaming state machine (`parsers/qwen3coder.go`) that trusts the model to produce well-formed output. llama.cpp builds a PEG grammar from the declared tool schemas (`chat.cpp:1555-1616` at reference commit `a0ed91a`) and applies it as logit masks during generation — the model literally cannot produce malformed tool calls.
 
@@ -501,21 +511,21 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 
 | Priority | Item | Effort | Section |
 |----------|------|--------|---------|
-| **P1** | Fix history `<think>` block rendering — remove `isThinking &&` gate at both `qwen35.go:143` (rendering) and `qwen35.go:65` (extraction) | Small (2 lines) | 9.3 |
+| ~~**P1**~~ **DONE** | ~~Fix~~ Fixed history `<think>` block rendering — removed `isThinking &&` gate at both `qwen35.go:143` (rendering) and `qwen35.go:65` (extraction). Commit `4044b63f`. | Small (2 lines) | 9.3 |
 | **P3** | Verify `Qwen3VLRenderer` thinking variant needs `emitEmptyThinkOnNoThink` | Research | 9.7 |
 
 ### Grammar-Constrained Tool Call Generation (Qwen-Scoped)
 
 | Priority | Item | Effort | Section |
 |----------|------|--------|---------|
-| **P0** | Implement grammar-constrained tool call generation for Qwen 3.5. See dedicated plan: [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md). **Step 3 (GBNF builder) DONE** — `llama/sampling_ext.cpp`. Steps 1-2, 4-6 remain. | Medium (~265-415 lines, Qwen-scoped) | 6.6 |
+| ~~**P0**~~ **DONE** | ~~Implement~~ Implemented grammar-constrained tool call generation for Qwen 3.5. See [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md). **ALL 5 STEPS DONE** — commit `4044b63f`, 8 files, ~212 lines. | Medium (~265-415 est. → ~212 actual) | 6.6 |
 
 ### From Previous Report (Still Open — Revised Effort Estimates)
 
 | Priority | Item | Effort | Section (prev report) |
 |----------|------|--------|----------------------|
-| **P0** | Fix compact separators in `formatToolCallArgument` (Sub-bug C) — Qwen-family-only code, safest to fix, improves KV cache round-trip | Small (but requires KV cache round-trip validation) | 3.1 Bug C |
-| **P0** | Fix HTML escaping in `marshalWithSpaces` + `formatToolCallArgument` (Sub-bug A) — shared infrastructure, verify all callers | Small-Medium (shared function, must verify Olmo3/Qwen3VL callers) | 3.1 Bug A |
+| **P0 CRITICAL** | Fix compact separators in `formatToolCallArgument` (Sub-bug C) — Qwen-family-only code, safest to fix, directly eliminates spacing corruption in KV cache round-trip. Empirically verified: every `object`/`array` param has spacing stripped. | Small (but requires KV cache round-trip validation) | 3.1 Bug C |
+| **P0 CRITICAL** | Fix HTML escaping in `marshalWithSpaces` + `formatToolCallArgument` (Sub-bug A) — shared infrastructure, verify all callers. Empirically verified: `<>&` → `\u003c\u003e\u0026` in every structured arg containing these chars (nearly universal in coding contexts). | Small-Medium (shared function, must verify Olmo3/Qwen3VL callers) | 3.1 Bug A |
 | **P1** | Fix `required`/`properties` key ordering (Sub-bug B) — **DO NOT change the shared struct without per-model template verification** — requires either verifying every model's HuggingFace template or implementing renderer-local marshaling | Medium-High (prerequisite research across all tool-calling models) | 3.1 Bug B |
 | **P2** | Add dedicated prefill bug fix test in `qwen35_test.go` | Small | 1.1 |
 
@@ -527,7 +537,7 @@ The previous report noted this, and it remains true: `llm/server.go:148-152` rej
 | **llama.cpp** | Prompt tokens contaminate penalty sampler ring buffer | Medium (masked by defaults) | 1.11, 6.4 Bug 2 |
 | **llama.cpp** | No model-specific sampler defaults | Low | 6.4 Bug 3 |
 | **llama.cpp** | Float precision loss in `tojson` (6 digits vs 17) | Very Low | 6.4 Bug 4 |
-| **Fork + Upstream Ollama** | Free-form tool call parser silently propagates malformed model output — llama.cpp prevents this via grammar-constrained generation. **Fork fixing this: Step 3 (GBNF builder) DONE**, Steps 1-2, 4-6 remain. See [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md). | Structural limitation (being fixed) | 6.6 |
+| **Upstream Ollama only** | Free-form tool call parser silently propagates malformed model output — llama.cpp prevents this via grammar-constrained generation. **Fork DONE** (commit `4044b63f`). See [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md). | Structural limitation (fixed in fork) | 6.6 |
 | **Unsloth GGUF** | Modified template (defensive `is mapping` + key iteration) — functionally equivalent | Informational | 6.5 |
 
 ---
@@ -662,7 +672,9 @@ if messageThinking != "" {
 
 **Severity:** Medium. The bug only manifests when a user switches `think` between turns in the same conversation. In practice, most users either always use thinking or always don't. But for agentic frameworks that might toggle thinking per-turn for latency reasons, this is a real distribution shift that could degrade quality.
 
-**llama.cpp comparison:** llama.cpp does NOT have this bug for history rendering — it executes the official Jinja2 template directly, which always includes `<think>` blocks for history messages after `last_query_index`. However, llama.cpp has its own generation prompt bug (Section 6.4 Bug 1): it produces `<think>\n</think>` (3 tokens) instead of the official `<think>\n\n</think>\n\n` (6 tokens) for non-thinking mode — a token sequence the model was never trained on. The fork and upstream Ollama have the history rendering bug but produce the correct generation prompt prefill; llama.cpp has the generation prompt bug but correct history rendering.
+**Fix status:** The fork fixed this in commit `4044b63f` — removed `isThinking &&` from both `qwen35.go:143` (rendering condition) and `qwen35.go:65` (`splitQwen35ReasoningContent` no longer takes `isThinking` parameter). The fork's `Qwen35Renderer` now matches the official Jinja2 template exactly. **Upstream Ollama still has this bug.**
+
+**llama.cpp comparison:** llama.cpp does NOT have this bug for history rendering — it executes the official Jinja2 template directly, which always includes `<think>` blocks for history messages after `last_query_index`. However, llama.cpp has its own generation prompt bug (Section 6.4 Bug 1): it produces `<think>\n</think>` (3 tokens) instead of the official `<think>\n\n</think>\n\n` (6 tokens) for non-thinking mode — a token sequence the model was never trained on. Upstream Ollama has the history rendering bug but produces the correct generation prompt prefill; llama.cpp has the generation prompt bug but correct history rendering. **The fork now has both correct** — history rendering fixed (`4044b63f`) and correct generation prompt prefill via `emitEmptyThinkOnNoThink`.
 
 ### 9.4 The `emitEmptyThinkOnNoThink` Field — Correct Implementation
 
@@ -770,5 +782,5 @@ Since Qwen3-Coder models don't have an official `enable_thinking` mechanism in t
 
 | Priority | Item | Effort |
 |----------|------|--------|
-| **P1** | Fix history `<think>` block rendering — remove `isThinking &&` gate at both `qwen35.go:143` (rendering) and `qwen35.go:65` (extraction), matching the official template lines 91-92 and 100 | Small (2 lines) |
+| ~~**P1**~~ **DONE** | ~~Fix~~ Fixed history `<think>` block rendering — removed `isThinking &&` gate at both `qwen35.go:143` and `qwen35.go:65`, matching official template lines 91-92 and 100. Commit `4044b63f`. | Small (2 lines) |
 | **P3** | Verify whether `Qwen3VLRenderer` needs `emitEmptyThinkOnNoThink: true` for the thinking variant | Research |

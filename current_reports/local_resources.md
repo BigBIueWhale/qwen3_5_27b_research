@@ -4,7 +4,7 @@
 
 | Path | Description |
 |------|-------------|
-| `/home/user/shared_vm/ollama/` | **BigBIueWhale/ollama** fork @ `9ec17fc1` — 7 commits atop `v0.17.4` merge (tag `v0.17.4-bbl.5`). Merge base: `cc90a035`. Remote `origin` = `https://github.com/BigBIueWhale/ollama.git`, remote `upstream` = `https://github.com/ollama/ollama.git` |
+| `/home/user/shared_vm/ollama/` | **BigBIueWhale/ollama** fork @ `4044b63f` — 11 commits atop `v0.17.4` merge (tag `v0.17.4-bbl.5`). Merge base: `cc90a035`. Remote `origin` = `https://github.com/BigBIueWhale/ollama.git`, remote `upstream` = `https://github.com/ollama/ollama.git` |
 
 ### Key fork source files
 
@@ -12,12 +12,14 @@
 |------|-------------|
 | `model/models/qwen3next/deltanet.go` | GatedDeltaNet recurrent layer — contains `SetInplace` bug (lines 445-484) |
 | `model/models/qwen3next/model.go` | Qwen3Next model definition — recurrent layer inference, defaults, missing `Validate()` |
-| `model/renderers/qwen3coder.go` | Shared renderer for qwen3-coder and qwen3.5 — tool definitions (XML), thinking, lastQueryIndex |
+| `model/renderers/qwen35.go` | Dedicated `Qwen35Renderer` — JSON tool defs, tools-first ordering, image support, `lastQueryIndex`, unconditional `<think>` wrapping in history (matches official Jinja2 template), prefill bug fix |
+| `model/renderers/qwen3coder.go` | Shared renderer for qwen3-coder — tool definitions (XML), thinking, lastQueryIndex |
 | `model/renderers/qwen3vl.go` | Qwen3VL renderer — prefill fix, `</think>` closure fix |
-| `model/parsers/qwen3coder.go` | Shared parser — thinking support, XML tool call parsing |
-| `model/parsers/parsers.go` | Parser routing — maps `"qwen3.5"` to `Qwen3CoderParser` |
-| `model/renderers/renderer.go` | Renderer routing — maps `"qwen3.5"` to `Qwen3CoderRenderer` |
-| `sample/samplers.go` | Ring buffer penalty sampler — `recordToken()`, `repeatLastN` parameter |
+| `model/parsers/qwen35.go` | Dedicated `Qwen35Parser` — thinking extraction, delegates tool calls to embedded `Qwen3CoderParser` |
+| `model/parsers/qwen3coder.go` | Shared parser for qwen3-coder — thinking support, XML tool call parsing |
+| `model/parsers/parsers.go` | Parser routing — maps `"qwen3.5"` to `Qwen35Parser`, `"qwen3-coder"` to `Qwen3CoderParser` |
+| `model/renderers/renderer.go` | Renderer routing — maps `"qwen3.5"` to `Qwen35Renderer`, `"qwen3-coder"` to `Qwen3CoderRenderer` |
+| `sample/samplers.go` | Ring buffer penalty sampler — `recordToken()`, `repeatLastN` parameter. Grammar sampler with lazy activation support (`NewGrammarSamplerLazy`), dead-end detection (all-tokens-rejected error) |
 | `sample/transforms.go` | Penalty application — `applyPenalties()` |
 | `runner/ollamarunner/runner.go` | Runner — removed `Accept()`/`Reset()`, passes `RepeatLastN` |
 | `convert/convert_qwen3next.go` | GGUF converter — unconditional KV emission |
@@ -25,8 +27,12 @@
 | `tokenizer/special.go` | Special token splitting with `strings.Contains` early-out (perf) |
 | `tokenizer/vocabulary.go` | Stack buffer in `Merge()` BPE hot path (perf) |
 | `api/types.go` | `RepeatPenalty: 1.1` default (line 1066) |
-| `llama/sampling_ext.h` | C bridge header — added `tool_call_grammar_from_json()` declaration + 11 error codes (Step 3 of grammar plan) |
-| `llama/sampling_ext.cpp` | C bridge impl — added `tool_call_grammar_from_json()` (~230 lines): trie-based exclusion patterns, GBNF grammar builder for Qwen 3.5 XML tool calls |
+| `llama/sampling_ext.h` | C bridge header — `grammar_init_lazy()` (dormant grammar with regex triggers), `tool_call_grammar_from_json()` + 11 error codes |
+| `llama/sampling_ext.cpp` | C bridge impl — `grammar_init_lazy()` (~35 lines), `tool_call_grammar_from_json()` (~230 lines): trie-based exclusion patterns, GBNF grammar builder for Qwen 3.5 XML tool calls. Null-properties fix for nil `*ToolPropertiesMap` |
+| `llama/llama.go` | Go wrapper — `NewGrammarLazy()` (lazy grammar creation), `ToolCallGrammarFromJSON()` (grammar from tools JSON), consolidated `newGrammar()` shared helper |
+| `llm/server.go` | `CompletionRequest` with `Grammar` + `GrammarTriggerPatterns` fields, `ToolCallGrammarFromJSON()` passthrough, Format→Grammar guard (`if req.Grammar == ""`) |
+| `server/routes.go` | `ChatHandler` builds tool grammar for `qwen3.5` parser with mode-dependent trigger patterns (thinking: require `</think>` before `<tool_call>`; non-thinking: trigger on first `<tool_call>`) |
+| `runner/ollamarunner/runner.go` | Lazy vs eager grammar branch based on `GrammarTriggerPatterns` |
 
 ---
 
@@ -88,7 +94,7 @@
 |------|-------|-------------|
 | `fork_vs_upstream_analysis.md` | 348 | Fork vs upstream analysis pinned to upstream `82848a78`. Covers what the fork should fix (P0-P3), what upstream should fix, and critical architectural differences (penalty sampling, ring buffer, KV emission). |
 | `fork_vs_latest_upstream_and_llama_cpp.md` | 724 | Fork vs latest upstream Ollama (`9896e36`) and llama.cpp (`a0ed91a`). Covers CUDA async copy, M-RoPE can_shift, speculative decoding, parallelism, vision, sampler, thinking/non-thinking modes, and correctness. |
-| `grammar_constrained_tool_calls_plan.md` | 455 | Dedicated implementation plan for grammar-constrained tool call generation. Covers why (Ollama trusts model, llama.cpp doesn't), full infrastructure audit (what's already in place), constraint comparison table (llama.cpp vs fork), all error handling paths, step-by-step implementation plan (~265-415 lines), and future JSON schema enhancement path. Pinned to llama.cpp reference `a0ed91a`. |
+| `grammar_constrained_tool_calls_plan.md` | ~530 | Implementation plan for grammar-constrained tool call generation — **ALL 5 STEPS DONE** (commit `4044b63f`). Covers why (Ollama trusts model, llama.cpp doesn't), full infrastructure audit, constraint comparison table (llama.cpp vs fork), all error handling paths, step-by-step implementation with actual code details, mode-dependent trigger patterns, dead-end detection, renderer fix. 8 files changed, ~212 lines added. Pinned to llama.cpp reference `a0ed91a`. |
 
 ### Other research documents (parent directory)
 
