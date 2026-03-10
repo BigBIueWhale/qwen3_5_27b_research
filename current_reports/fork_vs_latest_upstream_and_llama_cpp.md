@@ -444,7 +444,13 @@ The Unsloth Dynamic 2.0 `UD-Q4_K_XL` GGUF at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf` 
 
 **Impact on Ollama users:** None. Ollama does not execute the GGUF-embedded Jinja template — it uses its own Go renderers. The GGUF template is only relevant for llama.cpp's `--chat-template` auto-detection.
 
-### 6.6 Tool Call Parser Architecture: Ollama's Free-Form Parser vs llama.cpp's Grammar-Constrained Parser
+### 6.6 Devstral Small 2: Template-Driven Support Is Still Wrong If the Template Path Is Wrong
+
+Devstral Small 2 (`mistralai/Devstral-Small-2-24B-Instruct-2512`, https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512) exposes an important distinction. In our Ollama fork, Devstral still has **less model-specific support machinery** than Qwen 3.5: no dedicated Go renderer, no dedicated Go parser, only template rendering plus the generic template-aware tool parser. That does not make upstream llama.cpp correct; it only means llama.cpp can start from a better scaffold when the GGUF embeds a chat template.
+
+Even with that advantage, upstream llama.cpp is still wrong relative to training for Devstral Small 2. Relative to Mistral's own tokenizer/normalizer implementation in `mistral-common` (https://github.com/mistralai/mistral-common), three mismatches remain: (1) on the default no-system path, the rendered system prompt bytes differ because the Unsloth GGUF's embedded default prompt text is not identical to Mistral's official `2512` prompt text; (2) Mistral v13 normalizes tool-result messages back into original tool-call order, while llama.cpp preserves caller-supplied tool-result order; (3) Mistral supports assistant-prefix / `continue_final_message` semantics, while llama.cpp's chat-template input model does not, so the final assistant turn is closed differently in that edge case. Any one of those is enough to make the format wrong relative to training. The correct conclusion is therefore strict: Devstral Small 2 is not perfectly implemented even in upstream llama.cpp, and our Ollama fork is further from training because Devstral still rides the generic template + generic parser path.
+
+### 6.7 Tool Call Parser Architecture: Ollama's Free-Form Parser vs llama.cpp's Grammar-Constrained Parser
 
 **Full plan:** See dedicated report [`grammar_constrained_tool_calls_plan.md`](grammar_constrained_tool_calls_plan.md).
 

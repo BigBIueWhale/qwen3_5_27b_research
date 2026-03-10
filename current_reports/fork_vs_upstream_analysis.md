@@ -32,6 +32,47 @@ Qwen3-Coder reference: `Qwen/Qwen3-Coder-30B-A3B-Instruct` Jinja2 template ([ver
 
 ---
 
+## Implementation Coverage Note: Manual Go vs Template-Driven Tool Calling
+
+Not every tool-calling model supported in Ollama uses the same implementation strategy. This matters for the JSON round-trip bug and for any future shared serializer changes: some models are fully hand-implemented in Go, while others still rely on model-supplied templates plus Ollama's generic tool parser path.
+
+**Full manual Go renderer + manual Go parser** (`model/renderers/renderer.go`, `model/parsers/parsers.go`):
+- `qwen3.5`
+- `qwen3-coder`
+- `qwen3-vl-instruct`
+- `qwen3-vl-thinking`
+- `lfm2`
+- `lfm2-thinking` / `lfm2.5-thinking`
+- `cogito`
+- `deepseek3.1` renderer + `deepseek3` parser
+- `olmo3`
+- `olmo3.1`
+- `nemotron-3-nano`
+- `functiongemma`
+- `glm-4.7`
+- `glm-ocr`
+
+**Manual Go parser, but prompt rendering still comes from the model template**:
+- `qwen3`
+- `qwen3-thinking`
+- `ministral`
+- `gpt-oss` / `gptoss` (Harmony parser path)
+
+**Template-driven rendering + generic template-aware tool parsing**:
+- `llama3.1`
+- `llama3.2`
+- `mistral`
+- `mistral-nemo`
+- `mistral-small`
+- `mixtral:8x22b`
+- `qwen2`
+- `qwen2.5`
+- `qwq`
+- `granite3.3`
+- `devstral` / `devstral-small-2`
+
+The important Devstral-specific point: **Devstral Small 2 is not implemented as a dedicated Go renderer/parser pair in Ollama.** It follows the template-driven path in `server/prompt.go`, with tool extraction delegated to `tools/template.go` + `tools/tools.go`. That is "string template + generic parser", not "manual Devstral runtime". This is why the model can look superficially supported while still missing training-specific nuances: the installed template can be partially right, but the serving path is only as faithful as the template text plus the generic parser's limited state machine.
+
 ## Part 1: Where the Fork Beats Upstream Ollama
 
 ### 1.1 CRITICAL: Prefill bug fix — upstream Ollama's most dangerous active bug
