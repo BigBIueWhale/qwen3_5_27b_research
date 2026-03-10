@@ -13,7 +13,7 @@
 | `model/models/qwen3next/deltanet.go` | GatedDeltaNet recurrent layer — contains `SetInplace` bug (lines 445-484) |
 | `model/models/qwen3next/model.go` | Qwen3Next model definition — recurrent layer inference, defaults, missing `Validate()` |
 | `model/renderers/qwen35.go` | Dedicated `Qwen35Renderer` — JSON tool defs, tools-first ordering, image support, `lastQueryIndex`, unconditional `<think>` wrapping in history (matches official Jinja2 template), prefill bug fix |
-| `model/renderers/qwen3coder.go` | Shared renderer for qwen3-coder — tool definitions (XML), thinking, lastQueryIndex |
+| `model/renderers/qwen3coder.go` | Shared renderer for qwen3-coder — tool definitions (XML), thinking, lastQueryIndex, Qwen-local structured tool argument serializer with spaced JSON and no HTML escaping |
 | `model/renderers/qwen3vl.go` | Qwen3VL renderer — prefill fix, `</think>` closure fix |
 | `model/parsers/qwen35.go` | Dedicated `Qwen35Parser` — thinking extraction, delegates tool calls to embedded `Qwen3CoderParser` |
 | `model/parsers/qwen3coder.go` | Shared parser for qwen3-coder — thinking support, XML tool call parsing |
