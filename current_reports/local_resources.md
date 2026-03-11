@@ -128,7 +128,7 @@ wget -O /tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf \
 | Path | Description |
 |------|-------------|
 | `/tmp/qwen35-check/` | Minimal uv project (`Python >=3.12`) with `transformers>=5.2.0` and `jinja2>=3.1.6`. Created for fetching/validating Qwen 3.5 chat templates from HuggingFace. |
-| `/tmp/olmo3-check/` | Scratch directory used to verify OLMo tool serialization against official HuggingFace sources. Contains `allenai/Olmo-3-7B-Instruct` `chat_template.jinja`, `config.json`, tokenizer config, model API metadata, and `allenai/Olmo-3.1-32B-Instruct` `chat_template.jinja`. Verification result: the shared `marshalWithSpaces` HTML-escaping fix is **correct in principle** for all current callers of that helper (`qwen3.5`, `qwen3-vl`, `olmo3`) because the official templates use `tools | tojson` for tool definitions. **Important:** this fix is still NOT implemented in the fork as of 2026-03-11. |
+| `/tmp/olmo3-check/` | Scratch directory used to verify OLMo tool serialization against official HuggingFace sources. Contains `allenai/Olmo-3-7B-Instruct` `chat_template.jinja`, `config.json`, tokenizer config, model API metadata, and `allenai/Olmo-3.1-32B-Instruct` `chat_template.jinja`. Verification result: the shared tool-definition HTML-escaping fix is **correct in principle** for all current `marshalWithSpaces` callers (`qwen3.5`, `qwen3-vl`, `olmo3`) because the official templates use `tools | tojson` for tool definitions. **Important:** this fix is still NOT implemented in the fork as of 2026-03-11, and failed implementation attempts showed that changing `marshalWithSpaces` alone is insufficient — nested/custom `MarshalJSON` boundaries in `api/types.go` still HTML-escape nested tool-definition fields. |
 
 ---
 
