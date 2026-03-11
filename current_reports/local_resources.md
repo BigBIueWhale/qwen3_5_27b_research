@@ -13,7 +13,7 @@
 | `model/models/qwen3next/deltanet.go` | GatedDeltaNet recurrent layer — contains `SetInplace` bug (lines 445-484) |
 | `model/models/qwen3next/model.go` | Qwen3Next model definition — recurrent layer inference, defaults, missing `Validate()` |
 | `model/renderers/qwen35.go` | Dedicated `Qwen35Renderer` — JSON tool defs, tools-first ordering, image support, `lastQueryIndex`, unconditional `<think>` wrapping in history (matches official Jinja2 template), prefill bug fix |
-| `model/renderers/qwen3coder.go` | Shared renderer for qwen3-coder — tool definitions (XML), thinking, lastQueryIndex, Qwen-local structured tool argument serializer with spaced JSON and no HTML escaping |
+| `model/renderers/qwen3coder.go` | Shared renderer for qwen3-coder — XML tool definitions, thinking, lastQueryIndex, Qwen-local structured tool argument serializer with spaced JSON and no HTML escaping. **Known remaining qwen3-coder-only fidelity gaps:** `renderAdditionalKeys()` still emits compact/HTML-escaped nested JSON instead of the template's `render_extra_keys(... | tojson | safe)` behavior, and multi-type `type` fields still use JSON serialization instead of the template's Python string formatting. |
 | `model/renderers/qwen3vl.go` | Qwen3VL renderer — prefill fix, `</think>` closure fix |
 | `model/parsers/qwen35.go` | Dedicated `Qwen35Parser` — thinking extraction, delegates tool calls to embedded `Qwen3CoderParser` |
 | `model/parsers/qwen3coder.go` | Shared parser for qwen3-coder — thinking support, XML tool call parsing |
@@ -26,7 +26,7 @@
 | `server/prompt.go` | Binary search prompt truncation (perf) |
 | `tokenizer/special.go` | Special token splitting with `strings.Contains` early-out (perf) |
 | `tokenizer/vocabulary.go` | Stack buffer in `Merge()` BPE hot path (perf) |
-| `api/types.go` | `RepeatPenalty: 1.1` default (line 1066) |
+| `api/types.go` | `RepeatPenalty: 1.0` default (line 1066) |
 | `llama/sampling_ext.h` | C bridge header — `grammar_init_lazy()` (dormant grammar with regex triggers), `tool_call_grammar_from_json()` + 11 error codes |
 | `llama/sampling_ext.cpp` | C bridge impl — `grammar_init_lazy()` (~35 lines), `tool_call_grammar_from_json()` (~230 lines): trie-based exclusion patterns, GBNF grammar builder for Qwen 3.5 XML tool calls. Null-properties fix for nil `*ToolPropertiesMap` |
 | `llama/llama.go` | Go wrapper — `NewGrammarLazy()` (lazy grammar creation), `ToolCallGrammarFromJSON()` (grammar from tools JSON), consolidated `newGrammar()` shared helper |
@@ -128,7 +128,7 @@ wget -O /tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf \
 | Path | Description |
 |------|-------------|
 | `/tmp/qwen35-check/` | Minimal uv project (`Python >=3.12`) with `transformers>=5.2.0` and `jinja2>=3.1.6`. Created for fetching/validating Qwen 3.5 chat templates from HuggingFace. |
-| `/tmp/olmo3-check/` | Scratch directory used to verify OLMo tool serialization against official HuggingFace sources. Contains `allenai/Olmo-3-7B-Instruct` `chat_template.jinja`, `config.json`, tokenizer config, model API metadata, and `allenai/Olmo-3.1-32B-Instruct` `chat_template.jinja`. Verification result: the shared tool-definition HTML-escaping fix is **correct in principle** for all current `marshalWithSpaces` callers (`qwen3.5`, `qwen3-vl`, `olmo3`) because the official templates use `tools | tojson` for tool definitions. **Important:** this fix is still NOT implemented in the fork as of 2026-03-11, and failed implementation attempts showed that changing `marshalWithSpaces` alone is insufficient — nested/custom `MarshalJSON` boundaries in `api/types.go` still HTML-escape nested tool-definition fields. |
+| `/tmp/olmo3-check/` | Scratch directory used to verify OLMo tool serialization against official HuggingFace sources. Contains `allenai/Olmo-3-7B-Instruct` `chat_template.jinja`, `config.json`, tokenizer config, model API metadata, and `allenai/Olmo-3.1-32B-Instruct` `chat_template.jinja`. Verification result: the shared tool-definition HTML-escaping fix is correct for all current `marshalWithSpaces` callers (`qwen3.5`, `qwen3-vl`, `olmo3`) because the official templates use `tools | tojson` for tool definitions. This fix is now implemented in the fork across both `marshalWithSpaces` and the nested/custom `MarshalJSON` boundaries in `api/types.go` / `internal/orderedmap`. |
 
 ---
 
