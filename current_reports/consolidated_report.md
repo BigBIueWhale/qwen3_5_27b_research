@@ -87,8 +87,6 @@ This treats any last assistant message as a prefill, **including messages with t
 
 The official Qwen 3.5 Jinja2 template **always** emits `<|im_end|>` after every assistant message, regardless of tool calls. The `add_generation_prompt` flag is a separate concern — it controls whether `<|im_start|>assistant\n<think>\n` is appended at the end, independently of message closures. Ollama's prefill conflates two things (omitting `<|im_end|>` for streaming continuation, and skipping the generation prompt) that should be independent.
 
-**Test coverage gap:** The fork's single differentiating line (`qwen35.go:136`: `&& len(message.ToolCalls) == 0`) currently has no dedicated test in the `qwen35_test.go` suite; it is only tested indirectly via `qwen3coder_test.go:327-376`.
-
 ### 1.2 MEDIUM: `</think>` Not Closed When Content Is Empty in `Qwen3VLRenderer`
 
 **Fault: Upstream Ollama (`82848a78` through `9896e36`, still unfixed).** The fork correctly fixed this in commit `fbae6976`. This no longer affects Qwen 3.5 (which uses its own dedicated `Qwen35Renderer`, which always closes `</think>` at line 144). But `Qwen3VLRenderer` is still used by `qwen3-vl-instruct` and `qwen3-vl-thinking`, where this bug remains live in upstream Ollama.
@@ -710,7 +708,6 @@ llama.cpp demonstrates this works using `split_equal(n_ubatch, true)` — per-se
 | Issue | Impact | Status |
 |-------|--------|--------|
 | JSON serialization key ordering in `ToolFunctionParameters` | Remaining distribution shift on tool-definition key ordering | **OPEN** |
-| Prefill test gap — `qwen35.go:136` has no dedicated test | Risk of regression | **OPEN** |
 
 ### Performance Opportunities
 
@@ -785,7 +782,6 @@ Ollama bundles vision tensors into the main GGUF (1307 tensors). llama.cpp uses 
 | **P0** | Adopt CUDA async copy + reduced sync from `ggml-cuda.cu` and `ggml-backend.cpp` | Medium (2 files, conflict resolution) | **OPEN** |
 | **P1** | Fix `required`/`properties` key ordering in `ToolFunctionParameters` — requires per-model template verification or renderer-local marshaling | Medium-High | **OPEN** |
 | **P1** | Adopt M-RoPE `can_shift()` guard in vendored `llama-kv-cache.cpp` | Small (3 lines) | **OPEN** |
-| **P2** | Add dedicated prefill bug fix test in `qwen35_test.go` | Small | **OPEN** |
 | **P2** | Increase `num_batch` to 2048 in the Modelfile | Zero (config-only) | **OPEN** |
 | **P3** | Verify `Qwen3VLRenderer` thinking variant needs `emitEmptyThinkOnNoThink: true` | Research | **OPEN** |
 | **P3** | Verify Qwen 3.5 model family size diversity (0.8B through 397B) | Small | **OPEN** |
