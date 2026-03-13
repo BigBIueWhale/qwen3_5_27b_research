@@ -85,7 +85,7 @@ This treats any last assistant message as a prefill, **including messages with t
 
 **When does this trigger?** Any time a client sends a chat request where the last message is an assistant message with tool calls populated: a client replays a conversation from saved history that ended at a tool-call boundary, an agent framework constructs the message list with the assistant's tool-call message last, or the fork's own test suite (`qwen3coder_test.go:327-376`) proves this is an expected and tested input shape.
 
-The official Qwen 3.5 Jinja2 template **always** emits `<|im_end|>` after every assistant message, regardless of tool calls. The `add_generation_prompt` flag is a separate concern — it controls whether `<|im_start|>assistant\n<think>\n` is appended at the end, independently of message closures. Ollama's prefill conflates two things (omitting `<|im_end|>` for streaming continuation, and skipping the generation prompt) that should be independent.
+The official Qwen 3.5 Jinja2 template emits `{{- '<|im_end|>\n' }}` for every assistant message — this line appears outside any conditional block in the template and runs unconditionally regardless of tool calls, thinking mode, message position, or any other state. The `add_generation_prompt` flag is a separate concern — it controls whether `<|im_start|>assistant\n<think>\n` is appended after all messages, independently of message closures. Ollama's prefill conflates two things (omitting `<|im_end|>` for streaming continuation, and skipping the generation prompt) that the official template keeps strictly independent. The `len(message.ToolCalls) == 0` guard restores the separation: assistant messages with tool calls are complete turns (always closed), while assistant messages without tool calls may be prefills (left open for continuation).
 
 ### 1.2 MEDIUM: `</think>` Not Closed When Content Is Empty in `Qwen3VLRenderer`
 
@@ -235,10 +235,10 @@ The `Qwen3CoderRenderer` injects `"You are Qwen, a helpful AI assistant..."` whe
 Both the fork (before `4044b63f`) and upstream Ollama gate the rendering of `<think>` blocks in assistant message history on `isThinking` (controlled by the API's `think: true/false` parameter). This is a two-part bug.
 
 **Part 1 — Rendering condition at `qwen35.go:143`:**
-The official template at line 100 uses only `{%- if loop.index0 > ns.last_query_index %}` — no `enable_thinking` check. Assistant messages after `last_query_index` ALWAYS include `<think>` blocks regardless of whether thinking is enabled for the current turn.
+The official template's `enable_thinking` parameter is checked in exactly one place — the `add_generation_prompt` block at the end of the template (see Section 3.1). It does not appear anywhere in the message rendering loop. The rendering condition for `<think>` blocks uses only `{%- if loop.index0 > ns.last_query_index %}` — no `enable_thinking` check. Assistant messages after `last_query_index` ALWAYS include `<think>` blocks regardless of whether thinking is enabled for the current turn. This also applies to messages with empty reasoning: when `reasoning_content` is an empty string, the template produces `<think>\n\n</think>\n\n` (an empty think block), not a bare message without think tags.
 
 **Part 2 — Reasoning extraction at `qwen35.go:65`:**
-The official template at lines 91-92 always uses `reasoning_content` when it exists as a string — no `enable_thinking` check. When `isThinking=false` and `messageThinking` is non-empty, the old code ignores the stored thinking field and falls through to content parsing, which typically finds nothing. The reasoning is silently lost.
+The official template always uses `reasoning_content` when it exists as a string (`message.reasoning_content is string`) — no `enable_thinking` check. In Jinja2, an empty string `""` passes the `is string` test, so path 1 is taken even for messages with no reasoning. When `isThinking=false` and `messageThinking` is non-empty, the old code ignores the stored thinking field and falls through to content parsing, which typically finds nothing. The reasoning is silently lost.
 
 **The fix** (two lines in `model/renderers/qwen35.go`):
 1. Line 65: `splitQwen35ReasoningContent(content, messageThinking string)` — removed `isThinking` parameter
@@ -277,14 +277,18 @@ The `Qwen35Parser` has a 3-state thinking machine (`CollectingThinking` → `Thi
 
 ### 3.1 The Official Template: One Template, Two Modes
 
-The official Qwen 3.5 Jinja2 template uses a single `enable_thinking` parameter that affects **only the generation prompt prefill**:
+The official Qwen 3.5 Jinja2 template (identical across `Qwen/Qwen3.5-27B` and `Qwen/Qwen3.5-35B-A3B` on HuggingFace) receives `enable_thinking` as a per-request template parameter. It is checked in **exactly one place** in the entire template — the `add_generation_prompt` block at the very end:
 
 | `enable_thinking` | Generation Prompt Prefill | Model Behavior |
 |-------------------|-------------------------|----------------|
 | `true` (or undefined — **default**) | `<|im_start|>assistant\n<think>\n` | Model generates reasoning inside `<think>...</think>`, then content |
 | `false` | `<|im_start|>assistant\n<think>\n\n</think>\n\n` | Empty think block → model generates content directly |
 
+`enable_thinking` does **not** appear anywhere in the message rendering loop. Historical assistant messages are **never gated** by `enable_thinking`. They receive `<think>` block wrapping based solely on their position relative to `last_query_index` — if a message appears after the last real user query, it gets `<think>\nreasoning\n</think>\n\n` wrapping unconditionally, even if `enable_thinking` is `false`, and even if the reasoning content is empty (producing `<think>\n\n</think>\n\n`). The `<|im_end|>` tag that closes each assistant message is also emitted unconditionally — it appears outside any conditional block and runs for every assistant message regardless of thinking mode, tool calls, or message position.
+
 There are **no `/think` or `/no_think` tokens**, no special token IDs for mode switching. The `<think>` and `</think>` are token IDs 248068-248069 in the vocabulary, marked as `"special": false` — regular tokens. The mode is determined entirely by the prefill.
+
+Reasoning content is extracted from each historical assistant message via two paths in the official template: (1) an explicit `reasoning_content` field on the message (checked via `message.reasoning_content is string`), or (2) a fallback that parses inline `<think>...</think>` tags from the message content. Path 1 takes priority. Note that in Jinja2, an empty string `""` passes the `is string` test, so a message with `reasoning_content: ""` takes path 1 (using the empty string directly) and does NOT fall through to content parsing.
 
 ### 3.2 The `emitEmptyThinkOnNoThink` Field — Correct Implementation
 
@@ -311,6 +315,160 @@ The `Qwen35Parser.Init()` correctly starts in `CollectingThinking` state when `t
 ### 3.5 Fork's Qwen3CoderRenderer Thinking Asymmetry
 
 The fork added thinking support to `Qwen3CoderRenderer` (in commit `fbae6976`) that upstream lacks. The fork supports thinking for `qwen3-coder` models if the `think: true` API parameter is passed. Upstream silently ignores `think: true` for qwen3-coder. Since Qwen3-Coder models don't have an official `enable_thinking` mechanism in their Jinja2 template, this is an extension beyond the training data.
+
+---
+
+## Part 3B: No Input Validation — Callers Can Silently Produce Prompts the Model Was Never Trained On
+
+### Why This Section Exists
+
+Every fix documented in this report — the prefill bug fix (Section 1.1), the unconditional `<think>` block rendering (Section 2.5), the HTML-escaping fix (Part 4), the grammar-constrained tool call generation (Part 5) — exists to ensure the Go renderer produces byte-identical prompts to what the official Qwen 3.5 Jinja2 template produces. But all of these fixes assume the caller sends a valid conversation. If the caller sends an invalid conversation — a system message at position 3, two user messages in a row, an assistant message with `Role: "function"`, an empty function name in a tool call — the renderer does not reject it. It silently renders whatever it receives into a prompt string that the model will process. The resulting prompt is a token sequence absent from all training data, and the model's behavior on it is undefined. This is the same class of problem that template fidelity fixes solve (training distribution shift, KV cache invalidation), except it originates from the caller rather than from the renderer.
+
+The official Qwen 3.5 Jinja2 template (from `Qwen/Qwen3.5-27B` and `Qwen/Qwen3.5-35B-A3B` on HuggingFace) defends against this with 8 explicit `raise_exception()` calls that reject invalid input with clear error messages. The `BigBIueWhale/ollama` fork — and upstream `ollama/ollama` — have none. There is no `Validate()` method on `api.Message`, no `ChatRequest.Validate()` method, no validation middleware between the HTTP endpoint at `server/routes.go` and the `Qwen35Renderer.Render()` call, and no validation inside the renderer itself. The renderer is a pure pass-through: it accepts any message array and renders it into a prompt string without checking whether that prompt string represents a conversation the model was trained to handle.
+
+### The 8 Rejections in the Official Qwen 3.5 Jinja2 Template
+
+The official template calls `raise_exception()` — a hard error that halts template rendering — in 8 places. Each rejection prevents a specific category of invalid input from reaching the model.
+
+**Rejection 1 — No messages provided.**
+Condition: the `messages` parameter is empty, falsy, or not provided. Error: `"No messages provided."` The Ollama `ChatHandler` at `server/routes.go:2178` does check `len(req.Messages) == 0` and returns early, so this specific case is handled — but at the HTTP handler level, not in the renderer. If a code path calls `Render()` directly (for example, the KV cache round-trip tests in `server/qwen35_kvcache_roundtrip_test.go`), no such check exists.
+
+**Rejection 2 — System message must be at the beginning.**
+Condition: a message with `role == "system"` appears at any position other than index 0 in the message array. Error: `"System message must be at the beginning."` The `Qwen35Renderer` at `model/renderers/qwen35.go:138` handles non-first system messages by rendering them as `<|im_start|>system\n...` tags in the conversation body — a valid-looking but training-absent prompt shape. No error is returned. A caller that accidentally includes a system message mid-conversation (for example, by prepending model-specific instructions to each turn) would silently corrupt the prompt.
+
+**Rejection 3 — No user query found.**
+Condition: after scanning all messages in reverse, every user message has content that starts with `<tool_response>` and ends with `</tool_response>` — meaning no user message contains an actual human query. Error: `"No user query found in messages."` The `Qwen35Renderer` at `model/renderers/qwen35.go:114-127` performs the same backwards scan to find `lastQueryIndex`, but if no real user query is found, `lastQueryIndex` stays at `len(messages) - 1` (the initial value) and the renderer silently proceeds. The consequence is that no assistant messages receive `<think>` block wrapping (since none are positioned after `lastQueryIndex`), which may or may not match the model's expectations — but the fundamental problem is that the conversation is semantically meaningless (all human input is tool responses with no originating query), and the renderer should refuse it.
+
+**Rejection 4 — Unexpected message role.**
+Condition: a message has a `role` field that is not one of `"system"`, `"user"`, `"assistant"`, or `"tool"`. Error: `"Unexpected message role."` The `Qwen35Renderer` at `model/renderers/qwen35.go:130-180` checks each role with `if`/`else if` chains. A message with `Role: "function"` (the OpenAI-legacy role name) or `Role: "developer"` (the OpenAI-new role name) or any typo would match none of the branches and be silently dropped — not rendered at all, with no error. The caller would not know their message was ignored. The `api.Message.UnmarshalJSON()` method at `api/types.go:228` normalizes the role to lowercase (`m.Role = strings.ToLower(m.Role)`) but does not validate it against the set of allowed values.
+
+**Rejection 5 — System message cannot contain images.**
+Condition: a system message's content includes an image item (detected by `'image' in item` or `item.type == 'image'`). Error: `"System message cannot contain images."` The `Qwen35Renderer.renderContent()` method at `model/renderers/qwen35.go:47-61` renders images unconditionally for any message, including system messages. If a caller sends a system message with images, the renderer would embed `<|vision_start|><|image_pad|><|vision_end|>` tokens inside the system prompt — a prompt shape that does not exist in the Qwen 3.5 training data.
+
+**Rejection 6 — System message cannot contain videos.**
+Same as Rejection 5 but for video content. Same silent acceptance in the fork.
+
+**Rejection 7 — Unexpected item type in content.**
+Condition: a message's content is an iterable (list/sequence) containing an item that is not an image, video, or text type. Error: `"Unexpected item type in content."` The `Qwen35Renderer.renderContent()` method does not iterate over content items at all — it only checks the `Images` field on the message struct and then writes `content.Content` as a string. This is safe by construction in Go (the struct schema prevents arbitrary item types), but the protection comes from the Go type system, not from explicit validation.
+
+**Rejection 8 — Unexpected content type.**
+Condition: a message's content is not a string, iterable, None, or undefined. Error: `"Unexpected content type."` Same as Rejection 7 — the Go struct schema prevents this at the type level.
+
+### What the Fork Silently Accepts Beyond the 8 Rejections
+
+The official template's 8 rejections are explicit error checks. But the template also makes implicit assumptions that the fork does not enforce:
+
+**Multiple system messages.** The official template rejects any system message after index 0 (Rejection 2). The `Qwen35Renderer` at `model/renderers/qwen35.go:138` renders non-first system messages as system-role messages in the conversation body: `<|im_start|>system\n[content]<|im_end|>\n`. This is syntactically valid ChatML but semantically meaningless — the model was trained with at most one system message at the start of the conversation.
+
+**Non-alternating message roles.** The official template does not explicitly check for alternation (user → assistant → user → ...), but the Qwen 3.5 model was trained exclusively on conversations that follow this pattern (with tool messages interleaving after assistant tool-call messages). Two consecutive user messages, two consecutive assistant messages, or a tool message not preceded by an assistant message with tool calls — all render without error in the fork.
+
+**Empty function names in tool calls.** The `Qwen35Renderer` at `model/renderers/qwen35.go:159` concatenates `"<function=" + toolCall.Function.Name + ">"` without checking that `Name` is non-empty. An empty name produces `<function=>` — malformed XML that the model was never trained on and that the grammar-constrained tool call generation (Part 5) would never produce.
+
+**Tool calls with missing or extra parameters.** The renderer iterates `toolCall.Function.Arguments.All()` and renders whatever is present. It does not validate arguments against the tool's declared `required` parameters or `properties` schema. A tool call missing a required parameter renders without error, producing a prompt where the model sees a tool invocation that violates the tool's own schema — something it was trained to never produce.
+
+**Assistant messages with both `Thinking` field AND inline `<think>` tags in `Content`.** The `splitQwen35ReasoningContent` function at `model/renderers/qwen35.go:64-79` prioritizes the `Thinking` field (path 1) and silently ignores inline `<think>` tags in `Content` when both are present. This is correct behavior (matching the official template's `reasoning_content` priority), but no diagnostic is emitted. A caller that accidentally populates both fields would not know the inline tags are being ignored.
+
+### The Architectural Problem: Validation Requires the Same State That Rendering Computes
+
+Adding input validation is not a simple matter of inserting a check before the renderer call. The Ollama renderer architecture fuses two concerns into a single `Render()` method: (1) computing structural properties of the conversation (the `lastQueryIndex` position, the system message location, the tool response grouping, the image offset tracking), and (2) using those properties to emit the prompt string. Validation needs the same structural properties — but uses them to check invariants instead of emitting text.
+
+**State that both validation and rendering need to compute:**
+
+| Structural property | Where rendered | What validation would check |
+|---|---|---|
+| `lastQueryIndex` — position of last non-tool-response user message | `qwen35.go:114-127` (backward scan with `renderContent()` calls to check `<tool_response>` wrapping) | Whether any real user query exists at all (official template Rejection 3) |
+| System message position | `qwen35.go:100-112` (checks `messages[0].Role == "system"`) | Whether system messages appear only at index 0 (Rejection 2), whether multiple system messages exist |
+| Message role sequence | `qwen35.go:130-180` (the main loop dispatches on role) | Whether all roles are valid (Rejection 4), whether roles alternate correctly, whether tool messages follow assistant messages with tool calls |
+| Tool call structure | `qwen35.go:149-166` (iterates `toolCall.Function.Name` and `Arguments.All()`) | Whether function names are non-empty, whether required parameters are present |
+| Content type and structure | `qwen35.go:47-61` (`renderContent()` processes images and text) | Whether system messages contain images or videos (Rejections 5 and 6) |
+| Tool response grouping | `qwen35.go:172-179` (consecutive tool messages are grouped under one `<|im_start|>user` tag) | Whether tool messages appear in valid positions |
+
+If validation is implemented as a separate function that runs before `Render()`, it must re-walk the entire message array and recompute all of these properties. This is not a trivial duplication — the `lastQueryIndex` computation alone requires calling `renderContent()` on every user message to check whether its content starts with `<tool_response>` and ends with `</tool_response>`, which means the content rendering logic is also duplicated.
+
+If validation is instead embedded inside `Render()` (returning errors through the existing `(string, error)` return signature), the duplication is avoided — but the validation logic becomes interleaved with rendering logic, making both harder to test independently. And there is a performance concern: `Render()` is called multiple times per request inside the `fitsContext()` binary search loop at `server/prompt.go:45-70`, which iteratively truncates the message array to fit the model's context window. Validation would run on every iteration of this loop, even though the structural validity of the message array does not change between iterations (only the number of messages included changes).
+
+The clean architecture would separate the `Render()` method into three phases:
+
+1. **Analyze** — walk the message array once and compute all structural properties (`lastQueryIndex`, system message positions, role sequence, tool call completeness, image offsets) into a structured intermediate representation.
+2. **Validate** — check the intermediate representation against the model's rules. Return errors for violations. This phase is skipped on subsequent `fitsContext()` iterations since the structural properties of the full message array do not change.
+3. **Render** — use the intermediate representation to emit the prompt string. This phase runs on each `fitsContext()` iteration with a potentially truncated message subset.
+
+Currently, phases 1 and 3 are fused together inside `Render()`, and phase 2 does not exist. This fusion exists in all three Qwen-family renderers (`Qwen35Renderer`, `Qwen3CoderRenderer`, `Qwen3VLRenderer`) and in every other renderer in Ollama (Cogito, DeepSeek, Olmo3, Nemotron, GLM, FunctionGemma — none implement any validation). Refactoring to the three-phase architecture would require changing the `Renderer` interface (currently `Render(messages, tools, think) (string, error)` — a single method that creates a new renderer instance on every call at `renderer.go:38`) or introducing a new interface alongside it.
+
+### Scope of Validation Rules
+
+The validation rules fall into two tiers: universal rules that apply to every model family, and model-specific rules that depend on the official Jinja2 template's assumptions.
+
+**Tier 1 — Universal rules (apply to all models):**
+
+| Rule | Official template error | Current fork behavior |
+|---|---|---|
+| Messages array must not be empty | `"No messages provided."` | `ChatHandler` returns early at `routes.go:2178`; renderer silently returns empty string |
+| Every message role must be one of `system`, `user`, `assistant`, `tool` | `"Unexpected message role."` | Unknown roles silently dropped from prompt — message is not rendered, no error |
+| System message must be the first message (if present) | `"System message must be at the beginning."` | Non-first system messages rendered as `<\|im_start\|>system\n...` in conversation body |
+| System messages must not contain images | `"System message cannot contain images."` | Images in system messages rendered as `<\|vision_start\|>` tokens inside system prompt |
+| System messages must not contain videos | `"System message cannot contain videos."` | Videos in system messages rendered as `<\|vision_start\|>` tokens inside system prompt |
+
+**Tier 2 — Model-specific rules (Qwen 3.5 official template):**
+
+| Rule | Official template behavior | Current fork behavior |
+|---|---|---|
+| At least one user message must contain a real query (not just `<tool_response>` wrappers) | `"No user query found in messages."` | `lastQueryIndex` stays at `len(messages)-1`, no `<think>` blocks rendered, no error |
+| Tool call function names must be non-empty | Template would produce `<function=>` (malformed) | Renders `<function=>` — malformed XML the model was never trained on |
+| Messages should alternate roles (user → assistant → user), with tool messages interleaving after assistant tool-call messages | Not explicitly checked, but the model was trained exclusively on this pattern | Any sequence of roles accepted — two user messages in a row, two assistant messages in a row, all render without error |
+| Tool messages should follow assistant messages that contain tool calls | Not explicitly checked, but the template's tool response grouping logic assumes this | Tool messages in any position are rendered as `<tool_response>` blocks |
+| At most one system message should exist in the conversation | Enforced by Rejection 2 (any non-first system message raises an error) | Multiple system messages rendered — first one in system prompt block, subsequent ones as system-role messages in conversation body |
+| Assistant messages with tool calls should not have `Thinking` content stored in both the `Thinking` field and as inline `<think>` tags in `Content` | Template prioritizes `reasoning_content` field over inline tags (path 1 vs path 2) | Same priority (correct), but no diagnostic that the caller is sending redundant data |
+
+**Tier 3 — Structural invariants for the grammar-constrained tool call pipeline (Part 5):**
+
+The grammar-constrained tool call generation pipeline (commits `b1038b91`, `59d1b367`, `4044b63f`) builds a GBNF grammar from the tool definitions at `server/routes.go:2223-2254`. This pipeline has its own validation requirements that the C++ `tool_call_grammar_from_json()` function at `llama/sampling_ext.cpp` partially enforces (12 defensive checks), but the Go caller does not validate before calling:
+
+| Rule | C++ enforcement | Go caller enforcement |
+|---|---|---|
+| Tool definitions JSON must be a valid JSON array | C++ returns error code 2 (`TOOL_CALL_GRAMMAR_INVALID_JSON`) | No pre-validation — error surfaces as grammar build failure |
+| Each tool must have a non-empty `function.name` | C++ returns error code 6 (`TOOL_CALL_GRAMMAR_EMPTY_NAME`) | No pre-validation |
+| Function names must not contain null bytes or characters forbidden in GBNF rule names | C++ returns error code 8 (`TOOL_CALL_GRAMMAR_FORBIDDEN_CHAR`) | No pre-validation |
+| Function names must not be duplicated across tools | C++ returns error code 9 (`TOOL_CALL_GRAMMAR_DUPLICATE_NAME`) | No pre-validation |
+| `required` parameters must appear in `properties` | C++ returns error code 10 (`TOOL_CALL_GRAMMAR_REQUIRED_NOT_IN_PROPS`) | No pre-validation |
+
+These C++ checks produce error codes that are translated into Go errors, but the error messages are generic integers, not descriptive strings that a caller could act on. If validation were added at the Go level, these checks could produce descriptive error messages before the C++ code is ever reached.
+
+### What This Means for the Fork's Value Proposition
+
+The fork's template fidelity fixes (prefill guard, unconditional `<think>` wrapping, HTML-escaping fix, spaced JSON serialization) ensure that **valid input produces training-faithful output**. But without input validation, **invalid input silently produces training-absent output** — and the caller receives no signal that anything is wrong. The model processes the malformed prompt and produces a response, which may be subtly wrong (lower tool-calling accuracy, degraded reasoning) or grossly wrong (hallucinated tool calls, ignored instructions), depending on how far the input deviates from the training distribution.
+
+This is not a theoretical concern. Real-world agentic frameworks — open-source coding agents, chatbot frontends, LangChain/LlamaIndex pipelines — frequently construct message arrays programmatically and may produce invalid structures through bugs, version mismatches, or incorrect assumptions about the API contract. The official Qwen 3.5 Jinja2 template's `raise_exception()` calls exist precisely because these invalid inputs were observed in practice during the model's development and evaluation.
+
+### Test Coverage Required
+
+This validation layer requires its own dedicated test suite — separate from the renderer output tests in `model/renderers/qwen35_test.go` and from the KV cache round-trip tests in `server/qwen35_kvcache_roundtrip_test.go`. The renderer tests verify that valid input produces correct output. The validation tests must verify that invalid input produces clear, actionable error messages — not silently degraded prompts. These are fundamentally different assertions testing fundamentally different code paths.
+
+The validation test suite must cover every condition that the official Qwen 3.5 Jinja2 template rejects via `raise_exception()`, every implicit structural assumption the model was trained on, and every grammar pipeline pre-condition:
+
+**Tests for Tier 1 (universal) rejections:**
+1. Empty message array → error: `"no messages provided"` (or equivalent).
+2. Message with `Role: "function"` (OpenAI-legacy role) → error identifying the invalid role `"function"` and listing the four valid roles (`system`, `user`, `assistant`, `tool`).
+3. Message with `Role: "developer"` (OpenAI-new role) → same error as above, different invalid role value.
+4. Message with `Role: ""` (empty string) → same error, empty role.
+5. System message at index 2 (after a user message and an assistant message) → error identifying message index 2 as a system message that must appear at index 0.
+6. Two system messages (one at index 0, one at index 3) → error identifying the second system message at index 3.
+7. System message with images → error explaining that the Qwen 3.5 model's official chat template prohibits images in system messages.
+
+**Tests for Tier 2 (Qwen 3.5-specific) rejections:**
+8. All user messages are `<tool_response>`-wrapped with no real user query → error explaining that the conversation contains tool responses but no human query for the model to respond to.
+9. Tool call with empty function name (`Function.Name: ""`) → error identifying the tool call and explaining that function names must be non-empty.
+10. Two consecutive user messages without an intervening assistant message → error or warning identifying the non-alternating sequence at the specific message indices.
+11. Two consecutive assistant messages without an intervening user or tool message → same as above.
+12. Tool message (`Role: "tool"`) not preceded by an assistant message with tool calls → error explaining that tool responses must follow an assistant message that invoked a tool.
+13. Tool message preceded by a user message → same as above.
+
+**Tests for Tier 3 (grammar pipeline) pre-conditions:**
+14. Tool with empty function name in the tools array (not in a message's tool calls, but in the tool definitions passed to the grammar builder) → error before the C++ grammar builder is reached.
+15. Two tools with the same function name → error identifying the duplicate name.
+16. Tool with a `required` parameter name that does not appear in `properties` → error identifying the orphaned required parameter.
+
+Each test case must verify two things: (1) the invalid input is rejected — the renderer or validator returns a non-nil error, the prompt string is not produced, and the model never sees the malformed input; and (2) the error message is specific enough for the caller to diagnose and fix the problem without reading the Ollama source code. The error messages should name the specific violation, identify the offending message index or field, and explain what the valid input would look like. Generic errors like `"invalid message"` or `"validation failed"` are unacceptable — they push the debugging burden onto the caller, who has no visibility into the renderer's expectations.
 
 ---
 
