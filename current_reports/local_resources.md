@@ -4,14 +4,14 @@
 
 | Path | Description |
 |------|-------------|
-| `/home/user/shared_vm/ollama/` | **BigBIueWhale/ollama** fork @ `4044b63f` — 11 commits atop `v0.17.4` merge (tag `v0.17.4-bbl.5`). Merge base: `cc90a035`. Remote `origin` = `https://github.com/BigBIueWhale/ollama.git`, remote `upstream` = `https://github.com/ollama/ollama.git` |
+| `/home/user/shared_vm/ollama/` | **BigBIueWhale/ollama** fork @ `c90b3cbe` — 11 commits atop `v0.17.4` merge (tag `v0.17.4-bbl.5`). Merge base: `cc90a035`. Remote `origin` = `https://github.com/BigBIueWhale/ollama.git`, remote `upstream` = `https://github.com/ollama/ollama.git` |
 
 ### Key fork source files
 
 | Path | What it does |
 |------|-------------|
-| `model/models/qwen3next/deltanet.go` | GatedDeltaNet recurrent layer — contains `SetInplace` bug (lines 445-484) |
-| `model/models/qwen3next/model.go` | Qwen3Next model definition — recurrent layer inference, defaults, missing `Validate()` |
+| `model/models/qwen3next/deltanet.go` | GatedDeltaNet recurrent layer — balanced concat tree (lines 458-509, replaced SetInplace in commit `d474d368`) |
+| `model/models/qwen3next/model.go` | Qwen3Next model definition — recurrent layer inference, defaults, `Validate()` (lines 440-478, commit `4d576100`) |
 | `model/renderers/qwen35.go` | Dedicated `Qwen35Renderer` — JSON tool defs, tools-first ordering, image support, `lastQueryIndex`, unconditional `<think>` wrapping in history (matches official Jinja2 template), prefill bug fix |
 | `model/renderers/qwen3coder.go` | Shared renderer for qwen3-coder — XML tool definitions, thinking, lastQueryIndex, Qwen-local structured tool argument serializer with spaced JSON and no HTML escaping. **Known remaining qwen3-coder-only fidelity gaps:** `renderAdditionalKeys()` still emits compact/HTML-escaped nested JSON instead of the template's `render_extra_keys(... | tojson | safe)` behavior, and multi-type `type` fields still use JSON serialization instead of the template's Python string formatting. |
 | `model/renderers/qwen3vl.go` | Qwen3VL renderer — prefill fix, `</think>` closure fix |
@@ -92,9 +92,7 @@
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `fork_vs_upstream_analysis.md` | 348 | Fork vs upstream analysis pinned to upstream `82848a78`. Covers what the fork should fix (P0-P3), what upstream should fix, and critical architectural differences (penalty sampling, ring buffer, KV emission). |
-| `fork_vs_latest_upstream_and_llama_cpp.md` | 724 | Fork vs latest upstream Ollama (`9896e36`) and llama.cpp (`a0ed91a`). Covers CUDA async copy, M-RoPE can_shift, speculative decoding, parallelism, vision, sampler, thinking/non-thinking modes, and correctness. |
-| `grammar_constrained_tool_calls_plan.md` | ~530 | Implementation plan for grammar-constrained tool call generation — **ALL 5 STEPS DONE** (commit `4044b63f`). Covers why (Ollama trusts model, llama.cpp doesn't), full infrastructure audit, constraint comparison table (llama.cpp vs fork), all error handling paths, step-by-step implementation with actual code details, mode-dependent trigger patterns, dead-end detection, renderer fix. 8 files changed, ~212 lines added. Pinned to llama.cpp reference `a0ed91a`. |
+| `consolidated_report.md` | ~893 | **Comprehensive research report** consolidating all prior analyses. Covers: fork vs upstream Ollama (`82848a78` and `9896e36`), fork vs llama.cpp (`d969e933` and `a0ed91a`), all fork fixes (prefill, mropeInterleaved, penalty sampler, repeat_last_n, think blocks, JSON serialization), grammar-constrained tool call generation (all 5 steps done, commit `4044b63f`), llama.cpp's own 4 bugs, thinking/non-thinking mode deep analysis, speculative decoding impossibility, parallelism, vision, GGML vendor debt, performance opportunities, full action items. |
 
 ### Other research documents (parent directory)
 
