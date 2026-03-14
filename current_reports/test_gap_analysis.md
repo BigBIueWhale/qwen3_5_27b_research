@@ -147,110 +147,146 @@ This should also be tested in reverse: turn 1 used `think: false` (assistant mes
 
 ### What the function does and why it exists
 
-`splitQwen35ReasoningContent` at `model/renderers/qwen35.go` lines 64-79 is the function that decides what bytes the model sees inside the `<think>...\n</think>` block and what bytes the model sees after the `\n\n` that follows it, for every historical assistant message in the conversation. Its output feeds directly into line 143-144 of the renderer:
+Every historical assistant message the model sees during a multi-turn conversation is rendered as a specific byte sequence. For messages positioned after `lastQueryIndex` (the last real user query), the official Qwen 3.5 Jinja2 template produces:
+
+```
+<|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{content}...tool calls...<|im_end|>\n
+```
+
+The model was trained on billions of tokens in this exact format. The `{reasoning}` and `{content}` values are not stored directly — they are extracted from the message object at render time, because different clients store them differently (see below). The function `splitQwen35ReasoningContent` at `model/renderers/qwen35.go` lines 64-79 performs this extraction. Its two return values (`reasoning` and `remaining`) are placed into the byte sequence at line 143-144 of the renderer:
 
 ```go
 sb.WriteString(imStartTag + message.Role + "\n<think>\n" + contentReasoning + "\n</think>\n\n" + content)
 ```
 
-The model was trained on billions of tokens where every historical assistant turn follows this exact byte sequence: `<|im_start|>assistant\n<think>\n` then reasoning text then `\n</think>\n\n` then visible content then tool calls (if any) then `<|im_end|>\n`. The `splitQwen35ReasoningContent` function is responsible for separating the reasoning from the visible content so the renderer can place each in the correct position within that byte sequence. If this function returns wrong values — wrong reasoning, wrong remaining content, or any extra characters like duplicate `<think>` tags — the rendered prompt deviates from what the model was trained on. The model does not error. It silently produces worse output: lower tool-calling accuracy, weaker reasoning, more hallucinations. The user blames the model.
+If this function returns wrong values — wrong reasoning, wrong remaining content, extra characters like a duplicate `<think>` tag, a leftover `\n` — the rendered prompt deviates from what the model was trained on. The model does not error. It silently produces worse output: lower tool-calling accuracy, weaker reasoning, more hallucinations. The user blames the model, not the inference engine. Additionally, because Ollama reuses the KV cache (expensive intermediate computation) by comparing the new prompt against the previous one byte-by-byte, any byte difference in the historical portion invalidates the cache from that point forward, making every subsequent response in a long agentic session progressively slower to generate.
+
+### The official template's extraction algorithm and the fork's equivalent
+
+The official Jinja2 template (from `Qwen/Qwen3.5-27B` on HuggingFace, in the `chat_template` field of `tokenizer_config.json`) extracts reasoning from assistant messages using two paths. This is the verbatim Jinja2 code (with escaped newlines expanded for readability):
+
+```jinja2
+{%- set reasoning_content = '' %}
+{%- if message.reasoning_content is string %}
+    {%- set reasoning_content = message.reasoning_content %}
+{%- else %}
+    {%- if '</think>' in content %}
+        {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+        {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+    {%- endif %}
+{%- endif %}
+{%- set reasoning_content = reasoning_content|trim %}
+```
+
+The fork's equivalent at `model/renderers/qwen35.go` lines 64-79:
+
+```go
+func splitQwen35ReasoningContent(content, messageThinking string) (reasoning string, remaining string) {
+    if messageThinking != "" {
+        return strings.TrimSpace(messageThinking), content
+    }
+    if idx := strings.Index(content, qwen35ThinkCloseTag); idx != -1 {
+        before := content[:idx]
+        if open := strings.LastIndex(before, qwen35ThinkOpenTag); open != -1 {
+            reasoning = before[open+len(qwen35ThinkOpenTag):]
+        } else {
+            reasoning = before
+        }
+        content = strings.TrimLeft(content[idx+len(qwen35ThinkCloseTag):], "\n")
+    }
+    return strings.TrimSpace(reasoning), content
+}
+```
+
+**How these correspond, step by step:**
+
+| Official template operation | Fork equivalent | Notes |
+|---|---|---|
+| `if message.reasoning_content is string` → use it directly | `if messageThinking != ""` → return it directly | See "Known divergence" below for the empty-string difference |
+| `content.split('</think>')[0]` — everything before the first `</think>` | `content[:idx]` where `idx = strings.Index(content, "</think>")` — same thing | Both find the **first** `</think>`. Equivalent for any number of `</think>` tags. |
+| `.rstrip('\n')` — strip trailing newlines from the text before `</think>` | No explicit equivalent; the final `strings.TrimSpace(reasoning)` strips all trailing whitespace | `TrimSpace` is a superset of `rstrip('\n')`, but since the final `\|trim` (below) also strips all whitespace, the end result is identical |
+| `.split('<think>')[-1]` — everything after the **last** `<think>` tag | `strings.LastIndex(before, "<think>")` — finds the **last** `<think>` and takes everything after it | Both discard any text before the last `<think>` tag. When there is no `<think>` tag, the template's `split` returns a one-element list and `[-1]` returns the whole string; the fork's `LastIndex` returns -1 and the `else` branch at line 74 takes the whole `before` string. Equivalent. |
+| `.lstrip('\n')` — strip leading newlines from the extracted reasoning | No explicit equivalent; the final `strings.TrimSpace(reasoning)` strips all leading whitespace | Same reasoning as above — end result identical after final trim |
+| `content.split('</think>')[-1].lstrip('\n')` — remaining content is everything after the **last** `</think>`, with leading newlines stripped | `strings.TrimLeft(content[idx+len("</think>"):], "\n")` — remaining content is everything after the **first** `</think>`, with leading newlines stripped | **Divergence when content has multiple `</think>` tags**: the template takes after the last, the fork takes after the first. In practice the model never produces multiple `</think>` tags — the grammar-constrained generation pipeline and the parser both enforce a single thinking block. This divergence is documented but not tested. |
+| `reasoning_content\|trim` — Jinja2's `trim` filter strips all whitespace from both ends | `strings.TrimSpace(reasoning)` — Go's `TrimSpace` strips all Unicode whitespace from both ends | Equivalent |
+
+**The extraction-then-wrapping cycle:** Both the template and the fork extract reasoning and content, then re-wrap them in `<think>\n{reasoning}\n</think>\n\n{content}`. This means the model's raw output — which includes `\n` after `<think>` and `\n` before `</think>` — goes through a strip-then-re-add cycle. The raw output `<think>\nLet me check\n</think>\n\nParis is 18°C.` is extracted to reasoning=`"Let me check"` and content=`"Paris is 18°C."` (newlines stripped), then the renderer re-wraps as `<think>\nLet me check\n</think>\n\nParis is 18°C.` (newlines re-added). The final bytes are identical to the raw output. This is the same cycle the official template performs. The model sees the same bytes regardless of whether this is the first render or a re-render on a subsequent turn.
 
 ### Why two extraction paths exist — different clients encode the same model output differently
 
 The function has two main extraction paths because different client applications store the same model output in different ways, and the renderer must produce the correct byte sequence regardless of which client sent the conversation history.
 
-**Path 1 — Explicit `Thinking` field (line 65-66).** When a client application (Claude Code, a custom agentic framework, etc.) receives the model's streaming response, Ollama's parser separates the thinking text from the visible content and delivers them as two separate fields: `Thinking` (the reasoning inside `<think>...</think>`) and `Content` (everything after). A well-behaved client stores these as separate fields in its conversation history. On the next turn, the client sends both fields back. Path 1 handles this case: if the `message.Thinking` field (called `messageThinking` in the function parameter) is non-empty, use it as the reasoning and return the `Content` field unchanged.
+**Path 1 — Explicit `Thinking` field (line 65-66).** When a client application (Claude Code, a custom agentic framework, etc.) receives the model's streaming response, Ollama's parser separates the thinking text from the visible content and delivers them as two separate fields: `Thinking` (the reasoning inside `<think>...</think>`) and `Content` (everything after). A well-behaved client stores these as separate fields in its conversation history. On the next turn, the client sends both fields back. Path 1 handles this: if the `message.Thinking` field (called `messageThinking` in the function parameter) is non-empty, use it as the reasoning and return the `Content` field unchanged.
 
-This corresponds to the official Jinja2 template's primary extraction path: `if message.reasoning_content is string` → use it directly.
+**Path 2 — Inline `<think>` tags in content (lines 69-76).** Not all clients handle the `Thinking` field. Some third-party clients (Open WebUI, LangChain integrations, custom tools, older client libraries) either don't recognize the `Thinking` field and drop it during JSON serialization, or store the raw model output as a single string with the `<think>` tags still embedded. When these clients send the conversation history back, the `Thinking` field is empty, but the `Content` field contains the raw model output with tags.
 
-**Path 2 — Inline `<think>` tags in content (lines 69-76).** Not all clients properly handle the `Thinking` field. Some third-party clients (Open WebUI, LangChain integrations, custom tools, older client libraries) either don't understand the `Thinking` field and drop it during JSON serialization, or store the raw model output as a single string with the `<think>` tags still embedded in the content. When these clients send the conversation history back, the `Thinking` field is empty, but the `Content` field contains `<think>reasoning text</think>\nvisible answer`. Path 2 handles this case: if `messageThinking` is empty but the content string contains `</think>`, extract the reasoning from before the close tag (stripping a leading `<think>` if present) and return the content after the close tag.
+Path 2 has a sub-case that is not an edge case but the most common inline format: **Path 2b — close tag without opening tag (line 73-74).** When thinking is enabled, the renderer prefills `<|im_start|>assistant\n<think>\n` before the model starts generating. The model then produces `reasoning text\n</think>\n\nvisible answer`. The `<think>` open tag is part of the renderer's prefill, not part of the model's output. A client that captures only the model's generated tokens (not the prefill) stores `reasoning text\n</think>\n\nvisible answer` — a close tag without an opening tag. This is the realistic Path 2 input format. Path 2a (with both tags) occurs when a client captures the full output including the prefill.
 
-This corresponds to the official Jinja2 template's fallback extraction path: `if '</think>' in content` → `content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')`.
+**Path 3 — No thinking at all (line 79).** Neither the `Thinking` field nor inline tags are present. The function returns empty reasoning and the content unchanged.
 
-Path 2 has a sub-case: **Path 2b — close tag without opening tag (line 73-74).** This is not a malformed edge case — it is actually how the model's raw output looks during generation. When thinking is enabled, the renderer prefills `<|im_start|>assistant\n<think>\n` before the model starts generating. The model then produces reasoning text followed by `</think>\n\nvisible answer`. The `<think>` open tag is part of the renderer's prefill, not part of the model's output. A client that captures only the model's generated tokens (not the prefill) and stores that as the content string will have `reasoning text</think>\nvisible answer` — a close tag without an opening tag. Path 2b strips the content before `</think>` as the reasoning, matching the official template's `content.split('</think>')[0]` which also does not require an opening tag.
+### The critical property: all paths must produce the same `(reasoning, remaining)` for equivalent input
 
-**Path 3 — No thinking at all (line 79).** Neither the `Thinking` field nor inline tags are present. The function returns empty reasoning and the content unchanged. The renderer wraps the empty reasoning in `<think>\n\n</think>\n\n` (an empty thinking block), which matches the official template's behavior when `reasoning_content` is an empty string after trimming.
+Three different clients can encode the exact same assistant turn three different ways:
 
-### The critical property: both paths must produce identical output for equivalent input
+- **Client A** (well-behaved, stores fields separately): `{Thinking: "Let me check the weather", Content: "Paris is 18°C."}`
+- **Client B** (stores raw output with prefill): `{Content: "<think>\nLet me check the weather\n</think>\n\nParis is 18°C."}`
+- **Client C** (stores raw output without prefill): `{Content: "Let me check the weather\n</think>\n\nParis is 18°C."}`
 
-A well-behaved client (Client A) and a third-party client (Client B) can represent the exact same model turn differently:
+All three represent the same model turn. All three must produce the same `(reasoning, remaining)` tuple: `("Let me check the weather", "Paris is 18°C.")`. The renderer then wraps both into the same byte sequence: `<|im_start|>assistant\n<think>\nLet me check the weather\n</think>\n\nParis is 18°C.`. The model sees the same prompt regardless of which client sent the history.
 
-- **Client A** sends: `{Thinking: "Let me look up the weather", Content: "The temperature in Paris is 18°C."}`
-- **Client B** sends: `{Content: "<think>Let me look up the weather</think>\nThe temperature in Paris is 18°C."}`
-
-Both represent the same assistant response — the model produced reasoning followed by a visible answer. The renderer must produce the same byte sequence for both, because the model was trained on one format, and it does not know or care which client sent the history. Concretely, both must result in the renderer writing:
-
-```
-<|im_start|>assistant\n<think>\nLet me look up the weather\n</think>\n\nThe temperature in Paris is 18°C.
-```
-
-If Path 1 and Path 2 produce different `(reasoning, remaining)` tuples for equivalent input — different whitespace, a leftover `<think>` tag, a missing newline strip — then switching clients mid-conversation (or a single client changing how it stores thinking between versions) causes the rendered prompt to change. This has two consequences:
-
-1. **The model sees a prompt shape it was not trained on.** Silent quality degradation, as described in "Why Exact Template Fidelity Matters" above.
-2. **The KV cache is invalidated.** Ollama compares the new prompt against the previous prompt byte-by-byte to determine how much of the expensive intermediate computation can be reused. A single byte difference in the historical portion — a leftover `<think>` tag, a missing newline — invalidates the cache from that point forward. In a 20-turn agentic coding session, every subsequent response takes dramatically longer to generate because the entire history must be reprocessed.
-
-This equivalence property is the most important thing to test. It is not about code coverage. It is about ensuring that the model receives the byte sequence it was trained on regardless of how the client encoded the conversation history.
+If any path produces different values — a leftover newline, a duplicate `<think>` tag, a missing whitespace strip — the model sees a prompt it was never trained on, and the KV cache is invalidated from that point forward.
 
 ### Relationship to Gap 2 — same fix, different test level
 
-This function's signature was changed as part of the same fix described in Gap 2. The upstream Ollama version (commit `9896e36` at `/tmp/ollama-latest/model/renderers/qwen35.go`) has the signature `splitQwen35ReasoningContent(content, messageThinking string, isThinking bool)` and gates Path 1 on `if isThinking && messageThinking != ""`. The fork removed the `isThinking` parameter entirely, changing the signature to `splitQwen35ReasoningContent(content, messageThinking string)` and the guard to `if messageThinking != ""`.
+This function's signature was changed as part of the same fix described in Gap 2. The upstream Ollama version (commit `9896e36`) has the signature `splitQwen35ReasoningContent(content, messageThinking string, isThinking bool)` and gates Path 1 on `if isThinking && messageThinking != ""`. The fork removed the `isThinking` parameter entirely, changing the guard to `if messageThinking != ""`.
 
-What this means concretely: in the upstream version, when a user switches from `think: true` to `think: false` between conversation turns (a common pattern — enable thinking for complex planning, disable it for quick follow-ups), the upstream function receives `isThinking=false` for the current turn. The `isThinking && messageThinking != ""` guard evaluates to `false && true` → `false`, so Path 1 is skipped. The function falls through to Path 2, which searches the content for inline tags. If the content has no inline tags (because the client properly stored thinking in the `Thinking` field, not inline), Path 2 finds nothing, and the function returns empty reasoning. The renderer then wraps the empty reasoning in `<think>\n\n</think>\n\n` — the historical assistant message appears to have had no thinking at all. The model's own previous reasoning is silently erased from the prompt. The model sees a conversation where it previously gave answers without thinking, even though it actually did think. This is a prompt shape the model was never trained on.
+What this means: in the upstream version, when a user switches from `think: true` to `think: false` between conversation turns (a common pattern — enable thinking for complex planning, disable it for quick follow-ups), the upstream function receives `isThinking=false`. The guard evaluates to `false && true` → `false`, skipping Path 1. The function falls through to Path 2, which searches the content for inline tags. If the content has no inline tags (because the client properly stored thinking in the `Thinking` field), Path 2 finds nothing, and the function returns empty reasoning. The historical assistant message's thinking is silently erased. The model sees a conversation where it previously answered without thinking, even though it actually did think. This is a prompt shape the model was never trained on. The official template never does this — its `message.reasoning_content is string` check has no `enable_thinking` gate.
 
-The fork's version does not have this problem because it checks `messageThinking != ""` without any `isThinking` gate, matching the official Jinja2 template where `message.reasoning_content is string` is checked unconditionally.
-
-Gap 2 tests the renderer-level consequence of this fix: it renders with `think=false` and verifies that historical thinking blocks appear in the output. This gap tests the extraction function's internal logic in isolation. Both are needed: Gap 2 catches someone re-adding the `isThinking` gate (the regression at the integration level), while this gap catches bugs in the extraction logic itself (wrong tag stripping, wrong fallback priority, wrong whitespace handling — regressions within the function that produce corrupted reasoning or remaining content even when the function is called correctly).
-
-### Why no existing test catches bugs in this function
-
-The function is unexported (`splitQwen35ReasoningContent`, lowercase first letter) but is in the `renderers` package, and the test file `qwen35_test.go` is also in `package renderers` — so tests can call it directly.
-
-Today, no test calls it directly. It is only exercised indirectly through the renderer's `Render()` method. In all existing tests that include assistant messages with thinking content, the `Thinking` field is always non-empty: `TestQwen35RendererBackToBackToolCallsAndResponses` uses `Thinking: "Need to call add and multiply."`, `TestQwen35RendererInterleavedThinkingAndTools` uses `Thinking: "Need weather before giving advice."` and `Thinking: "Need UV index for sunscreen advice."`, `TestQwen35RendererAssistantPrefillWithThinking` uses `Thinking: "Keep it short."`, and `TestQwen35RendererAssistantToolCallIsNotPrefill` (think=true subtest) uses `Thinking: "Let me check."`.
-
-Every one of these hits Path 1 and returns immediately. Path 2 (both 2a and 2b) has zero test coverage. If someone introduced a bug in Path 2 — for example, failing to strip the `<think>` open tag (producing double-wrapped `<think>\n<think>reasoning</think>\n</think>`), or using `strings.Index` instead of `strings.LastIndex` for the open tag search, or failing to strip leading newlines from the remaining content — no test would fail. The bug would only manifest when a third-party client sent conversation history with inline thinking tags, producing a prompt the model was never trained on, with no error message to indicate what went wrong.
+Gap 2 tests the renderer-level consequence of this fix. This gap tests the extraction function's internal logic in isolation. Both are needed: Gap 2 catches someone re-adding the `isThinking` gate; this gap catches bugs in the extraction logic itself (wrong tag stripping, wrong fallback priority, wrong whitespace handling).
 
 ### Known divergence from the official template
 
-The fork's Path 1 guard is `messageThinking != ""`. In Go, the `Thinking` field on `api.Message` is a plain `string` — its zero value is `""`. When a client sends JSON without a `"thinking"` field, Go's JSON unmarshaler sets `Thinking` to `""`. When a client explicitly sends `"thinking": ""`, Go also sets `Thinking` to `""`. These two cases are indistinguishable in Go's type system.
+The fork's Path 1 guard is `messageThinking != ""`. In Go, the `Thinking` field on `api.Message` is a plain `string` with zero value `""`. Go's JSON unmarshaler sets it to `""` both when the field is absent from JSON and when it is explicitly `"thinking": ""`. These are indistinguishable.
 
-The official Jinja2 template's guard is `message.reasoning_content is string`. In Python/Jinja2, `None` (field absent) is NOT a string, but `""` (explicitly empty) IS a string. So the official template distinguishes "field absent" (fall through to Path 2) from "field is empty string" (use the empty string, skip Path 2). The fork cannot make this distinction because Go's `string` type has no null state.
+The official template's guard is `message.reasoning_content is string`. In Python/Jinja2, `None` (field absent) is NOT a string, but `""` (explicitly empty) IS a string. The official template distinguishes "absent" (fall through to Path 2) from "empty string" (use it, skip Path 2). The fork cannot make this distinction.
 
-The practical consequence: if a message has `Thinking: ""` (which in Go is indistinguishable from "field absent") AND its `Content` happens to contain a literal `</think>` substring, the fork falls through to Path 2 and parses the content for thinking tags. The official template would take Path 1 with the empty string and leave the content alone. In practice this divergence is unlikely to matter — a model would not produce `</think>` in its visible content — but the test should document this behavior explicitly so that anyone reading the tests understands the fork's choice and its relationship to Go's type system constraints.
+Practical consequence: if a message has `Thinking: ""` (indistinguishable from absent in Go) AND `Content` contains `</think>`, the fork falls through to Path 2 and parses the content. The official template would take Path 1 with the empty string. In practice, a model would not produce `</think>` in visible content, so this divergence does not affect real inputs. The tests should document this explicitly.
+
+### Why no existing test catches bugs in this function
+
+The function is unexported (`splitQwen35ReasoningContent`, lowercase first letter) but accessible from tests because `qwen35_test.go` is in the same `renderers` package.
+
+No test calls it directly. All existing tests that include assistant messages with thinking content use a non-empty `Thinking` field (`"Need to call add and multiply."`, `"Need weather before giving advice."`, `"Need UV index for sunscreen advice."`, `"Keep it short."`, `"Let me check."`). Every one hits Path 1 and returns immediately. Path 2 — both 2a (with open tag) and 2b (without open tag) — has zero test coverage. A bug in Path 2 would only manifest when a third-party client sends conversation history with inline thinking tags.
 
 ### What the tests need to verify
 
-Direct unit tests calling `splitQwen35ReasoningContent` in `model/renderers/qwen35_test.go`. The function is unexported but accessible because the test file is in the same package.
+One test function — `TestSplitQwen35ReasoningContent` — with table-driven subtests calling the function directly. All test inputs use the realistic content format the model actually generates (with `\n` after `<think>` and `\n` before `</think>`), not sanitized strings without newlines.
 
-**Test 1 — Path equivalence (the most important test).** Call the function twice with the same reasoning and content, encoded two different ways:
+**Test 1 — Path equivalence (the most important test).** Three encodings of the same model turn must produce identical `(reasoning, remaining)`:
 
-- Client A encoding: `splitQwen35ReasoningContent("The temperature is 18°C.", "Let me look up the weather")` — explicit `Thinking` field (Path 1).
-- Client B encoding: `splitQwen35ReasoningContent("<think>Let me look up the weather</think>\nThe temperature is 18°C.", "")` — inline tags in content (Path 2a).
+- Client A (explicit field): `splitQwen35ReasoningContent("Paris is 18°C.", "Let me check the weather")` — Path 1
+- Client B (inline with both tags): `splitQwen35ReasoningContent("<think>\nLet me check the weather\n</think>\nParis is 18°C.", "")` — Path 2a
+- Client C (inline without open tag): `splitQwen35ReasoningContent("Let me check the weather\n</think>\nParis is 18°C.", "")` — Path 2b
 
-Assert that both calls return identical `(reasoning, remaining)` tuples: `("Let me look up the weather", "The temperature is 18°C.")`. This directly asserts the equivalence property — the model receives the same prompt regardless of which client sent the history. If this test fails, it means two clients representing the same model turn will cause the model to see different prompts, which means different token sequences, which means training distribution shift and KV cache invalidation.
+All three must return `("Let me check the weather", "Paris is 18°C.")`. The `\n` after `<think>` and `\n` before `</think>` must be stripped by the extraction — the official template strips them via `lstrip('\n')` and `rstrip('\n')` before the final `|trim`, and the fork strips them via `strings.TrimSpace` on reasoning and `strings.TrimLeft(..., "\n")` on remaining content. The renderer then re-adds `\n` on both sides when wrapping: `<think>\n` + reasoning + `\n</think>`. The round-trip produces the same bytes.
 
-Also test the equivalence for the Path 2b variant — the case where the client captured the model's raw output without the prefilled `<think>` open tag:
+**Test 2 — Inline tags with internal newlines (realistic multi-line reasoning).** `splitQwen35ReasoningContent("<think>\nStep 1: look up weather\nStep 2: format answer\n</think>\nParis is 18°C.", "")` → reasoning `"Step 1: look up weather\nStep 2: format answer"`, remaining `"Paris is 18°C."`. The `\n` immediately after `<think>` and immediately before `</think>` are stripped. The internal `\n` between reasoning steps is preserved. This matches the official template: `rstrip('\n')` strips only the trailing newline before `</think>`, `lstrip('\n')` strips only the leading newline after `<think>`, and `|trim` strips surrounding whitespace — but internal newlines survive because `trim` only operates on the ends.
 
-- Client C encoding: `splitQwen35ReasoningContent("Let me look up the weather</think>\nThe temperature is 18°C.", "")` — close tag without open tag (Path 2b).
+**Test 3 — Close tag without open tag (Path 2b, the model's raw output after prefill).** `splitQwen35ReasoningContent("Let me check\n</think>\nParis is 18°C.", "")` → reasoning `"Let me check"`, remaining `"Paris is 18°C."`. The official template's `content.split('</think>')[0]` does not require a `<think>` tag. The subsequent `.split('<think>')[-1]` is a no-op when no `<think>` exists (Python's `"text".split('<think>')` returns `["text"]`, and `[-1]` returns `"text"`). The fork's `LastIndex` returns -1 and the `else` branch at line 74 takes the entire `before` string. Both produce the same result.
 
-Assert that this also returns `("Let me look up the weather", "The temperature is 18°C.")` — identical to both Client A and Client B. Three different client encodings of the same model turn, all producing the same extraction result.
+**Test 4 — Explicit field wins over inline tags (no double-extraction).** `splitQwen35ReasoningContent("<think>\ninline reasoning\n</think>\nvisible", "explicit reasoning")` → reasoning `"explicit reasoning"`, remaining `"<think>\ninline reasoning\n</think>\nvisible"`. Path 1 fires at line 65 and returns immediately. The content is NOT parsed — it is returned exactly as received, with `<think>` tags still present as literal characters. The renderer wraps only the explicit field's reasoning in `<think>...\n</think>` tags. The inline tags in content become literal text in the visible portion of the prompt. This test confirms no double-extraction occurs.
 
-**Test 2 — Path 2a inline tag extraction (the core untested code path).** `splitQwen35ReasoningContent("<think>reasoning here</think>\nvisible answer", "")` → reasoning `"reasoning here"`, remaining `"visible answer"`. This verifies that the `strings.Index` / `strings.LastIndex` logic at lines 69-76 correctly finds the tags, extracts the text between them, strips the tags, and strips the leading newline from the remaining content. This is the code path that third-party clients depend on when they store thinking inline.
+**Test 5 — No thinking (Path 3 baseline).** `splitQwen35ReasoningContent("just content, no thinking", "")` → reasoning `""`, remaining `"just content, no thinking"`. Neither `messageThinking != ""` nor `strings.Index(content, "</think>") != -1`. The renderer wraps the empty reasoning as `<think>\n\n</think>\n\n` — an empty thinking block — matching the official template.
 
-**Test 3 — Path 2b close tag without open tag (the model's raw output format).** `splitQwen35ReasoningContent("reasoning here</think>\nvisible answer", "")` → reasoning `"reasoning here"`, remaining `"visible answer"`. This is not an error case — it reflects how the model's raw generated output looks when a client captures tokens after the renderer's `<think>\n` prefill. The official template handles this identically: `content.split('</think>')[0]` does not require a preceding `<think>` tag. The `.split('<think>')[-1]` call that follows is a no-op when there is no open tag (the list has one element and `[-1]` returns it).
+**Test 6 — Whitespace-only `Thinking` field.** `splitQwen35ReasoningContent("content", "   \n  ")` → reasoning `""`, remaining `"content"`. The string `"   \n  "` is not `""`, so Path 1 fires. `strings.TrimSpace("   \n  ")` returns `""`. Content is returned unchanged — Path 2's tag parsing is never reached. The official template's `message.reasoning_content is string` would also be true for `"   \n  "`, and `|trim` would also return `""`. The behaviors match. This documents that whitespace-only fields do NOT fall through to content parsing.
 
-**Test 4 — Path 1 priority over inline tags (explicit field wins).** `splitQwen35ReasoningContent("<think>inline reasoning</think>visible", "explicit field reasoning")` → reasoning `"explicit field reasoning"`, remaining `"<think>inline reasoning</think>visible"`. The `messageThinking != ""` check at line 65 fires first and returns immediately. The content is NOT parsed for inline tags — it is returned exactly as-is, including the `<think>` tags as literal characters. This matters because: if a client sends both a `Thinking` field AND content with inline tags (a malformed but possible input), the function must not double-extract. The `Thinking` field is authoritative. The inline tags in content become literal text in the visible portion of the prompt. The renderer at line 144 wraps only the explicit field's reasoning in `<think>...\n</think>` tags. The test must verify that the remaining content is returned unchanged — with the inline tags still present as literal characters — to confirm that no double-extraction occurs.
+**Test 7 — Empty content with explicit thinking (tool-call-only turn).** `splitQwen35ReasoningContent("", "Let me call the function")` → reasoning `"Let me call the function"`, remaining `""`. Path 1 fires. The model reasoned but produced no visible text — its response is entirely tool calls. The renderer wraps this as `<think>\nLet me call the function\n</think>\n\n` followed by tool call XML. This is a common pattern in agentic use.
 
-**Test 5 — Path 3 no thinking (baseline).** `splitQwen35ReasoningContent("just content", "")` → reasoning `""`, remaining `"just content"`. Both inputs are empty or contain no tags. The function returns empty reasoning. The renderer wraps this as `<think>\n\n</think>\n\n` — an empty thinking block — which matches the official template's output for messages with no reasoning. This test establishes the baseline behavior.
-
-**Test 6 — Whitespace-only `Thinking` field (documents a behavioral quirk).** `splitQwen35ReasoningContent("content", "   \n  ")` → reasoning `""`, remaining `"content"`. The string `"   \n  "` is not equal to `""`, so Path 1's `messageThinking != ""` guard evaluates to true, and Path 1 fires. But `strings.TrimSpace("   \n  ")` returns `""`. So the function returns empty reasoning via Path 1, and the content is returned unchanged (Path 2's tag parsing is never reached). The official Jinja2 template would also take its primary path (`"   \n  "` is a string, so `message.reasoning_content is string` is true), and `reasoning_content|trim` would also produce `""`. The behaviors match. This test documents that whitespace-only thinking fields do NOT fall through to content parsing, which could be surprising to someone reading the code.
-
-**Test 7 — Empty content with explicit thinking.** `splitQwen35ReasoningContent("", "thinking")` → reasoning `"thinking"`, remaining `""`. Path 1 fires. The model produced reasoning but no visible content. The renderer wraps this as `<think>\nthinking\n</think>\n\n` — the `\n\n` after the close tag separates the (empty) visible content from the tool calls or `<|im_end|>` that follows. This is a valid model output pattern: the model reasoned but its visible response is entirely tool calls with no prose.
-
-**Test 8 — Both empty.** `splitQwen35ReasoningContent("", "")` → reasoning `""`, remaining `""`. Path 3 fires (neither `messageThinking != ""` nor `strings.Index("", "</think>") != -1`). Both are empty. This represents an assistant message with no thinking and no visible content — the turn consists entirely of tool calls. The renderer wraps this as `<think>\n\n</think>\n\n` followed by the tool call XML.
+**Test 8 — Both empty.** `splitQwen35ReasoningContent("", "")` → reasoning `""`, remaining `""`. Path 3. The assistant message has no thinking and no visible content — the turn is entirely tool calls with no reasoning. The renderer wraps as `<think>\n\n</think>\n\n` followed by tool call XML.
 
 ### Think mode variants
 
-Not needed. The fork's `splitQwen35ReasoningContent` is a pure function: it takes two strings (`content` and `messageThinking`) and returns two strings (`reasoning` and `remaining`). It has no access to `isThinking`, `ThinkValue`, or any renderer state. The `isThinking` parameter was deliberately removed as part of the fix described in Gap 2. The function's behavior is identical regardless of what think mode the current request uses — it always extracts reasoning the same way. Think mode only affects two things downstream: (1) whether the renderer wraps historical assistant messages in `<think>` tags (line 143's `if i > lastQueryIndex` check, which does NOT check `isThinking` — this is the fork's fix, tested by Gap 2), and (2) whether the generation prompt at the end uses `<think>\n` or `<think>\n\n</think>\n\n` (tested by other tests' generation prompt suffix assertions). Neither of these is the responsibility of `splitQwen35ReasoningContent`.
+Not needed. The fork's `splitQwen35ReasoningContent` is a pure function of its two string arguments. It has no access to `isThinking`, `ThinkValue`, or any renderer state — the `isThinking` parameter was deliberately removed as part of the fix described in Gap 2. Think mode only affects downstream behavior: whether the renderer wraps historical messages in `<think>` tags (tested by Gap 2) and whether the generation prompt uses `<think>\n` or `<think>\n\n</think>\n\n` (tested by other tests).
 
 ---
 
