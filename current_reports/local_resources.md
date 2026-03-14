@@ -78,11 +78,26 @@
 |------|-------------|
 | `/tmp/llama_cpp_up_to_date/` | `ggml-org/llama.cpp` master @ `c5a7788` ("ggml: add GATED_DELTA_NET op"). Shallow clone (`--depth=1`). Trie upgraded to `uint32_t` Unicode codepoints in `peg-parser.cpp`. Tool grammar builder refactored from `chat.cpp` into new `chat-peg-parser.cpp` with parameterized markers. Public API (`json-schema-to-grammar.h`) byte-for-byte identical to vendored version. |
 
+## Post-Refactor llama.cpp Clones
+
+| Path | Description |
+|------|-------------|
+| `/tmp/llama-cpp-fresh/` | `ggml-org/llama.cpp` @ `0cd4f47` (March 10, 2026). Contains the unified autoparser refactoring: per-model specialized handlers (`common_chat_params_init_qwen3_coder`, etc.) replaced with `common_chat_template_direct_apply()`. This fixes the `enable_thinking` generation prompt bug — the unified path correctly passes `enable_thinking` to the Jinja template context at `chat.cpp:773`. See `consolidated_report.md` Section 7.1 for details. |
+| `/tmp/llama_cpp_devstral2512_audit/` | `ggml-org/llama.cpp` @ `aa2d278` (March 10, 2026). Same post-refactor state as `/tmp/llama-cpp-fresh/`. Created for Devstral Small 2 template audit. |
+
 ## Stale Upstream Bare Clone
 
 | Path | Description |
 |------|-------------|
 | `/tmp/ollama-upstream/` | Bare clone of `ollama/ollama` @ `8207e55e` (older than `/tmp/ollama-master/`). Created earlier in the session. **Stale — use `/tmp/ollama-latest/` instead.** |
+
+---
+
+## Reference Resources
+
+| Path | Description |
+|------|-------------|
+| `/tmp/resources_reference/` | Ground truth reference data for template verification. Contains: `hf-Qwen3.5-27B/` and `hf-Qwen3.5-35B-A3B/` (HuggingFace model snapshots with `tokenizer_config.json` containing the official Jinja2 chat template — the authoritative source for how the model was trained), `Qwen3.5-github/` (Qwen's official reference code), `Qwen3-Coder-30B-A3B-Instruct.tokenizer_config.json` (Qwen3-Coder template), `sglang/` / `transformers/` / `vllm/` (reference inference framework code for cross-checking template handling). The official Qwen 3.5 template in these snapshots confirms that `enable_thinking` is checked in exactly one place (the `add_generation_prompt` block) and never in the message rendering loop. |
 
 ---
 
