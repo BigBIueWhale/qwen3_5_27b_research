@@ -92,7 +92,8 @@
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `consolidated_report.md` | ~893 | **Comprehensive research report** consolidating all prior analyses. Covers: fork vs upstream Ollama (`82848a78` and `9896e36`), fork vs llama.cpp (`d969e933` and `a0ed91a`), all fork fixes (prefill, mropeInterleaved, penalty sampler, repeat_last_n, think blocks, JSON serialization), grammar-constrained tool call generation (all 5 steps done, commit `4044b63f`), llama.cpp's own 4 bugs, thinking/non-thinking mode deep analysis, speculative decoding impossibility, parallelism, vision, GGML vendor debt, performance opportunities, full action items. |
+| `consolidated_report.md` | ~893 | **Comprehensive research report** consolidating all prior analyses. Covers: fork vs upstream Ollama (`82848a78` and `9896e36`), fork vs llama.cpp (`d969e933` and `a0ed91a`), all fork fixes (prefill, mropeInterleaved, penalty sampler, repeat_last_n, think blocks, JSON serialization), grammar-constrained tool call generation (all 5 steps done, commit `4044b63f`), llama.cpp's own 4 bugs, thinking/non-thinking mode deep analysis, speculative decoding impossibility, parallelism, vision, GGML vendor debt, performance opportunities, full action items. Part 3B links to `input_validation_report.md`. |
+| `input_validation_report.md` | ~300 | **Client input validation report.** Traces the full request lifecycle (5 stages) with what validation exists vs. what's missing. Concrete prompt traces for 6 invalid input scenarios. Side-by-side comparison with llama.cpp. Opinionated architectural solution: 5 one-liner checks inside `Render()` at existing code points (zero duplication). Complete checklist of what to validate, what NOT to validate, and where NOT to put validation. |
 
 ### Other research documents (parent directory)
 
