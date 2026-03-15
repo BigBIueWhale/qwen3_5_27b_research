@@ -1,7 +1,7 @@
 # BigBIueWhale/ollama Fork: Comprehensive Research Report for Qwen 3.5 27B
 
 **Date:** 2026-03-13
-**Fork:** `BigBIueWhale/ollama` @ commit `c90b3cbe` (11 commits atop the Ollama `v0.17.4` merge base `cc90a035`, tag `v0.17.4-bbl.5`)
+**Fork:** `BigBIueWhale/ollama` on branch `main`, merge base `cc90a035` (Ollama `v0.17.4`). Use `git log --oneline cc90a035..HEAD` for the current commit list.
 **Model:** Qwen 3.5 27B (Alibaba Qwen), a hybrid recurrent architecture (`qwen3next`) combining GatedDeltaNet recurrent layers with standard full-attention layers. Running via Unsloth Dynamic 2.0 `UD-Q4_K_XL` GGUF quantization (17.6 GB, 851 tensors, text-only, at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf`)
 **Inference engine:** Ollama — a Go-based inference engine that vendors the GGML tensor math library from the llama.cpp project (maintained by ggml-org) but reimplements everything else in Go: chat template rendering uses hardcoded Go renderers instead of llama.cpp's Jinja2 template engine, sampling is a Go rewrite instead of llama.cpp's `llama-sampler.cpp`, and the model runner is `ollamarunner` instead of llama.cpp's HTTP server. This means llama.cpp bugs in GGML affect Ollama, but llama.cpp's correct Jinja2 template handling does NOT help Ollama — Ollama must reimplement the same logic in Go renderers and parsers.
 **Upstream Ollama (previous):** `ollama/ollama` master @ `82848a78` (commit message: `model: fix renderer and parser for qwen3.5 (#14605)`)
@@ -195,10 +195,11 @@ Note: `ssm.v_head_reordered` and `rope.mrope_interleaved` are **ollama-internal 
 
 ## Part 2: Qwen 3.5 Renderer and Parser — Dedicated Implementation
 
-The fork now has a dedicated `Qwen35Renderer` (`model/renderers/qwen35.go`, 195 lines) and `Qwen35Parser` (`model/parsers/qwen35.go`, 239 lines), ported from upstream Ollama's `82848a78` implementation with three fixes applied. The `Qwen35Parser` is byte-for-byte identical to upstream Ollama. The `Qwen35Renderer` differs from upstream in three places:
+The fork now has a dedicated `Qwen35Renderer` (`model/renderers/qwen35.go`, 195 lines) and `Qwen35Parser` (`model/parsers/qwen35.go`, 239 lines), ported from upstream Ollama's `82848a78` implementation with four fixes applied. The `Qwen35Parser` is byte-for-byte identical to upstream Ollama. The `Qwen35Renderer` differs from upstream in four places:
 1. **Prefill bug fix** (line 136): adds `&& len(message.ToolCalls) == 0` — see Section 1.1
 2. **History think block fix** (line 143): removes `isThinking &&` — unconditional `<think>` wrapping matching official Jinja2 template — see Section 2.5
 3. **Reasoning extraction fix** (line 65): `splitQwen35ReasoningContent` no longer takes `isThinking` parameter — always uses `messageThinking` when available — see Section 2.5
+4. **Multiple `</think>` tag fix** (line 81): uses `strings.LastIndex` for remaining content extraction instead of `strings.Index`, matching the official template's `content.split('</think>')[-1]` semantics — remaining content comes from after the LAST `</think>`, not the first
 
 The previous approach of routing `"qwen3.5"` through `Qwen3CoderRenderer`/`Qwen3CoderParser` caused seven distinct template fidelity problems (sections 2.1–2.7 below), **all now resolved**. All existing tests pass, and 17 new tests (5 renderer + 11 parser + 1 integration routing test in `qwen3_test.go:211`) cover the new code.
 
@@ -355,23 +356,29 @@ The fork now fixes the **full tool-definition serialization path** by switching 
 
 *Shared infrastructure concern (verified):* `marshalWithSpaces` is called by the Olmo3, Qwen 3.5, and Qwen3VL renderers. Official HuggingFace templates for `Qwen/Qwen3.5-*`, `Qwen/Qwen3-VL-*`, `allenai/Olmo-3-7B-Instruct`, and `allenai/Olmo-3.1-32B-Instruct` all use `tools | tojson` for tool definitions, so disabling HTML escaping is correct for those paths.
 
-### 4.2 Sub-Bug B — Key Ordering at `ToolFunctionParameters` Level — OPEN
+### 4.2 Sub-Bug B — Key Ordering in Tool Definition Serialization — OPEN
 
-Go's `json.Marshal` outputs struct fields in declaration order. Empirically verified by running Go's `json.Marshal` on the actual Ollama `api.Tool` struct types and comparing against HuggingFace's `get_json_schema()` output:
+Go's `json.Marshal` outputs struct fields in declaration order and sorts `map[string]any` keys alphabetically. Empirically verified by running Go's `json.Marshal` on the actual Ollama `api.Tool` struct types and comparing against HuggingFace's `get_json_schema()` output (traced through `chat_template_utils.py` source code — `_parse_type_hint()` constructs dicts with specific insertion order, then `get_json_schema()` appends fields like `description` and `enum` in a specific sequence, and Python's `json.dumps` with `sort_keys=False` preserves that insertion order):
 
-| Nesting level | Go struct field order | HuggingFace / OpenAI convention | Match? |
+| Nesting level | Go struct field order | HuggingFace `get_json_schema()` insertion order | Match? |
 |---|---|---|---|
 | `Tool` | `type`, `function` | `type`, `function` | **Yes** |
 | `ToolFunction` | `name`, `description`, `parameters` | `name`, `description`, `parameters` | **Yes** |
 | `ToolFunctionParameters` | `type`, `required`, `properties` | `type`, `properties`, `required` | **No — `required`/`properties` swapped** |
-| `ToolProperty` | `type`, `description`, `enum` | `type`, `description`, `enum` | **Yes** |
+| `ToolProperty` (with enum) | `type`, `description`, `enum` | `type`, `enum`, `description` | **No — `enum`/`description` swapped** |
+| `ToolProperty` (no enum) | `type`, `description` | `type`, `description` | **Yes** |
+| `ToolProperty.Items` (as `map[string]any`) | alphabetical (e.g., `description`, `type`) | insertion order (e.g., `type`, `description`) | **No — Go alphabetizes map keys** |
 | `ToolPropertiesMap` (property names) | insertion order (orderedmap) | insertion order | **Yes** |
 
-The only structural key ordering mismatch is at the `ToolFunctionParameters` level. Both HuggingFace's `get_json_schema()` function (at `chat_template_utils.py:210-213`) and the OpenAI function calling convention put `properties` before `required`.
+The `ToolProperty` enum/description mismatch arises because `_parse_type_hint()` at `chat_template_utils.py:139-142` constructs `{"type": ..., "enum": [...]}` first, then `get_json_schema()` at line 380 appends `schema["description"] = desc` last. Python dicts preserve insertion order, so the training data has `enum` before `description`. Go's `ToolProperty` struct declares `Description` before `Enum`, producing the opposite order.
 
-**This is NOT a simple "swap two struct fields" fix.** `ToolFunctionParameters` is a shared type used by **every single renderer** in Ollama that supports tool calling. Python's `tojson` preserves **dict insertion order**, meaning the ordering is an artifact of how each model's specific Jinja2 template constructs its Python dicts. Different model families have different templates that may construct dicts in different orders.
+The `Items` mismatch arises because `ToolProperty.Items` is typed as Go `any`. When a client sends `"items": {"type": "string", "description": "..."}`, Go's `json.Unmarshal` stores it as `map[string]any`, and `json.Marshal` re-serializes with alphabetically sorted keys: `{"description": "...", "type": "string"}`. The training data has `type` before `description` (from `_parse_type_hint()` at line 149: `{"type": "array", "items": _parse_type_hint(args[0])}`).
 
-**Additional key ordering concern for `any`-typed fields**: Ollama's `ToolProperty.Items` and `ToolFunctionParameters.Defs` are typed as Go `any`. When JSON is unmarshaled into these fields, nested objects become `map[string]any`, and Go's `json.Marshal` sorts those keys **alphabetically**. This affects tools with array parameters whose `items` contain nested object schemas.
+**Concrete byte comparison** (empirically verified with Go and Python producing the same tool definition):
+- **Python (training data):** `..., "format": {"type": "string", "enum": ["json", "xml"], "description": "Output format"}, ...`
+- **Go (fork output):** `..., "format": {"type": "string", "description": "Output format", "enum": ["json", "xml"]}, ...`
+
+**This is NOT a simple "swap a few struct fields" fix.** `ToolFunctionParameters` and `ToolProperty` are shared types used by **every single renderer** in Ollama that supports tool calling. Python's `tojson` preserves **dict insertion order**, meaning the ordering is an artifact of how each model's specific Jinja2 template constructs its Python dicts. Different model families have different templates that may construct dicts in different orders. The `Items` issue is harder still — it requires either a custom ordered-map type (like `ToolPropertiesMap`) or renderer-local marshaling to preserve insertion order through a JSON round-trip.
 
 The correct approach is one of:
 1. **Renderer-local custom marshaling** — Have Qwen renderers control field ordering, leaving shared struct untouched
@@ -410,7 +417,7 @@ However, llama.cpp's `tojson` has **one minor flaw**: float serialization at `va
 
 ### 4.5 KV Cache Round-Trip Test (`server/qwen35_kvcache_roundtrip_test.go`)
 
-The fork has 26 parameterized test cases covering round-trip consistency. The `allowCanonicalizationDrift` mechanism is broken — it checks raw form versus raw form instead of re-rendered form. The tests correctly identify 4 classes of round-trip failures: spacing, key ordering, number lexical forms, and HTML escaping.
+The fork has 22 parameterized test cases covering round-trip consistency. The `allowCanonicalizationDrift` mechanism is broken — it checks raw form versus raw form instead of re-rendered form. The tests correctly identify 4 classes of round-trip failures: spacing, key ordering, number lexical forms, and HTML escaping.
 
 ### 4.6 Prerequisite Research for Remaining Fixes
 
@@ -734,7 +741,9 @@ llama.cpp demonstrates this works using `split_equal(n_ubatch, true)` — per-se
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| JSON serialization key ordering in `ToolFunctionParameters` | Remaining distribution shift on tool-definition key ordering | **OPEN** |
+| `ToolFunctionParameters` key ordering: `required` before `properties` (should be reversed) | Distribution shift on every tool definition in every system prompt | **OPEN** |
+| `ToolProperty` key ordering: `description` before `enum` (should be reversed) | Distribution shift on tool parameters with enumerated values | **OPEN** |
+| `ToolProperty.Items` map key alphabetization: `any`-typed field loses insertion order | Distribution shift on tools with array parameters whose `items` have multiple fields | **OPEN** |
 
 ### Performance Opportunities
 
@@ -807,7 +816,7 @@ Ollama bundles vision tensors into the main GGUF (1307 tensors). llama.cpp uses 
 | Priority | Item | Effort | Status |
 |----------|------|--------|--------|
 | **P0** | Adopt CUDA async copy + reduced sync from `ggml-cuda.cu` and `ggml-backend.cpp` | Medium (2 files, conflict resolution) | **OPEN** |
-| **P1** | Fix `required`/`properties` key ordering in `ToolFunctionParameters` — requires per-model template verification or renderer-local marshaling | Medium-High | **OPEN** |
+| **P1** | Fix tool definition key ordering: `ToolFunctionParameters` (`required`/`properties` swapped), `ToolProperty` (`enum`/`description` swapped), and `Items` map key alphabetization — requires per-model template verification or renderer-local marshaling | Medium-High | **OPEN** |
 | **P1** | Adopt M-RoPE `can_shift()` guard in vendored `llama-kv-cache.cpp` | Small (3 lines) | **OPEN** |
 | **P2** | Increase `num_batch` to 2048 in the Modelfile | Zero (config-only) | **OPEN** |
 | **P3** | Verify `Qwen3VLRenderer` thinking variant needs `emitEmptyThinkOnNoThink: true` | Research | **OPEN** |

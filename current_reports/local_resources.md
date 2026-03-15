@@ -4,7 +4,7 @@
 
 | Path | Description |
 |------|-------------|
-| `/home/user/shared_vm/ollama/` | **BigBIueWhale/ollama** fork @ `c90b3cbe` — 11 commits atop `v0.17.4` merge (tag `v0.17.4-bbl.5`). Merge base: `cc90a035`. Remote `origin` = `https://github.com/BigBIueWhale/ollama.git`, remote `upstream` = `https://github.com/ollama/ollama.git` |
+| `/home/user/shared_vm/ollama/` | **BigBIueWhale/ollama** fork, branch `main`, merge base `cc90a035` (Ollama `v0.17.4`). Use `git log --oneline cc90a035..HEAD` for the current commit list. Remote `origin` = `https://github.com/BigBIueWhale/ollama.git`, remote `upstream` = `https://github.com/ollama/ollama.git` |
 
 ### Key fork source files
 
