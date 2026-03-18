@@ -364,7 +364,7 @@ Go's `json.Marshal` outputs struct fields in declaration order and sorts `map[st
 |---|---|---|---|
 | `Tool` | `type`, [`items`†], `function` | `type`, `function` | **Yes**† |
 | `ToolFunction` | `name`, `description`, `parameters` | `name`, `description`, `parameters` | **Yes** |
-| `ToolFunctionParameters` | `type`, [`$defs`†], [`items`†], `required`, `properties` | `type`, `properties`, `required` | **No — `required`/`properties` swapped** |
+| `ToolFunctionParameters` | `type`, [`$defs`†], [`items`†], [`required`‡], `properties` | `type`, `properties`, [`required`‡] | **No — `required`/`properties` swapped** |
 | `ToolProperty` (with enum) | `type`, `description`, `enum` | `type`, `enum`, `description` | **No — `enum`/`description` swapped** |
 | `ToolProperty` (no enum) | `type`, `description` | `type`, `description` | **Yes** |
 | `ToolProperty` (`Optional[T]`) | `type`, `description` | `type`, `nullable`, `description` | **No — `nullable` field lost** |
@@ -374,6 +374,8 @@ Go's `json.Marshal` outputs struct fields in declaration order and sorts `map[st
 | `ToolPropertiesMap` (property names) | insertion order (orderedmap) | insertion order | **Yes** |
 
 †`Tool.Items` (`api/types.go:322`), `ToolFunctionParameters.$defs` (`api/types.go:489`), and `ToolFunctionParameters.Items` (`api/types.go:490`) are `omitempty` fields not produced by HuggingFace's `get_json_schema()`. When nil (the common case), they are hidden. If present (from a client-provided schema), they affect serialization order and suffer the same `map[string]any` alphabetization as `ToolProperty.Items`.
+
+‡`ToolFunctionParameters.Required` (`api/types.go:491`) also has `omitempty`, correctly matching Python's conditional `if required: schema["required"] = required` guard at `chat_template_utils.py:211-212` — when no parameters are required, both Go and Python omit the field entirely. The ordering deviation (before `properties` in Go, after in Python) applies only when `required` is present, which is the common case for tool-calling models.
 
 The `ToolProperty` enum/description mismatch arises because `_parse_type_hint()` at `chat_template_utils.py:139-142` constructs `{"type": ..., "enum": [...]}` first, then `get_json_schema()` at line 380 appends `schema["description"] = desc` last. Python dicts preserve insertion order, so the training data has `enum` before `description`. Go's `ToolProperty` struct declares `Description` before `Enum`, producing the opposite order. (The same ordering holds when `enum` comes from a docstring's `(choices: ...)` block instead of a `Literal` type hint — `get_json_schema()` at line 378 inserts `schema["enum"]` before line 380 inserts `schema["description"]`, producing the same `enum`-before-`description` order.)
 
