@@ -296,15 +296,15 @@ Not needed. The fork's `splitQwen35ReasoningContent` is a pure function of its t
 
 ---
 
-## Gap 4: The Tool Definition Field Ordering Test Locks In the Wrong Ordering
+## Gap 4: ~~The Tool Definition Field Ordering Test Locks In the Wrong Ordering~~ PARTIALLY DONE — `TestQwen35RendererToolDefinitionsMatchOfficialTemplate`
 
-**What the bug is:** The `TestQwen35RendererToolDefinitionsUseLiteralHTMLChars` test in `model/renderers/qwen35_test.go` locks in the wrong JSON field ordering as the expected output. The official Qwen 3.5 Jinja2 template does `{{ tool | tojson }}`. Crucially, HuggingFace Transformers overrides Jinja2's default `tojson` filter (at `chat_template_utils.py:463-466`) with a custom implementation that uses `json.dumps(sort_keys=False, ensure_ascii=False)` — no key sorting and no HTML escaping. This means `tojson` preserves the caller's dict insertion order. Stock Jinja2's `tojson` does the opposite: it uses `sort_keys=True` and HTML-escapes `<>&` to Unicode escape sequences (`\u003c`, `\u003e`, `\u0026`). llama.cpp's Jinja2 engine matches HuggingFace's behavior (insertion order preserved via `as_ordered_object()` at `value.cpp:1330`, no HTML escaping, and `sort_keys=true` throws `not_implemented_exception` at `value.cpp:176`). Since both major inference frameworks agree, and the model was trained with HuggingFace's `apply_chat_template`, the ground truth is: insertion order preserved, no HTML escaping, no key sorting. Running the official template through HuggingFace Transformers' `_compile_jinja_template` with the test's exact tools produces:
+**What the bug was:** The `TestQwen35RendererToolDefinitionsUseLiteralHTMLChars` test in `model/renderers/qwen35_test.go` locked in the wrong JSON field ordering as the expected output. The official Qwen 3.5 Jinja2 template does `{{ tool | tojson }}`. Crucially, HuggingFace Transformers overrides Jinja2's default `tojson` filter (at `chat_template_utils.py:463-466`) with a custom implementation that uses `json.dumps(sort_keys=False, ensure_ascii=False)` — no key sorting and no HTML escaping. This means `tojson` preserves the caller's dict insertion order. Stock Jinja2's `tojson` does the opposite: it uses `sort_keys=True` and HTML-escapes `<>&` to Unicode escape sequences (`\u003c`, `\u003e`, `\u0026`). llama.cpp's Jinja2 engine matches HuggingFace's behavior (insertion order preserved via `as_ordered_object()` at `value.cpp:1330`, no HTML escaping, and `sort_keys=true` throws `not_implemented_exception` at `value.cpp:176`). Since both major inference frameworks agree, and the model was trained with HuggingFace's `apply_chat_template`, the ground truth is: insertion order preserved, no HTML escaping, no key sorting. Running the official template through HuggingFace Transformers' `_compile_jinja_template` with the test's exact tools produces:
 
 ```
 "parameters": {"type": "object", "properties": {"location": {...}, "filters": {"type": "array", "items": {"type": "string", "description": "..."}}}, "required": ["location"]}
 ```
 
-The test expects:
+The old test expected:
 
 ```
 "parameters": {"type": "object", "required": ["location"], "properties": {"location": {...}, "filters": {"type": "array", "items": {"description": "...", "type": "string"}}}}
@@ -312,11 +312,17 @@ The test expects:
 
 Two differences, both caused by Go's serialization behavior:
 
-1. **`required` before `properties`** — Go's `ToolFunctionParameters` struct declares `Required` before `Properties`. Training data has `properties` first (from `get_json_schema()` constructing `{"type": "object", "properties": ...}` then appending `required`). This is the real bug — it affects every tool definition in every system prompt. **This fix is safe to apply globally** by reordering the Go struct fields in `api/types.go`: since `p` < `r` alphabetically, even stock Jinja2's `sort_keys=True` produces `properties` before `required`. Every Python/Jinja2 configuration agrees on this ordering. Per-model template verification confirmed: Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, and GLM-4 all use `tojson` (insertion order preserved → `properties` first); DeepSeek V3's template doesn't render tool definitions; gated models (Cogito, LFM2, GLM-OCR) are safe regardless because both possible Python orderings agree.
+1. **`required` before `properties`** — **FIXED.** The `ToolFunctionParameters` struct in `api/types.go` was reordered to declare `Properties` before `Required`, matching every Python/Jinja2 configuration (both HF Transformers' insertion-order-preserving override and stock Jinja2's alphabetical sorting, since `p` < `r`). Per-model template verification confirmed this is safe globally: Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, and GLM-4 all use `tojson` (insertion order preserved → `properties` first); DeepSeek V3's template doesn't render tool definitions; gated models (Cogito, LFM2, GLM-OCR) are safe regardless because both possible Python orderings agree. All collateral test breakage in other renderers (Cogito, DeepSeek, GLM-4.7, GLM-4.6, OLMo3) and `api/types_test.go` was fixed simultaneously.
 
-2. **`items` keys alphabetized** — Go's `map[string]any` sorts keys, producing `{"description": ..., "type": ...}` instead of `{"type": ..., "description": ...}`. This is a non-issue for training data: `get_json_schema()` never adds `description` to items sub-objects (items are single-key `{"type": "..."}` dicts). Only affects hand-crafted client schemas with multi-key items.
+2. **`items` keys alphabetized** — **OPEN.** Go's `map[string]any` sorts keys, producing `{"description": ..., "type": ...}` instead of `{"type": ..., "description": ...}`. This is a non-issue for training data: `get_json_schema()` never adds `description` to items sub-objects (items are single-key `{"type": "..."}` dicts). Only affects hand-crafted client schemas with multi-key items. Fixing this requires an ordered map type for the `Items any` field in `ToolProperty` — not yet implemented.
 
-**What needs to change:** The test's expected JSON should match the official template output. The `required`/`properties` fix is the priority and is safe to apply globally (struct field reorder in `api/types.go`). The `items` alphabetization fix is lower priority and requires a different approach (ordered map type or renderer-local marshaling). See `consolidated_report.md` Part 4 for the full analysis of all field ordering issues (including `enum`/`description` in `ToolProperty`, which this test does not exercise — that fix is NOT safe to apply globally because stock Jinja2 and HF Transformers disagree on `d`/`e` alphabetical vs insertion ordering).
+**What was done:** The test was renamed to `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` and rewritten to enforce the exact HuggingFace ground truth output. The expected JSON was generated by running HuggingFace Transformers v5.2.0's `_compile_jinja_template` on the official `Qwen/Qwen3.5-27B` `chat_template.jinja`. The test enforces three properties with specific failure messages:
+
+1. **No HTML escaping** — checks for `\u003c`, `\u003e`, `\u0026` and explains the HF Transformers `ensure_ascii=False` override and llama.cpp's literal character output.
+2. **`properties` before `required`** — now passes after the struct reorder.
+3. **`type` before `description` in `items`** — the test currently **fails** on this assertion because Go's `json.Marshal` alphabetizes `map[string]any` keys. The failure message explains the root cause (Go map key sorting vs HF/llama.cpp insertion order preservation) and the common causes of each type of mismatch.
+
+See `consolidated_report.md` Part 4 for the full analysis of all field ordering issues (including `enum`/`description` in `ToolProperty`, which this test does not exercise — that fix is NOT safe to apply globally because stock Jinja2 and HF Transformers disagree on `d`/`e` alphabetical vs insertion ordering).
 
 ---
 

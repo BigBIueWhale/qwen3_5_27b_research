@@ -353,7 +353,7 @@ The fork now fixes the **full tool-definition serialization path** by switching 
 
 *Shared infrastructure concern (verified):* `marshalWithSpaces` is called by the Olmo3, Qwen 3.5, and Qwen3VL renderers. Official HuggingFace templates for `Qwen/Qwen3.5-*`, `Qwen/Qwen3-VL-*`, `allenai/Olmo-3-7B-Instruct`, and `allenai/Olmo-3.1-32B-Instruct` all use `tools | tojson` for tool definitions, so disabling HTML escaping is correct for those paths.
 
-### 4.2 Sub-Bug B — Key Ordering and Field Loss in Tool Definition Serialization — OPEN
+### 4.2 Sub-Bug B — Key Ordering and Field Loss in Tool Definition Serialization — PARTIALLY DONE (`required`/`properties` fixed; `enum`/`description` and field loss remain OPEN)
 
 Go's `json.Marshal` outputs struct fields in declaration order and sorts `map[string]any` keys alphabetically. Additionally, Go's `ToolProperty` struct lacks three fields that HuggingFace's `_parse_type_hint()` can produce — `nullable`, `additionalProperties`, and `prefixItems` — which are silently dropped during JSON deserialization. Both issues were empirically verified by running Go's `json.Marshal` on the actual Ollama `api.Tool` struct types and comparing against HuggingFace's `get_json_schema()` output (traced through `chat_template_utils.py` source code — `_parse_type_hint()` constructs dicts with specific insertion order, then `get_json_schema()` appends fields like `description` and `enum` in a specific sequence, and Python's `json.dumps` with `sort_keys=False` preserves that insertion order):
 
@@ -749,7 +749,7 @@ llama.cpp demonstrates this works using `split_equal(n_ubatch, true)` — per-se
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| `ToolFunctionParameters` key ordering: `required` before `properties` (should be reversed) | Distribution shift on every tool definition in every system prompt. **Safe to fix globally** — every Python/Jinja2 configuration produces `properties` first (`p` < `r` alphabetically, and HF insertion order also puts `properties` first). Per-model verification complete. | **OPEN** |
+| `ToolFunctionParameters` key ordering: `required` before `properties` (should be reversed) | Distribution shift on every tool definition in every system prompt. **Safe to fix globally** — every Python/Jinja2 configuration produces `properties` first (`p` < `r` alphabetically, and HF insertion order also puts `properties` first). Per-model verification complete. | **DONE** — struct reordered in `api/types.go`, all renderer and API tests updated |
 | `ToolProperty` key ordering: `description` before `enum` (should be reversed for HF-trained models) | Distribution shift on tool parameters with enumerated values. **NOT safe to fix globally** — stock Jinja2 (`sort_keys=True`) produces `description` first (`d` < `e`), matching Go's current order; only HF Transformers' insertion-order override produces `enum` first. Requires per-model verification or renderer-local fix. | **OPEN** |
 | `ToolProperty.Items` map key alphabetization | Non-issue for training data (items are single-key dicts) | **Won't fix** |
 
@@ -824,7 +824,7 @@ Ollama bundles vision tensors into the main GGUF (1307 tensors). llama.cpp uses 
 | Priority | Item | Effort | Status |
 |----------|------|--------|--------|
 | **P0** | Adopt CUDA async copy + reduced sync from `ggml-cuda.cu` and `ggml-backend.cpp` | Medium (2 files, conflict resolution) | **OPEN** |
-| **P1** | Fix `ToolFunctionParameters` key ordering: move `Properties` before `Required` in `api/types.go` — per-model verification complete, safe to apply globally (every Python/Jinja2 config produces `properties` before `required` because `p` < `r` alphabetically) | Small | **OPEN** |
+| ~~**P1**~~ | ~~Fix `ToolFunctionParameters` key ordering: move `Properties` before `Required` in `api/types.go`~~ | ~~Small~~ | **DONE** — struct reordered, all tests updated, test renamed to `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` with HF ground truth |
 | **P2** | Fix `ToolProperty` key ordering (`enum`/`description` swapped) — requires renderer-local marshaling or per-model verification because stock Jinja2 (`d` < `e`) and HF Transformers (insertion order) disagree | Medium | **OPEN** |
 | **P1** | Adopt M-RoPE `can_shift()` guard in vendored `llama-kv-cache.cpp` | Small (3 lines) | **OPEN** |
 | **P2** | Increase `num_batch` to 2048 in the Modelfile | Zero (config-only) | **OPEN** |
