@@ -65,8 +65,8 @@ The important Devstral-specific point: **Devstral Small 2 (`mistralai/Devstral-S
 
 **Fault: Upstream Ollama (`82848a78` through `9896e36`, still unfixed).** All three upstream Ollama renderers — `qwen35.go`, `qwen3coder.go`, `qwen3vl.go` — have this bug. The fork correctly fixed it in commit `fbae6976` by adding `&& len(message.ToolCalls) == 0` to the prefill condition in all three renderers. llama.cpp does not have this bug — it uses `add_generation_prompt` as a separate parameter passed to the Jinja2 template, which never conflates message closure with generation prompt skipping. Prefill is an Ollama-specific concept that llama.cpp does not need.
 
-**Upstream bug locations**: `qwen35.go:136`, `qwen3coder.go:140`, `qwen3vl.go:82`
-**Fork fix locations**: `qwen35.go:136`, `qwen3coder.go:159` (line differs from upstream because the fork added thinking support to `Qwen3CoderRenderer` in prior commits), `qwen3vl.go:82`
+**Upstream bug locations**: the prefill condition in `Render()` in `qwen35.go`, `qwen3coder.go`, and `qwen3vl.go`
+**Fork fix locations**: same — the fork added `&& len(message.ToolCalls) == 0` to the prefill condition in all three renderers
 
 All three upstream Ollama renderers have:
 ```go
@@ -80,32 +80,29 @@ prefill := lastMessage && message.Role == "assistant" && len(message.ToolCalls) 
 
 This treats any last assistant message as a prefill, **including messages with tool calls**. The consequences differ by renderer:
 
-**In `qwen35.go` and `qwen3vl.go`** — **doubly broken**: The `<|im_end|>` tag is gated by `if !prefill` (`qwen35.go:169`, `qwen3vl.go:122`), so when `prefill=true` on an assistant+toolcalls message, BOTH the `<|im_end|>` is omitted AND the generation prompt (`<|im_start|>assistant\n<think>\n`) is skipped. The rendered prompt ends with `</tool_call>` — no closing tag, no new start. The model's view of the conversation is corrupted.
+**In `qwen35.go` and `qwen3vl.go`** — **doubly broken**: The `<|im_end|>` tag is gated by `if !prefill`, so when `prefill=true` on an assistant+toolcalls message, BOTH the `<|im_end|>` is omitted AND the generation prompt (`<|im_start|>assistant\n<think>\n`) is skipped. The rendered prompt ends with `</tool_call>` — no closing tag, no new start. The model's view of the conversation is corrupted.
 
-**In `qwen3coder.go`** — the tool-call branch unconditionally writes `<|im_end|>` (line 156), but the post-loop generation prompt at lines 187-189 is gated by `if lastMessage && !prefill`, which is skipped since `prefill=true`. The model gets no `<|im_start|>assistant\n` to begin generating.
+**In `qwen3coder.go`** — the tool-call branch unconditionally writes `<|im_end|>`, but the post-loop generation prompt is gated by `if lastMessage && !prefill`, which is skipped since `prefill=true`. The model gets no `<|im_start|>assistant\n` to begin generating.
 
-**When does this trigger?** Any time a client sends a chat request where the last message is an assistant message with tool calls populated: a client replays a conversation from saved history that ended at a tool-call boundary, an agent framework constructs the message list with the assistant's tool-call message last, or the fork's own test suite (`qwen3coder_test.go:327-376`) proves this is an expected and tested input shape.
+**When does this trigger?** Any time a client sends a chat request where the last message is an assistant message with tool calls populated: a client replays a conversation from saved history that ended at a tool-call boundary, an agent framework constructs the message list with the assistant's tool-call message last, or the fork's own test suite (the `TestQwenToolParser` cases in `qwen3coder_test.go`) proves this is an expected and tested input shape.
 
 The official Qwen 3.5 Jinja2 template emits `{{- '<|im_end|>\n' }}` for every assistant message — this line appears outside any conditional block in the template and runs unconditionally regardless of tool calls, thinking mode, message position, or any other state. The `add_generation_prompt` flag is a separate concern — it controls whether `<|im_start|>assistant\n<think>\n` is appended after all messages, independently of message closures. Ollama's prefill conflates two things (omitting `<|im_end|>` for streaming continuation, and skipping the generation prompt) that the official template keeps strictly independent. The `len(message.ToolCalls) == 0` guard restores the separation: assistant messages with tool calls are complete turns (always closed), while assistant messages without tool calls may be prefills (left open for continuation).
 
 ### 1.2 MEDIUM: `</think>` Not Closed When Content Is Empty in `Qwen3VLRenderer`
 
-**Fault: Upstream Ollama (`82848a78` through `9896e36`, still unfixed).** The fork correctly fixed this in commit `fbae6976`. This no longer affects Qwen 3.5 (which uses its own dedicated `Qwen35Renderer`, which always closes `</think>` at line 144). But `Qwen3VLRenderer` is still used by `qwen3-vl-instruct` and `qwen3-vl-thinking`, where this bug remains live in upstream Ollama.
+**Fault: Upstream Ollama (`82848a78` through `9896e36`, still unfixed).** The fork correctly fixed this in commit `fbae6976`. This no longer affects Qwen 3.5 (which uses its own dedicated `Qwen35Renderer`, which always closes `</think>`). But `Qwen3VLRenderer` is still used by `qwen3-vl-instruct` and `qwen3-vl-thinking`, where this bug remains live in upstream Ollama.
 
-**File**: `model/renderers/qwen3vl.go:96-100`
+**File**: `model/renderers/qwen3vl.go`, in the `Render()` method's assistant message handling
 
 Upstream Ollama conditionally emits `\n</think>\n\n` only when `content != ""`. For thinking-only assistant messages (thinking content but empty visible content), the `<think>` tag is opened but `</think>` is never written. The fork always writes `\n</think>\n\n` before conditionally writing content. llama.cpp always closes `</think>` — the Jinja2 template itself always emits the closing tag.
 
 ### 1.3 CRITICAL: `mropeInterleaved` Defaults to `false` — Silent Data Corruption in Upstream Ollama for Third-Party GGUFs
 
-**Fault: Upstream Ollama (`82848a78` through `9896e36`, still unfixed).** The fork (commit `9ec17fc1`) correctly defaults to `c.Architecture() != "qwen3next"` at `model.go:589`, which evaluates to `true` for `qwen35` — matching llama.cpp's approach. llama.cpp (`d969e933`) **hardcodes** the RoPE type per architecture in `llama_model_rope_type()` at `llama-model.cpp:9109-9113`: `case LLM_ARCH_QWEN35: return LLAMA_ROPE_TYPE_IMROPE` (value 40). This is a **silent data corruption bug** in upstream Ollama.
-
-**Upstream Ollama line**: `model/models/qwen3next/model.go:641`
-**Fork line**: `model/models/qwen3next/model.go:589`
+**Fault: Upstream Ollama (`82848a78` through `9896e36`, still unfixed).** The fork (commit `9ec17fc1`) correctly defaults to `c.Architecture() != "qwen3next"` in `New()` in `model/models/qwen3next/model.go`, which evaluates to `true` for `qwen35` — matching llama.cpp's approach. llama.cpp (`d969e933`) **hardcodes** the RoPE type per architecture in `llama_model_rope_type()` at `llama-model.cpp:9109-9113`: `case LLM_ARCH_QWEN35: return LLAMA_ROPE_TYPE_IMROPE` (value 40). This is a **silent data corruption bug** in upstream Ollama.
 
 Upstream Ollama defaults to `false`. The fork defaults based on architecture. Third-party GGUFs (from llama.cpp's converter, Unsloth, bartowski) do not write the ollama-internal `rope.mrope_interleaved` key (it is not in llama.cpp's GGUF constants at `gguf-py/gguf/constants.py`, confirmed in `d969e933`). The actual Qwen 3.5 27B model has `mrope_interleaved: true` (matching llama.cpp's hardcoded `LLAMA_ROPE_TYPE_IMROPE`).
 
-**Concrete impact traced through code**: `mropeInterleaved` controls the RoPE type at `model.go:67-75`:
+**Concrete impact traced through code**: `mropeInterleaved` controls the RoPE type in the model's RoPE initialization:
 - `true` → `rope.WithInterleaveMRoPE()` → sets `opts.Type |= 1<<3 | 1<<5` = **40** = `GGML_ROPE_TYPE_IMROPE`
 - `false` → `rope.WithMRoPE()` → sets `opts.Type |= 1<<3` = **8** = `GGML_ROPE_TYPE_MROPE`
 
@@ -120,18 +117,18 @@ Note: `ssm.v_head_reordered` defaults are functionally equivalent between fork (
 The repetition penalty was introduced by Keskar et al. (2019) in the CTRL paper (arXiv:1909.05858). The paper's formula operates over *"generated tokens g"* — the set of tokens the model has produced during inference. Prompt tokens are not in `g`.
 
 **Upstream Ollama** feeds prompt tokens into the penalty history via the public `Accept()` method called from the runner at **two call sites**:
-1. **Sequence load** (`runner.go:951-957`): `seq.sampler.Reset()` then loops through ALL cached inputs calling `seq.sampler.Accept(inp.Token)`. The last 64 prompt tokens become part of the penalty window.
-2. **Batch processing** (`runner.go:694-701`): As pending input tokens are committed to the cache, each token is `Accept()`-ed. Both prompt tokens and generated tokens flow through this path.
+1. **Sequence load** (in `processSequence()` in `runner.go`): `seq.sampler.Reset()` then loops through ALL cached inputs calling `seq.sampler.Accept(inp.Token)`. The last 64 prompt tokens become part of the penalty window.
+2. **Batch processing** (in `processBatch()` in `runner.go`): As pending input tokens are committed to the cache, each token is `Accept()`-ed. Both prompt tokens and generated tokens flow through this path.
 
 **llama.cpp** (`d969e933` through `a0ed91a`) has the same behavior. The server's `init_sampler()` at `server-context.cpp:208-212` loops through ALL prompt tokens and calls `common_sampler_accept(smpl.get(), id, false)` on each one. The penalty sampler at `llama-sampler.cpp:2622-2656` uses a ring buffer that makes no distinction between prompt-origin and generation-origin tokens. The penalty sampler in `llama-sampler.cpp` is **byte-identical** between `d969e933` and the latest `a0ed91a`. Defaults unchanged: `penalty_repeat=1.0` (disabled), `penalty_last_n=64`.
 
 This is the same mistake HuggingFace `transformers` made (and [acknowledged as a bug](https://github.com/huggingface/transformers/issues/36642) — users reported *"weird strings"* and false penalization of common phrases, fixed in [PR #37625](https://github.com/huggingface/transformers/pull/37625), April 2025). llama.cpp users reported the [same problem](https://github.com/ggml-org/llama.cpp/issues/331).
 
-**The fork's architecture** (`sample/samplers.go:19-32`): The `Sampler` struct contains `recentTokens []int32` (ring buffer), `recentTokenPos int` (write cursor), and `repeatLastN int` (window size from API, user-configurable). The private `recordToken()` method (lines 196-206) implements a classic circular buffer: O(1) per token, zero allocations after warmup, permanently bounded at `repeatLastN` entries. The runner's only interaction is `seq.sampler.Sample(logits)` — it never touches internal state. No external code can feed prompt tokens into the penalty window.
+**The fork's architecture** (in `sample/samplers.go`): The `Sampler` struct contains `recentTokens []int32` (ring buffer), `recentTokenPos int` (write cursor), and `repeatLastN int` (window size from API, user-configurable). The private `recordToken()` method implements a classic circular buffer: O(1) per token, zero allocations after warmup, permanently bounded at `repeatLastN` entries. The runner's only interaction is `seq.sampler.Sample(logits)` — it never touches internal state. No external code can feed prompt tokens into the penalty window.
 
 **llama.cpp's ring buffer architecture** (`d969e933`, `llama-sampler.cpp:23-132`): Uses a proper `ring_buffer<llama_token>` template class with the same design — fixed capacity, O(1) push, modular arithmetic. The key difference: llama.cpp's `llama_sampler_penalties_accept()` is a **public** function called by external code (the server feeds prompt tokens through it), while the fork's `recordToken()` is **private** and called only from `Sample()`.
 
-**Upstream Ollama's history architecture** (`sample/samplers.go:21-32`): The `Sampler` struct contains `history []int32` (an append-then-truncate slice). `Accept()` (lines 38-43) appends the token, then if `len(history) > DefaultPenaltyLookback`, copies the last 64 entries to the front and truncates — a **slide-and-truncate** pattern (O(n) per trim, allocates on growth). `Reset()` sets history to nil. The runner calls these externally at 3 separate call sites.
+**Upstream Ollama's history architecture** (in `sample/samplers.go`): The `Sampler` struct contains `history []int32` (an append-then-truncate slice). `Accept()` appends the token, then if `len(history) > DefaultPenaltyLookback`, copies the last 64 entries to the front and truncates — a **slide-and-truncate** pattern (O(n) per trim, allocates on growth). `Reset()` sets history to nil. The runner calls these externally at 3 separate call sites.
 
 **All three penalty types share the same token window — not just `repeatPenalty`.** The `applyPenalties()` function takes a single `recentTokens []int32` slice and applies ALL three penalty types in a single pass:
 
@@ -149,28 +146,28 @@ PARAMETER presence_penalty 1.5  # ACTIVE — the primary anti-repetition mechani
 
 The user disables `repeat_penalty` (1.0 = identity) and relies entirely on `presence_penalty 1.5` to prevent degenerate repetition. With the fork's architecture, this correctly penalizes self-repetition without touching prompt tokens. With upstream Ollama's architecture, `presence_penalty 1.5` would subtract 1.5 from the logit of every token in the last 64 tokens of history — including prompt tokens like tool names, JSON structural tokens, and parameter names. **A 1.5 logit subtraction is severe** (roughly halving the probability at typical logit scales), and applying it to prompt tokens would catastrophically degrade tool calling accuracy.
 
-**Cache shift behavior**: On normal cache shift, neither codebase touches the sampler. On the reprocess error path, upstream Ollama calls `seq.sampler.Reset()` (line 565), clearing the entire history — this is wrong because it destroys repetition penalty information at the exact moment it matters most. The fork does nothing to the ring buffer on either path, which is correct: cache shift is a memory management operation, not a semantic boundary.
+**Cache shift behavior**: On normal cache shift, neither codebase touches the sampler. On the reprocess error path, upstream Ollama calls `seq.sampler.Reset()`, clearing the entire history — this is wrong because it destroys repetition penalty information at the exact moment it matters most. The fork does nothing to the ring buffer on either path, which is correct: cache shift is a memory management operation, not a semantic boundary.
 
 One remaining nuance: the fork **does** penalize the model's own thinking tokens (they're generated), so if `<think>I need to call get_weather</think>` is shorter than 64 tokens, the `get_weather` tokens are still in the penalty window when the model emits the actual tool call. At `1.1` this is mild (~9% logit reduction), but users who raise the penalty to `1.5+` would break tool calling even with the fork's architecture.
 
 ### 1.5 `repeat_last_n` API Parameter — Silently Ignored in Upstream Ollama
 
-**Fault: Upstream Ollama.** The Go runner's `NewSampler` simply doesn't accept the parameter — the API field exists, the default exists (`api/types.go:1065`: `RepeatLastN: 64`), but nothing connects it to the sampler. The fork (commit `ab234955`) fixed this by adding `repeatLastN` as the 9th parameter to `NewSampler` and wiring `req.Options.RepeatLastN` through at `runner.go:899`. llama.cpp correctly wires `penalty_last_n`.
+**Fault: Upstream Ollama.** The Go runner's `NewSampler` simply doesn't accept the parameter — the API field exists, the default exists (`RepeatLastN: 64` in `api/types.go`), but nothing connects it to the sampler. The fork (commit `ab234955`) fixed this by adding `repeatLastN` as a parameter to `NewSampler` and wiring `req.Options.RepeatLastN` through in `runner.go`. llama.cpp correctly wires `penalty_last_n`.
 
-**Caveat**: The value IS respected in the legacy C++ `llamarunner` at `runner/llamarunner/runner.go:651`, which passes it to llama.cpp's C sampler. So this is a Go-runner-only regression, not a universal API lie. But the Go runner is the default for all new model architectures including `qwen3next`.
+**Caveat**: The value IS respected in the legacy C++ `llamarunner` (in `runner/llamarunner/runner.go`), which passes it to llama.cpp's C sampler. So this is a Go-runner-only regression, not a universal API lie. But the Go runner is the default for all new model architectures including `qwen3next`.
 
 ### 1.6 `repeatPenalty` Default — Reverted From 1.1 to 1.0 (Commit `57e3f80f`)
 
 The fork originally changed the default from `1.0` to `1.1` to make the penalty system functional out of the box. This was **reverted to `1.0`** in commit `57e3f80f` to avoid affecting non-Qwen models. The fork's ring-buffer architecture makes it safe to raise the penalty per-model via Modelfile without the prompt-token contamination that makes this dangerous in upstream Ollama and llama.cpp.
 
-The exact penalty math in all three codebases (fork `transforms.go:134-139`, upstream Ollama `transforms.go:50-57`, llama.cpp `llama-sampler.cpp:2690-2696`) is identical: `if logit > 0: logit /= repeatPenalty`, `if logit < 0: logit *= repeatPenalty`.
+The exact penalty math in all three codebases (fork's `applyPenalties()` in `transforms.go`, upstream Ollama's equivalent, llama.cpp's `llama-sampler.cpp`) is identical: `if logit > 0: logit /= repeatPenalty`, `if logit < 0: logit *= repeatPenalty`.
 
 ### 1.7 GGUF Converter Unconditional KV Emission
 
 **Fork converter** (`convert/convert_qwen3next.go`): Always writes both keys unconditionally:
 ```go
-kv["rope.mrope_interleaved"] = q.RopeParameters.MRopeInterleaved   // line 287
-kv["ssm.v_head_reordered"] = q.shouldReorderVHeads()                // line 314
+kv["rope.mrope_interleaved"] = q.RopeParameters.MRopeInterleaved
+kv["ssm.v_head_reordered"] = q.shouldReorderVHeads()
 ```
 
 **Upstream Ollama converter**: Only writes when `true`. For `rope.mrope_interleaved`, upstream's conditional emission is fine for Ollama-converted GGUFs (the converter writes `true` for `qwen35`), but third-party GGUFs that omit the key fall through to upstream's `false` default (wrong for `qwen35` — see Section 1.3).
@@ -179,11 +176,11 @@ Note: `ssm.v_head_reordered` and `rope.mrope_interleaved` are **ollama-internal 
 
 ### 1.8 Third-Party GGUF Compatibility Fixes
 
-- **`ssm_dt.bias` tensor name** (`deltanet.go:44`): `gguf:"ssm_dt,alt:ssm_dt.bias"`. Both fork and upstream have this — the alt tag allows loading GGUFs where the llama.cpp converter wrote `ssm_dt.bias` instead of `ssm_dt.weight`. **Shared fix.**
-- **Recurrent layer classification**: The fork uses the interval formula directly (`model.go:513-517`), bypassing the `headCountKV` array entirely. Upstream's `inferRecurrentLayers()` handles scalar broadcasts via a fallback path that reaches the same formula. Both produce correct results for all real-world GGUFs, but via different mechanisms.
+- **`ssm_dt.bias` tensor name** (in `deltanet.go`): `gguf:"ssm_dt,alt:ssm_dt.bias"`. Both fork and upstream have this — the alt tag allows loading GGUFs where the llama.cpp converter wrote `ssm_dt.bias` instead of `ssm_dt.weight`. **Shared fix.**
+- **Recurrent layer classification**: The fork uses the interval formula directly (in `New()` in `model.go`), bypassing the `headCountKV` array entirely. Upstream's `inferRecurrentLayers()` handles scalar broadcasts via a fallback path that reaches the same formula. Both produce correct results for all real-world GGUFs, but via different mechanisms.
 - **Architecture-based defaults for `mropeInterleaved`**: Fork-only fix — this is the critical one (see Section 1.3).
 - **Architecture-based defaults for `vHeadReordered`**: Functionally equivalent — both produce `true` for qwen35.
-- Both codebases have: `Validate()` method (`model.go:440-478`) catching missing tensors at load time, and inline nil checks in `GatedDeltaNet.Forward()` for `SSMDT`, `SSMA`, `SSMConv1D`, `SSMNorm`, and `SSMOut`.
+- Both codebases have: `Validate()` method (in `model.go`) catching missing tensors at load time, and inline nil checks in `GatedDeltaNet.Forward()` for `SSMDT`, `SSMA`, `SSMConv1D`, `SSMNorm`, and `SSMOut`.
 
 ### 1.9 Tokenizer Performance Optimizations
 
@@ -196,15 +193,15 @@ Note: `ssm.v_head_reordered` and `rope.mrope_interleaved` are **ollama-internal 
 ## Part 2: Qwen 3.5 Renderer and Parser — Dedicated Implementation
 
 The fork now has a dedicated `Qwen35Renderer` (`model/renderers/qwen35.go`, 195 lines) and `Qwen35Parser` (`model/parsers/qwen35.go`, 239 lines), ported from upstream Ollama's `82848a78` implementation with four fixes applied. The `Qwen35Parser` is byte-for-byte identical to upstream Ollama. The `Qwen35Renderer` differs from upstream in four places:
-1. **Prefill bug fix** (line 136): adds `&& len(message.ToolCalls) == 0` — see Section 1.1
-2. **History think block fix** (line 143): removes `isThinking &&` — unconditional `<think>` wrapping matching official Jinja2 template — see Section 2.5
-3. **Reasoning extraction fix** (line 65): `splitQwen35ReasoningContent` no longer takes `isThinking` parameter — always uses `messageThinking` when available — see Section 2.5
-4. **Multiple `</think>` tag fix** (line 81): uses `strings.LastIndex` for remaining content extraction instead of `strings.Index`, matching the official template's `content.split('</think>')[-1]` semantics — remaining content comes from after the LAST `</think>`, not the first
+1. **Prefill bug fix** (in the prefill condition in `Render()`): adds `&& len(message.ToolCalls) == 0` — see Section 1.1
+2. **History think block fix** (in the `<think>` wrapping condition in `Render()`): removes `isThinking &&` — unconditional `<think>` wrapping matching official Jinja2 template — see Section 2.5
+3. **Reasoning extraction fix** (in `splitQwen35ReasoningContent`): no longer takes `isThinking` parameter — always uses `messageThinking` when available — see Section 2.5
+4. **Multiple `</think>` tag fix** (in `splitQwen35ReasoningContent`): uses `strings.LastIndex` for remaining content extraction instead of `strings.Index`, matching the official template's `content.split('</think>')[-1]` semantics — remaining content comes from after the LAST `</think>`, not the first
 
 The previous approach of routing `"qwen3.5"` through `Qwen3CoderRenderer`/`Qwen3CoderParser` caused seven distinct template fidelity problems (sections 2.1–2.7 below), **all now resolved**. All existing tests pass, and 17 new tests (5 renderer + 11 parser + 1 integration routing test in `qwen3_test.go:211`) cover the new code.
 
 Note: the fork's `Qwen3CoderRenderer` AND `Qwen3CoderParser` already differ from upstream's versions — both have thinking support that upstream lacks:
-- **Fork's `Qwen3CoderRenderer`** (`qwen3coder.go`): has `isThinking` and `emitEmptyThinkOnNoThink` fields, thinking block rendering at lines 164-170, think prefill at lines 222-227, and the prefill bug fix at line 159.
+- **Fork's `Qwen3CoderRenderer`** (`qwen3coder.go`): has `isThinking` and `emitEmptyThinkOnNoThink` fields, thinking block rendering, think prefill, and the prefill bug fix — all in the `Render()` method.
 - **Fork's `Qwen3CoderParser`** (`qwen3coder.go`): has `hasThinkingSupport` and `defaultThinking` fields, 4 parser states (including `CollectingThinking` and `ThinkingDoneTransition`), and `HasThinkingSupport()` that returns the field value. Upstream has only 2 parser states and `HasThinkingSupport()` returns `false` unconditionally.
 
 ### 2.1 FIXED: Tool Definition Format — JSON Instead of XML
@@ -218,11 +215,11 @@ The dedicated `Qwen35Renderer` uses `marshalWithSpaces()` for JSON tool definiti
 
 ### 2.2 FIXED: System+Tools Ordering Reversed for Qwen 3.5
 
-The `Qwen35Renderer` emits tools block first (lines 90-99), then appends system message content after `</IMPORTANT>` (lines 100-107), matching the official template. This matters for attention patterns.
+The `Qwen35Renderer` emits the tools block first, then appends system message content after `</IMPORTANT>`, matching the official template. This matters for attention patterns.
 
 ### 2.3 FIXED: Image/Vision Support for Qwen 3.5
 
-The `Qwen35Renderer` has its own `renderContent()` method (lines 47-62) with `useImgTags` field. Qwen 3.5 27B is a **native multimodal early-fusion model** — it has a 27-layer vision encoder (1152 hidden size, 16 heads, patch size 16) built into its architecture. The official template handles image items with `<|vision_start|><|image_pad|><|vision_end|>` and video items with `<|vision_start|><|video_pad|><|vision_end|>`. Both upstream Ollama and the fork support images but not videos.
+The `Qwen35Renderer` has its own `renderContent()` method with `useImgTags` field. Qwen 3.5 27B is a **native multimodal early-fusion model** — it has a 27-layer vision encoder (1152 hidden size, 16 heads, patch size 16) built into its architecture. The official template handles image items with `<|vision_start|><|image_pad|><|vision_end|>` and video items with `<|vision_start|><|video_pad|><|vision_end|>`. Both upstream Ollama and the fork support images but not videos.
 
 **CAVEAT — image placement is wrong in all Ollama vision models.** Every image in `renderContent()` is prepended before `content.Content`. The `api.Message` struct stores images as a flat `Images []ImageData` array with zero positional information. All three vision-capable renderers in the entire Ollama codebase (`Qwen35Renderer`, `Qwen3VLRenderer`, `LFM2Renderer`) have this same front-prepend behavior. The official Jinja2 template handles inline image positioning natively because the HuggingFace `messages` format embeds images as interleaved content items. Fixing this requires changing the `api.Message` struct — Ollama's public HTTP API — to support interleaved content items, then updating all renderers, the runner's `[img-N]` regex splitter, and every client.
 
@@ -236,15 +233,15 @@ The `Qwen3CoderRenderer` injects `"You are Qwen, a helpful AI assistant..."` whe
 
 Both the fork (before `4044b63f`) and upstream Ollama gate the rendering of `<think>` blocks in assistant message history on `isThinking` (controlled by the API's `think: true/false` parameter). This is a two-part bug.
 
-**Part 1 — Rendering condition at `qwen35.go:143`:**
+**Part 1 — Rendering condition (the `<think>` wrapping in `Render()` in `qwen35.go`):**
 The official template's `enable_thinking` parameter is checked in exactly one place — the `add_generation_prompt` block at the end of the template (see Section 3.1). It does not appear anywhere in the message rendering loop. The rendering condition for `<think>` blocks uses only `{%- if loop.index0 > ns.last_query_index %}` — no `enable_thinking` check. Assistant messages after `last_query_index` ALWAYS include `<think>` blocks regardless of whether thinking is enabled for the current turn. This also applies to messages with empty reasoning: when `reasoning_content` is an empty string, the template produces `<think>\n\n</think>\n\n` (an empty think block), not a bare message without think tags.
 
-**Part 2 — Reasoning extraction at `qwen35.go:65`:**
+**Part 2 — Reasoning extraction (`splitQwen35ReasoningContent` in `qwen35.go`):**
 The official template always uses `reasoning_content` when it exists as a string (`message.reasoning_content is string`) — no `enable_thinking` check. In Jinja2, an empty string `""` passes the `is string` test, so path 1 is taken even for messages with no reasoning. When `isThinking=false` and `messageThinking` is non-empty, the old code ignores the stored thinking field and falls through to content parsing, which typically finds nothing. The reasoning is silently lost.
 
-**The fix** (two lines in `model/renderers/qwen35.go`):
-1. Line 65: `splitQwen35ReasoningContent(content, messageThinking string)` — removed `isThinking` parameter
-2. Line 143: `if i > lastQueryIndex` — removed `isThinking &&` prefix
+**The fix** (two changes in `model/renderers/qwen35.go`):
+1. `splitQwen35ReasoningContent(content, messageThinking string)` — removed `isThinking` parameter
+2. `if i > lastQueryIndex` — removed `isThinking &&` prefix from the `<think>` wrapping condition
 
 **When this bug triggers:** Multi-turn conversations where thinking mode switches between turns. Previous assistant responses had thinking content stored in `message.Thinking`. With `think: false`, both the extraction and the rendering gate fail, and the model sees its own previous responses with reasoning stripped out — a prompt format it was never trained on.
 
@@ -256,11 +253,11 @@ The official template always uses `reasoning_content` when it exists as a string
 
 ### 2.6 FIXED: `lastQueryIndex` Doesn't Check for `<tool_response>` Wrappers
 
-The `Qwen35Renderer` implements the `multiStepTool` / `<tool_response>` filtering pattern (lines 114-127) matching the official template exactly: walks messages backwards, skips user messages that are entirely `<tool_response>...</tool_response>` wrapped, finds the first non-tool-response user message as `last_query_index`.
+The `Qwen35Renderer` implements the `multiStepTool` / `<tool_response>` filtering pattern (the `lastQueryIndex` backward scan in `Render()`) matching the official template exactly: walks messages backwards, skips user messages that are entirely `<tool_response>...</tool_response>` wrapped, finds the first non-tool-response user message as `last_query_index`.
 
 ### 2.7 FIXED: Prefill Triggers on Assistant Messages With Tool Calls
 
-See Section 1.1 for the full analysis. The `Qwen35Renderer` has the fix at line 136.
+See Section 1.1 for the full analysis. The `Qwen35Renderer` has the fix in the prefill condition in `Render()`.
 
 ### What the Dedicated `Qwen35Parser` Provides
 
@@ -294,7 +291,7 @@ Reasoning content is extracted from each historical assistant message via two pa
 
 ### 3.2 The `emitEmptyThinkOnNoThink` Field — Correct Implementation
 
-The `Qwen35Renderer` is constructed with `emitEmptyThinkOnNoThink: true` at `renderer.go:60`. This correctly matches the official template:
+The `Qwen35Renderer` is constructed with `emitEmptyThinkOnNoThink: true` in `RendererForName()` in `renderer.go`. This correctly matches the official template:
 - `think: true` → `<think>\n` (model generates reasoning)
 - `think: false` → `<think>\n\n</think>\n\n` (empty think block, model generates content)
 - Without `emitEmptyThinkOnNoThink`: nothing emitted — would be WRONG
@@ -370,18 +367,18 @@ Go's `json.Marshal` outputs struct fields in declaration order and sorts `map[st
 | `ToolProperty` (`Optional[T]`) | `type`, `description` | `type`, `nullable`, `description` | **No — `nullable` field lost** |
 | `ToolProperty` (`Dict[str, T]`) | `type`, `description` | `type`, `additionalProperties`, `description` | **No — `additionalProperties` field lost** |
 | `ToolProperty` (`Tuple[T1, T2]`) | `type`, `description` | `type`, `prefixItems`, `description` | **No — `prefixItems` field lost** |
-| `ToolProperty.Items` (as `map[string]any`) | alphabetical (e.g., `description`, `type`) | insertion order (e.g., `type`, `description`) | **No — Go alphabetizes map keys** |
+| `ToolProperty.Items` (as `map[string]any`) | alphabetical (e.g., `description`, `type`) | single key only: `{"type": "..."}` | **Yes** — items are single-key, no ordering issue |
 | `ToolPropertiesMap` (property names) | insertion order (orderedmap) | insertion order | **Yes** |
 
-†`Tool.Items` (`api/types.go:322`), `ToolFunctionParameters.$defs` (`api/types.go:489`), and `ToolFunctionParameters.Items` (`api/types.go:490`) are `omitempty` fields not produced by HuggingFace's `get_json_schema()`. When nil (the common case), they are hidden. If present (from a client-provided schema), they affect serialization order and suffer the same `map[string]any` alphabetization as `ToolProperty.Items`.
+†`Tool.Items`, `ToolFunctionParameters.$defs`, and `ToolFunctionParameters.Items` (all in `api/types.go`) are `omitempty` fields not produced by HuggingFace's `get_json_schema()`. When nil (the common case), they are hidden.
 
-‡`ToolFunctionParameters.Required` (`api/types.go:491`) also has `omitempty`, correctly matching Python's conditional `if required: schema["required"] = required` guard at `chat_template_utils.py:211-212` — when no parameters are required, both Go and Python omit the field entirely. The ordering deviation (before `properties` in Go, after in Python) applies only when `required` is present, which is the common case for tool-calling models.
+‡`ToolFunctionParameters.Required` (in `api/types.go`) also has `omitempty`, correctly matching Python's conditional `if required: schema["required"] = required` guard in `chat_template_utils.py` — when no parameters are required, both Go and Python omit the field entirely. The ordering deviation (before `properties` in Go, after in Python) applies only when `required` is present, which is the common case for tool-calling models.
 
 The `ToolProperty` enum/description mismatch arises because `_parse_type_hint()` at `chat_template_utils.py:139-142` constructs `{"type": ..., "enum": [...]}` first, then `get_json_schema()` at line 380 appends `schema["description"] = desc` last. Python dicts preserve insertion order, so the training data has `enum` before `description`. Go's `ToolProperty` struct declares `Description` before `Enum`, producing the opposite order. (The same ordering holds when `enum` comes from a docstring's `(choices: ...)` block instead of a `Literal` type hint — `get_json_schema()` at line 378 inserts `schema["enum"]` before line 380 inserts `schema["description"]`, producing the same `enum`-before-`description` order.)
 
-The field loss rows (`Optional[T]`, `Dict[str, T]`, `Tuple[T1, T2]`) arise because Go's `ToolProperty` struct at `api/types.go:433-440` has six fields (`anyOf`, `type`, `items`, `description`, `enum`, `properties`) but HuggingFace's `_parse_type_hint()` can produce three additional fields: `nullable` (line 127, for `Optional[T]` / `Union[T, None]`), `additionalProperties` (line 175, for `Dict[str, T]`), and `prefixItems` (line 168, for `Tuple[T1, T2]`). Go's `json.Unmarshal` silently drops unknown fields, so these constraints vanish during the client→Go→renderer round-trip. The model then sees a tool schema missing type constraints it was trained on — `{"type": "string"}` instead of `{"type": "string", "nullable": true}`, or `{"type": "object"}` instead of `{"type": "object", "additionalProperties": {"type": "integer"}}`. Of the three, `nullable` is the most impactful — `Optional[T]` parameters are common in Python tool definitions.
+The field loss rows (`Optional[T]`, `Dict[str, T]`, `Tuple[T1, T2]`) arise because Go's `ToolProperty` struct (in `api/types.go`) has six fields (`anyOf`, `type`, `items`, `description`, `enum`, `properties`) but HuggingFace's `_parse_type_hint()` can produce three additional fields: `nullable` (line 127, for `Optional[T]` / `Union[T, None]`), `additionalProperties` (line 175, for `Dict[str, T]`), and `prefixItems` (line 168, for `Tuple[T1, T2]`). Go's `json.Unmarshal` silently drops unknown fields, so these constraints vanish during the client→Go→renderer round-trip. The model then sees a tool schema missing type constraints it was trained on — `{"type": "string"}` instead of `{"type": "string", "nullable": true}`, or `{"type": "object"}` instead of `{"type": "object", "additionalProperties": {"type": "integer"}}`. Of the three, `nullable` is the most impactful — `Optional[T]` parameters are common in Python tool definitions.
 
-The `Items` mismatch arises because `ToolProperty.Items` is typed as Go `any`. When a client sends `"items": {"type": "string", "description": "..."}`, Go's `json.Unmarshal` stores it as `map[string]any`, and `json.Marshal` re-serializes with alphabetically sorted keys: `{"description": "...", "type": "string"}`. The training data has `type` before `description` (from `_parse_type_hint()` at line 149: `{"type": "array", "items": _parse_type_hint(args[0])}`). The same `any`-typed alphabetization affects `ToolFunctionParameters.Defs` (`api/types.go:489`) and `ToolFunctionParameters.Items` (`api/types.go:490`), though these are rarely present since `get_json_schema()` does not produce `$defs` or top-level `items`.
+The `Items` alphabetization is a non-issue for training data. `get_json_schema()` never adds `description` to items sub-objects — items are single-key dicts like `{"type": "string"}`, which have no ordering to break. Only client-provided multi-key items schemas would be affected.
 
 **Concrete byte comparison** (empirically verified with Go and Python producing the same tool definition):
 - **Python (training data):** `..., "format": {"type": "string", "enum": ["json", "xml"], "description": "Output format"}, ...`
@@ -446,7 +443,7 @@ The fork has 22 parameterized test cases covering round-trip consistency. The `a
 
 ### 5.1 The Problem: Ollama Trusts the Model
 
-Ollama's tool call parser is a free-form streaming state machine (`model/parsers/qwen3coder.go:150-317`). It receives the model's raw text output token-by-token after generation and parses it. When the model misbehaves, the parser silently propagates malformed output:
+Ollama's tool call parser is a free-form streaming state machine (the `Add()` method in `model/parsers/qwen3coder.go`). It receives the model's raw text output token-by-token after generation and parses it. When the model misbehaves, the parser silently propagates malformed output:
 
 1. **Hallucinated function name.** `<function=nonexistent_tool>` creates a phantom `api.ToolCall` that propagates to the client.
 2. **Malformed XML.** `transformToXML` regex partially matches, `xml.Unmarshal` may fail, and recovery is unclear.
@@ -507,7 +504,7 @@ Added `grammar_init_lazy()` to `llama/sampling_ext.cpp` and `.h`. Calls `llama_g
 
 **`llama/llama.go`:** Added `NewGrammarLazy()` and `ToolCallGrammarFromJSON()`. Both `NewGrammar` and `NewGrammarLazy` delegate to a shared private `newGrammar()` — the branch between `grammar_init` and `grammar_init_lazy` is a single `if len(triggerPatterns) > 0` inside the shared function.
 
-`ToolCallGrammarFromJSON` wraps the C++ `tool_call_grammar_from_json()` via CGo — uses a 64KB grammar buffer (`maxGrammarLen = 64 * 1024` at `llama/llama.go:779`) and 1KB error buffer.
+`ToolCallGrammarFromJSON` wraps the C++ `tool_call_grammar_from_json()` via CGo — uses a 64KB grammar buffer and 1KB error buffer (defined in `ToolCallGrammarFromJSON()` in `llama/llama.go`).
 
 **`sample/samplers.go`:** Added `NewGrammarSamplerLazy()`. Both sampler constructors delegate to `newGrammarSampler()`.
 
@@ -519,7 +516,7 @@ Added `grammar_init_lazy()` to `llama/sampling_ext.cpp` and `.h`. Calls `llama_g
 
 **Function:** `tool_call_grammar_from_json(tools_json, grammar_out, grammar_max_len, error_out, error_max_len)` in `llama/sampling_ext.cpp`. Takes a JSON array of `api.Tool` definitions, returns a GBNF grammar string.
 
-**Defensive validation (11 error codes):** null pointers, zero-length buffers, invalid/non-array/empty JSON, missing or malformed fields, empty names, null bytes, forbidden characters (`>`, `<`, `\n`, `\r`), duplicate function/parameter names, required parameters not in properties, output truncation, grammar build exceptions.
+**Defensive validation (10 error codes):** null pointers, zero-length buffers, invalid/non-array/empty JSON, missing or malformed fields, empty names, null bytes, forbidden characters (`>`, `<`, `\n`, `\r`), duplicate function/parameter names, required parameters not in properties, output truncation, grammar build exceptions.
 
 **Character validation details:** Characters `=`, spaces, quotes, and GBNF metacharacters are NOT rejected — they are handled correctly by `gbnf_format_literal()` (wraps names in double-quoted GBNF strings) and the parser regex `[^>]+`. GBNF rule name collisions from unusual characters are resolved by the builder with numeric suffixes.
 
@@ -597,8 +594,8 @@ Why this was not done now: (1) `schema_to_grammar` produces standalone grammars 
 
 | Bug | Upstream Status | Fork Status |
 |-----|----------------|-------------|
-| **Prefill bug** — `qwen35.go:136` missing `&& len(message.ToolCalls) == 0` | **STILL BROKEN** | Fixed (commit `fbae6976`) |
-| **`mropeInterleaved` default** — `model.go:641` defaults to `false` | **STILL BROKEN** | Fixed (commit `9ec17fc1`) |
+| **Prefill bug** — `Render()` in `qwen35.go` missing `&& len(message.ToolCalls) == 0` | **STILL BROKEN** | Fixed (commit `fbae6976`) |
+| **`mropeInterleaved` default** — `New()` in `model.go` defaults to `false` | **STILL BROKEN** | Fixed (commit `9ec17fc1`) |
 | **`repeat_last_n` not wired** — `NewSampler` ignores API parameter | **STILL BROKEN** | Fixed (commit `ab234955`) |
 | **Penalty sampler feeds prompt tokens** — `Accept()` called on prompt | **STILL BROKEN** | Fixed (ring buffer architecture) |
 | **`</think>` not closed in `Qwen3VLRenderer`** — gated on `content != ""` | **STILL BROKEN** | Fixed (commit `fbae6976`) |
@@ -752,7 +749,7 @@ llama.cpp demonstrates this works using `split_equal(n_ubatch, true)` — per-se
 |-------|--------|--------|
 | `ToolFunctionParameters` key ordering: `required` before `properties` (should be reversed) | Distribution shift on every tool definition in every system prompt | **OPEN** |
 | `ToolProperty` key ordering: `description` before `enum` (should be reversed) | Distribution shift on tool parameters with enumerated values | **OPEN** |
-| `ToolProperty.Items` map key alphabetization: `any`-typed field loses insertion order | Distribution shift on tools with array parameters whose `items` have multiple fields | **OPEN** |
+| `ToolProperty.Items` map key alphabetization | Non-issue for training data (items are single-key dicts) | **Won't fix** |
 
 ### Performance Opportunities
 
@@ -825,7 +822,7 @@ Ollama bundles vision tensors into the main GGUF (1307 tensors). llama.cpp uses 
 | Priority | Item | Effort | Status |
 |----------|------|--------|--------|
 | **P0** | Adopt CUDA async copy + reduced sync from `ggml-cuda.cu` and `ggml-backend.cpp` | Medium (2 files, conflict resolution) | **OPEN** |
-| **P1** | Fix tool definition key ordering: `ToolFunctionParameters` (`required`/`properties` swapped), `ToolProperty` (`enum`/`description` swapped), and `Items` map key alphabetization — requires per-model template verification or renderer-local marshaling | Medium-High | **OPEN** |
+| **P1** | Fix tool definition key ordering: `ToolFunctionParameters` (`required`/`properties` swapped) and `ToolProperty` (`enum`/`description` swapped) — requires per-model template verification or renderer-local marshaling | Medium-High | **OPEN** |
 | **P1** | Adopt M-RoPE `can_shift()` guard in vendored `llama-kv-cache.cpp` | Small (3 lines) | **OPEN** |
 | **P2** | Increase `num_batch` to 2048 in the Modelfile | Zero (config-only) | **OPEN** |
 | **P3** | Verify `Qwen3VLRenderer` thinking variant needs `emitEmptyThinkOnNoThink: true` | Research | **OPEN** |
@@ -879,7 +876,7 @@ Ollama bundles vision tensors into the main GGUF (1307 tensors). llama.cpp uses 
 | `model/parsers/qwen35.go` | Dedicated Qwen 3.5 parser — thinking extraction, delegates tool calls to embedded `Qwen3CoderParser` |
 | `model/parsers/qwen3coder.go` | Shared qwen3-coder parser — thinking support, XML tool call parsing |
 | `model/parsers/parsers.go` | Parser routing — maps `"qwen3.5"` to `Qwen35Parser` |
-| `model/models/qwen3next/deltanet.go` | GatedDeltaNet — balanced concat tree (lines 458-509) |
+| `model/models/qwen3next/deltanet.go` | GatedDeltaNet — balanced concat tree in `Forward()` |
 | `model/models/qwen3next/model.go` | Model definition — architecture-based defaults, `Validate()` |
 | `sample/samplers.go` | Ring buffer penalty sampler, lazy grammar sampler, dead-end detection |
 | `sample/transforms.go` | `applyPenalties()` — operates on generated-only token window |
@@ -891,7 +888,7 @@ Ollama bundles vision tensors into the main GGUF (1307 tensors). llama.cpp uses 
 | `tokenizer/vocabulary.go` | Stack buffer in `Merge()` BPE hot path |
 | `api/types.go` | `RepeatPenalty: 1.0` default, custom `MarshalJSON` for tool types (no HTML escaping) |
 | `llama/sampling_ext.cpp` | C bridge — `grammar_init_lazy()`, `tool_call_grammar_from_json()` |
-| `llama/sampling_ext.h` | C bridge header — function declarations, 11 error codes |
+| `llama/sampling_ext.h` | C bridge header — function declarations, 10 error codes |
 | `llama/llama.go` | Go wrappers — `NewGrammarLazy()`, `ToolCallGrammarFromJSON()`, consolidated `newGrammar` |
 | `llm/server.go` | `CompletionRequest` with `Grammar`/`GrammarTriggerPatterns`, `ToolCallGrammarFromJSON()` passthrough, Format→Grammar guard |
 

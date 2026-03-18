@@ -27,7 +27,7 @@
 | `tokenizer/special.go` | Special token splitting with `strings.Contains` early-out (perf) |
 | `tokenizer/vocabulary.go` | Stack buffer in `Merge()` BPE hot path (perf) |
 | `api/types.go` | `RepeatPenalty: 1.0` default (line 1066) |
-| `llama/sampling_ext.h` | C bridge header — `grammar_init_lazy()` (dormant grammar with regex triggers), `tool_call_grammar_from_json()` + 11 error codes |
+| `llama/sampling_ext.h` | C bridge header — `grammar_init_lazy()` (dormant grammar with regex triggers), `tool_call_grammar_from_json()` + 10 error codes |
 | `llama/sampling_ext.cpp` | C bridge impl — `grammar_init_lazy()` (~35 lines), `tool_call_grammar_from_json()` (~230 lines): trie-based exclusion patterns, GBNF grammar builder for Qwen 3.5 XML tool calls. Null-properties fix for nil `*ToolPropertiesMap` |
 | `llama/llama.go` | Go wrapper — `NewGrammarLazy()` (lazy grammar creation), `ToolCallGrammarFromJSON()` (grammar from tools JSON), consolidated `newGrammar()` shared helper |
 | `llm/server.go` | `CompletionRequest` with `Grammar` + `GrammarTriggerPatterns` fields, `ToolCallGrammarFromJSON()` passthrough, Format→Grammar guard (`if req.Grammar == ""`) |

@@ -34,13 +34,13 @@ Here is every stage a chat request passes through, from the moment the client se
 
 **What validation happens now:**
 - **JSON syntax errors** are caught — if the client sends `{"messages": [}` (missing closing bracket), Gin returns HTTP 400. HTTP 400 means "Bad Request" — the standard HTTP status code meaning "the server understood the protocol but the content of your request is structurally invalid; this is the client's fault, fix it and try again."
-- **`TopLogprobs` range** is checked at `routes.go:1995-1998` — must be 0-20 or the server returns HTTP 400.
-- **Model name validity** is checked at `routes.go:2000-2017` — if the model name can't be parsed, HTTP 400.
-- **Empty messages array** is checked at `routes.go:2178` — if `len(req.Messages) == 0`, the server returns HTTP 200 with a "load" status (this just loads the model into GPU memory without generating anything).
-- **Think capability** is checked at `routes.go:2149-2165` — if the client requests `think: true` but the loaded model doesn't support thinking, HTTP 400 with the message `"<model> does not support thinking"`.
+- **`TopLogprobs` range** is checked in `ChatHandler` in `routes.go` — must be 0-20 or the server returns HTTP 400.
+- **Model name validity** is checked in `ChatHandler` in `routes.go` — if the model name can't be parsed, HTTP 400.
+- **Empty messages array** is checked in `ChatHandler` in `routes.go` — if `len(req.Messages) == 0`, the server returns HTTP 200 with a "load" status (this just loads the model into GPU memory without generating anything).
+- **Think capability** is checked in `ChatHandler` in `routes.go` — if the client requests `think: true` but the loaded model doesn't support thinking, HTTP 400 with the message `"<model> does not support thinking"`.
 
 **What validation is missing — the conversation structure is never checked:**
-- **No message role validation.** The `api.Message.UnmarshalJSON()` method at `api/types.go:232` normalizes the role to lowercase (`m.Role = strings.ToLower(m.Role)`) but never checks whether the result is one of the four valid roles: `"system"`, `"user"`, `"assistant"`, `"tool"`. A client can send `"role": "function"` (the old OpenAI role name, used by GPT-3.5 and early GPT-4 APIs), `"role": "developer"` (the new OpenAI role name, used by GPT-4.1 and later), `"role": ""` (empty string), or `"role": "banana"` (nonsense), and the server accepts all of them without returning an error.
+- **No message role validation.** The `Message.UnmarshalJSON()` method in `api/types.go` normalizes the role to lowercase (`m.Role = strings.ToLower(m.Role)`) but never checks whether the result is one of the four valid roles: `"system"`, `"user"`, `"assistant"`, `"tool"`. A client can send `"role": "function"` (the old OpenAI role name, used by GPT-3.5 and early GPT-4 APIs), `"role": "developer"` (the new OpenAI role name, used by GPT-4.1 and later), `"role": ""` (empty string), or `"role": "banana"` (nonsense), and the server accepts all of them without returning an error.
 - **No message ordering validation.** The server does not check whether system messages appear only at position 0, whether user and assistant messages alternate, whether tool messages follow assistant messages that actually made tool calls, or whether the conversation contains at least one real user query (as opposed to only tool call results).
 - **No content validation.** Empty content strings, images in system messages, assistant messages with both a `Thinking` field AND inline `<think>` tags in `Content` — all silently accepted.
 
@@ -65,7 +65,7 @@ None of these checks exist in the fork's `ChatHandler`.
 
 These are all returned as HTTP 400 responses. Additionally, llama.cpp executes the official Jinja2 template directly, so the template's own 8 `raise_exception()` calls fire naturally during rendering. When a Qwen 3.5 template calls `raise_exception("System message must be at the beginning.")`, the exception propagates through the Jinja2 runtime → gets wrapped in `std::invalid_argument` at `chat.cpp:1532` → gets caught by the HTTP server's `ex_wrapper()` at `server.cpp:43-46` → returns HTTP 400 to the client. (Earlier research incorrectly stated this mapped to HTTP 500 — the wrapping at `chat.cpp:1532` converts it to `std::invalid_argument` first.)
 
-### Stage 2: System Message Prepending (`server/routes.go:2078-2080` and `2189-2192`)
+### Stage 2: System Message Prepending (in `ChatHandler` in `server/routes.go`)
 
 **What this stage does:** If the model has a default system message defined in its Modelfile (the configuration file that specifies model parameters, system prompt, etc.) and the client's first message isn't already a system message, the server prepends the default system message at position 0 of the messages array.
 
@@ -75,15 +75,15 @@ These are all returned as HTTP 400 responses. Additionally, llama.cpp executes t
 
 ### Stage 3: Prompt Construction and Context Fitting (`server/prompt.go`)
 
-**What this stage does:** The `chatPrompt` function at `prompt.go:23-150` converts the message array into a prompt string by calling the model-specific renderer. The `fitsContext` function at `prompt.go:45-71` runs a binary search to find the longest prompt that fits in the model's context window (131,072 tokens for the Qwen 3.5 Modelfile configuration): it tries rendering the full conversation, checks the token count, and if it exceeds the limit, drops the oldest messages and retries. This means `Render()` is called O(log N) times per request, where N is the number of messages.
+**What this stage does:** The `chatPrompt` function in `prompt.go` converts the message array into a prompt string by calling the model-specific renderer. The `fitsContext` closure inside `chatPrompt` runs a binary search to find the longest prompt that fits in the model's context window (131,072 tokens for the Qwen 3.5 Modelfile configuration): it tries rendering the full conversation, checks the token count, and if it exceeds the limit, drops the oldest messages and retries. This means `Render()` is called O(log N) times per request, where N is the number of messages.
 
-**What validation happens now:** Only one check — at `prompt.go:115`, if the model is from the `mllama` family (Meta's Llama multimodal models, not Qwen) and a message has more than 1 image, it returns an error. No other validation.
+**What validation happens now:** Only one check — in `chatPrompt` in `prompt.go`, if the model is from the `mllama` family (Meta's Llama multimodal models, not Qwen) and a message has more than 1 image, it returns an error. No other validation.
 
 **Why this stage matters for validation architecture:** The binary-search loop calls `Render()` multiple times with progressively shorter message arrays. If validation were embedded inside `Render()`, it would run on every iteration — wasting time re-checking structural properties that don't change between iterations (the message roles, system message position, and tool call structure are the same regardless of which messages are truncated). This is the key architectural reason validation should happen once, before the binary search, not inside the renderer.
 
 ### Stage 4: Renderer Execution (`model/renderers/qwen35.go`, the `Render` method)
 
-**What this stage does:** This is the core of prompt construction. The `Qwen35Renderer.Render()` method at `qwen35.go:82-194` walks the message array and emits the exact byte sequence that becomes the model's input:
+**What this stage does:** This is the core of prompt construction. The `Qwen35Renderer.Render()` method in `qwen35.go` walks the message array and emits the exact byte sequence that becomes the model's input:
 - System messages → `<|im_start|>system\n[tools JSON]\n[content]<|im_end|>\n`
 - User messages → `<|im_start|>user\n[content]<|im_end|>\n`
 - Assistant messages → `<|im_start|>assistant\n<think>\n[reasoning]\n</think>\n\n[content][tool calls XML]<|im_end|>\n`
@@ -108,7 +108,7 @@ Client sends:
 ]
 ```
 
-The if/else chain at lines 138-180 checks for `"user"`, `"system"`, `"assistant"`, and `"tool"`. The `"function"` role matches none of these branches. There is no `else` clause. The message produces no output — it is silently dropped from the prompt.
+The if/else chain in `Render()` checks for `"user"`, `"system"`, `"assistant"`, and `"tool"`. The `"function"` role matches none of these branches. There is no `else` clause. The message produces no output — it is silently dropped from the prompt.
 
 Prompt the model sees:
 ```
@@ -143,7 +143,7 @@ Client sends:
 ]
 ```
 
-Line 100 checks `messages[0].Role == "system"` — it's `"user"`, so no system preamble is rendered. At the main loop, the system message at index 2 matches the catch-all at line 138: `message.Role == "system" && i != 0`, so it's rendered as a regular conversation turn.
+The `Render()` method checks `messages[0].Role == "system"` — it's `"user"`, so no system preamble is rendered. At the main loop, the system message at index 2 matches the combined branch `message.Role == "user" || (message.Role == "system" && i != 0)`, so it's rendered as a regular conversation turn.
 
 Prompt the model sees:
 ```
@@ -168,7 +168,7 @@ A system instruction appears mid-conversation, after the assistant already respo
 
 Client sends an assistant message with a tool call where `Function.Name` is an empty string `""`.
 
-Line 159 concatenates `"<function=" + toolCall.Function.Name + ">"` without checking emptiness.
+The tool call rendering in `Render()` concatenates `"<function=" + toolCall.Function.Name + ">"` without checking emptiness.
 
 Relevant portion of the prompt:
 ```
@@ -197,7 +197,7 @@ Client sends:
 ]
 ```
 
-Both user messages match the `message.Role == "user"` branch at line 138. Both are rendered.
+Both user messages match the `message.Role == "user"` branch in the `Render()` if/else chain. Both are rendered.
 
 Prompt the model sees:
 ```
@@ -227,7 +227,7 @@ Client sends:
 ]
 ```
 
-The tool message at index 1 matches line 172: `message.Role == "tool"`. It's wrapped in `<|im_start|>user\n<tool_response>...\n</tool_response>\n<|im_end|>\n`. There is no preceding assistant message with a `<tool_call>` that this result corresponds to.
+The tool message at index 1 matches the `message.Role == "tool"` branch in `Render()`. It's wrapped in `<|im_start|>user\n<tool_response>...\n</tool_response>\n<|im_end|>\n`. There is no preceding assistant message with a `<tool_call>` that this result corresponds to.
 
 Prompt the model sees:
 ```
@@ -251,7 +251,7 @@ A tool response appears after a user greeting, with no preceding tool call. The 
 
 **Example 6 — Images in system message (training-absent tokens):**
 
-Client sends a system message with an image in its `Images` array. The `renderContent()` method at lines 47-62 renders `<|vision_start|><|image_pad|><|vision_end|>` tokens for ANY message role, including system.
+Client sends a system message with an image in its `Images` array. The `renderContent()` method renders `<|vision_start|><|image_pad|><|vision_end|>` tokens for ANY message role, including system.
 
 Prompt the model sees:
 ```
@@ -268,13 +268,13 @@ Vision tokens inside the system prompt. The model was trained with vision tokens
 *Official template:* `raise_exception("System message cannot contain images.")` — rendering halts.
 *llama.cpp:* Same — HTTP 400 via Jinja2 execution.
 
-### Stage 5: Grammar-Constrained Tool Call Generation (`server/routes.go:2223-2254`, `llama/sampling_ext.cpp`)
+### Stage 5: Grammar-Constrained Tool Call Generation (in `ChatHandler` in `server/routes.go`, and `tool_call_grammar_from_json()` in `llama/sampling_ext.cpp`)
 
 **What this stage does:** This is unique to the fork. When the parser is `"qwen3.5"` and tools are provided, the `ChatHandler` serializes the tool definitions to JSON, passes them to the C++ `tool_call_grammar_from_json()` function (via CGo — Go calling C/C++ code — through `llama/llama.go:ToolCallGrammarFromJSON()`), which builds a GBNF grammar (a formal grammar specification that constrains the model to only produce valid tool call XML with real function names and properly-typed parameters during text generation).
 
 **What validation happens now — this is the fork's strongest validation point:**
 
-The C++ `tool_call_grammar_from_json()` function at `sampling_ext.cpp:411-606` has 12 defensive checks, each returning a specific error code defined in `sampling_ext.h:91-101`:
+The C++ `tool_call_grammar_from_json()` function in `sampling_ext.cpp` has 10 error codes (covering numerous individual validation check points), each defined in `sampling_ext.h`:
 
 | Error Code | Name | What It Catches |
 |-----------|------|-----------------|
@@ -289,13 +289,13 @@ The C++ `tool_call_grammar_from_json()` function at `sampling_ext.cpp:411-606` h
 | -9 | `TOOL_GRAMMAR_ERR_GRAMMAR_BUILD` | The GBNF grammar construction itself failed (e.g., invalid JSON schema in parameters) |
 | -10 | `TOOL_GRAMMAR_ERR_DUPLICATE_NAME` | Two tools have the same function name |
 
-The per-tool validation function `validate_tool_json()` at `sampling_ext.cpp:301-388` performs detailed checks: tool must be an object, must have a `"function"` key, function must be an object, must have a `"name"` key, name must be a string, name must be non-empty, name must not contain null bytes, name must not contain characters that would break XML (`>`, `<`) or GBNF rule names (`\n`, `\r`), and if `required` parameters are declared, every required parameter name must exist in the `properties` object.
+The per-tool validation function `validate_tool_json()` in `sampling_ext.cpp` performs detailed checks: tool must be an object, must have a `"function"` key, function must be an object, must have a `"name"` key, name must be a string, name must be non-empty, name must not contain null bytes, name must not contain characters that would break XML (`>`, `<`) or GBNF rule names (`\n`, `\r`), and if `required` parameters are declared, every required parameter name must exist in the `properties` object.
 
 **These tool-level checks are unique to the fork.** llama.cpp's `common_chat_tools_parse_oaicompat()` at `common/chat.cpp:396-428` only checks: tools is an array, each tool has `type: "function"`, each tool has a `function` object, and each function has a `name` field (presence only — an empty string `""` passes). No duplicate name detection, no forbidden character check, no null byte check, no required-in-properties check.
 
 **What validation is missing at this stage:**
-- **No Go-level pre-validation.** The Go wrapper `ToolCallGrammarFromJSON()` at `llama/llama.go:775-797` passes the JSON string straight to C++ with zero pre-checks. If the C++ function returns an error code, it's translated into a Go error like `"tool_call_grammar_from_json (code -7): tools[2]: function name is empty"` — technically descriptive but not formatted for end-user consumption.
-- **Wrong HTTP status code.** At `routes.go:2231-2234`, if `ToolCallGrammarFromJSON` returns an error, the server responds with `http.StatusInternalServerError` (HTTP 500). This should be HTTP 400 — the client sent invalid tool definitions, that's the client's fault. HTTP 500 means "Internal Server Error" — it tells the client "something broke on my end, you might want to retry later." Monitoring systems flag HTTP 500 as a server bug, automated retry logic retries the same broken request, and the client's error handling code for "bad input" never fires.
+- **No Go-level pre-validation.** The Go wrapper `ToolCallGrammarFromJSON()` in `llama/llama.go` passes the JSON string straight to C++ with zero pre-checks. If the C++ function returns an error code, it's translated into a Go error like `"tool_call_grammar_from_json (code -7): tools[2]: function name is empty"` — technically descriptive but not formatted for end-user consumption.
+- **Wrong HTTP status code.** In `ChatHandler` in `routes.go`, if `ToolCallGrammarFromJSON` returns an error, the server responds with `http.StatusInternalServerError` (HTTP 500). This should be HTTP 400 — the client sent invalid tool definitions, that's the client's fault. HTTP 500 means "Internal Server Error" — it tells the client "something broke on my end, you might want to retry later." Monitoring systems flag HTTP 500 as a server bug, automated retry logic retries the same broken request, and the client's error handling code for "bad input" never fires.
 
 ---
 
@@ -307,12 +307,12 @@ The obvious approach — adding a `ValidateMessages()` function that runs before
 
 | Structural Property | Where Rendered in `qwen35.go` | What Validation Would Check |
 |---|---|---|
-| `lastQueryIndex` — position of last non-tool-response user message | Lines 114-127: backward scan calling `renderContent()` on each user message to check `<tool_response>` wrapping | Whether any real user query exists at all (template rejection 3: "No user query found") |
-| System message position | Lines 100-112: checks `messages[0].Role == "system"` | Whether system messages appear only at index 0 (rejection 2), whether multiple system messages exist |
-| Message role sequence | Lines 138-180: if/else chain dispatches on role | Whether all roles are valid (rejection 4), whether roles alternate correctly |
-| Tool call structure | Lines 149-166: iterates `toolCall.Function.Name` and `Arguments.All()` | Whether function names are non-empty |
-| Content type and media | Lines 47-62: `renderContent()` processes images | Whether system messages contain images or videos (rejections 5, 6) |
-| Tool response grouping | Lines 172-179: consecutive tool messages grouped under one `<|im_start|>user` tag | Whether tool messages appear in valid positions |
+| `lastQueryIndex` — position of last non-tool-response user message | Backward scan in `Render()` calling `renderContent()` on each user message to check `<tool_response>` wrapping | Whether any real user query exists at all (template rejection 3: "No user query found") |
+| System message position | `Render()` checks `messages[0].Role == "system"` before main loop | Whether system messages appear only at index 0 (rejection 2), whether multiple system messages exist |
+| Message role sequence | if/else chain in `Render()` dispatches on role | Whether all roles are valid (rejection 4), whether roles alternate correctly |
+| Tool call structure | Tool call rendering in `Render()` iterates `toolCall.Function.Name` and `Arguments.All()` | Whether function names are non-empty |
+| Content type and media | `renderContent()` processes images | Whether system messages contain images or videos (rejections 5, 6) |
+| Tool response grouping | Tool branch in `Render()`: consecutive tool messages grouped under one `<|im_start|>user` tag | Whether tool messages appear in valid positions |
 
 A separate `ValidateMessages()` function would need to re-walk the entire message array and recompute `lastQueryIndex` (including calling `renderContent()` on every user message to check for `<tool_response>` wrapping), re-check system message positions, re-scan roles, and re-inspect tool calls. This is not a trivial duplication — the `lastQueryIndex` computation alone requires rendering content to check whether it starts and ends with `<tool_response>` tags.
 
@@ -320,7 +320,7 @@ A separate `ValidateMessages()` function would need to re-walk the entire messag
 
 Embedding validation checks directly inside `Render()` avoids the duplication but creates two new problems:
 
-1. **Repeated work across binary search iterations.** The `fitsContext` function at `server/prompt.go:45-71` calls `Render()` O(log N) times with progressively shorter message arrays. The structural validity of the full message array doesn't change between iterations — only the number of included messages changes. Validation would run on every iteration, wasting time.
+1. **Repeated work across binary search iterations.** The `fitsContext` closure in `prompt.go` calls `Render()` O(log N) times with progressively shorter message arrays. The structural validity of the full message array doesn't change between iterations — only the number of included messages changes. Validation would run on every iteration, wasting time.
 
 2. **Interleaved concerns.** Validation logic ("is this role valid?") becomes tangled with rendering logic ("emit `<|im_start|>` tag"), making both harder to test independently.
 
@@ -332,7 +332,7 @@ The key insight is that `Render()` already computes the structural properties va
 
 Concretely, this means adding checks at these exact locations in `qwen35.go`:
 
-**Role validation — at lines 138-180 (the existing role dispatch):**
+**Role validation — in the existing role dispatch if/else chain in `Render()`:**
 
 The if/else chain already enumerates every valid role. Adding an `else` clause that returns an error is one line of code and zero duplication:
 
@@ -346,7 +346,7 @@ The if/else chain already enumerates every valid role. Adding an `else` clause t
 
 This reuses the existing role dispatch. No separate validation walk needed. The check runs inside the main loop that already processes every message.
 
-**System message position — at lines 100-112 (existing system message extraction):**
+**System message position — in the existing system message extraction in `Render()`:**
 
 The renderer already checks `messages[0].Role == "system"`. Extending this to reject non-first system messages requires adding a check inside the main loop:
 
@@ -356,9 +356,9 @@ if message.Role == "system" && i != 0 {
 }
 ```
 
-This replaces the current behavior at line 138 where non-first system messages are silently rendered as conversation turns. One line, zero duplication.
+This replaces the current behavior where non-first system messages are silently rendered as conversation turns. One line, zero duplication.
 
-**No user query found — at lines 114-127 (existing `lastQueryIndex` computation):**
+**No user query found — after the existing `lastQueryIndex` backward scan:**
 
 The renderer already walks backward to find `lastQueryIndex`. After the loop, if `multiStepTool` is still `true` (meaning no non-tool-response user message was found), returning an error instead of proceeding is one line:
 
@@ -370,7 +370,7 @@ if multiStepTool {
 
 This reuses the existing backward scan. Zero duplication.
 
-**Images in system messages — at lines 47-62 (existing `renderContent()` method):**
+**Images in system messages — in the existing `renderContent()` method:**
 
 The `renderContent()` method already iterates over `content.Images`. Adding a role-based check requires passing the role or an `isSystemContent` flag to `renderContent()`, which is a small signature change:
 
@@ -382,9 +382,9 @@ if isSystemContent && len(content.Images) > 0 {
 
 This reuses the existing image iteration. The only change is adding a parameter to `renderContent()` — which currently doesn't know what role it's rendering for. Note: this changes `renderContent()`'s return signature from `(string, int)` to `(string, int, error)`, which affects the 4 call sites within `qwen35.go`.
 
-**Empty tool function names — at lines 149-166 (existing tool call rendering):**
+**Empty tool function names — in the existing tool call rendering in `Render()`:**
 
-The renderer already accesses `toolCall.Function.Name` at line 159. Adding an emptiness check is one line:
+The renderer already accesses `toolCall.Function.Name` during tool call rendering. Adding an emptiness check is one line:
 
 ```go
 if toolCall.Function.Name == "" {
@@ -396,7 +396,7 @@ This reuses the existing tool call iteration. Zero duplication.
 
 ### How This Interacts with `fitsContext` Binary Search
 
-The `fitsContext` function at `prompt.go:45-71` calls `Render()` multiple times. The validation checks above run inside `Render()`, so they would run on every binary search iteration.
+The `fitsContext` closure in `prompt.go` calls `Render()` multiple times. The validation checks above run inside `Render()`, so they would run on every binary search iteration.
 
 However, this is acceptable for two reasons:
 
@@ -408,7 +408,7 @@ The only edge case is `lastQueryIndex`: the "no user query found" check runs on 
 
 ### What About the Other Renderers? (Qwen3Coder, Qwen3VL, etc.)
 
-The `Qwen3CoderRenderer` at `model/renderers/qwen3coder.go` has a fundamentally different internal structure: it pre-filters system messages into a separate array (lines 66-78) and works with a filtered message slice. Its `lastQueryIndex` computation is also different (simple backward scan for any user message, no `<tool_response>` checking). The validation checks cannot be shared as-is between renderers.
+The `Qwen3CoderRenderer` in `model/renderers/qwen3coder.go` has a fundamentally different internal structure: it pre-filters system messages into a separate array and works with a filtered message slice. Its `lastQueryIndex` computation is also different (simple backward scan for any user message, no `<tool_response>` checking). The validation checks cannot be shared as-is between renderers.
 
 This is fine. Each renderer is responsible for validating the conventions of its specific model family. The Qwen 3.5 renderer validates Qwen 3.5's conventions; the Qwen3Coder renderer would validate Qwen3Coder's conventions. The checks are small (one-liners at existing code points), so the "duplication" between renderers is minimal and appropriate — each model has its own rules.
 
@@ -418,7 +418,7 @@ What SHOULD be shared is a common error type or error formatting convention, so 
 
 All validation errors from the renderer should surface as HTTP 400 (Bad Request), not HTTP 500 (Internal Server Error). Currently, `Render()` errors would propagate through `chatPrompt()` → `ChatHandler()`, where they need to be caught and returned as HTTP 400.
 
-The grammar pipeline error at `routes.go:2231-2234` should also change from `http.StatusInternalServerError` to `http.StatusBadRequest` — the client sent invalid tool definitions, not a server bug.
+The grammar pipeline error in `ChatHandler` in `routes.go` should also change from `http.StatusInternalServerError` to `http.StatusBadRequest` — the client sent invalid tool definitions, not a server bug.
 
 ---
 
@@ -428,17 +428,17 @@ The grammar pipeline error at `routes.go:2231-2234` should also change from `htt
 
 | # | What to Validate | Where in `qwen35.go` | How | Official Template Equivalent |
 |---|---|---|---|---|
-| 1 | Unknown message roles | Lines 138-180, add `else` clause | `return "", fmt.Errorf(...)` | Rejection 4: `"Unexpected message role."` |
-| 2 | System message not at index 0 | Lines 138, change behavior of `i != 0` case | `return "", fmt.Errorf(...)` | Rejection 2: `"System message must be at the beginning."` |
-| 3 | No real user query found | Lines 114-127, check `multiStepTool` after loop | `return "", fmt.Errorf(...)` | Rejection 3: `"No user query found in messages."` |
-| 4 | Images in system message | Lines 47-62, add role-aware check in `renderContent()` | `return "", 0, fmt.Errorf(...)` | Rejection 5: `"System message cannot contain images."` |
-| 5 | Empty tool function name | Lines 149-166, check before concatenation | `return "", fmt.Errorf(...)` | No equivalent (implicit) |
+| 1 | Unknown message roles | Add `else` clause to the role dispatch in `Render()` | `return "", fmt.Errorf(...)` | Rejection 4: `"Unexpected message role."` |
+| 2 | System message not at index 0 | Change behavior of mid-conversation system message handling in `Render()` | `return "", fmt.Errorf(...)` | Rejection 2: `"System message must be at the beginning."` |
+| 3 | No real user query found | Check `multiStepTool` after the `lastQueryIndex` backward scan | `return "", fmt.Errorf(...)` | Rejection 3: `"No user query found in messages."` |
+| 4 | Images in system message | Add role-aware check in `renderContent()` | `return "", 0, fmt.Errorf(...)` | Rejection 5: `"System message cannot contain images."` |
+| 5 | Empty tool function name | Check before tool call function name concatenation in `Render()` | `return "", fmt.Errorf(...)` | No equivalent (implicit) |
 
 ### Validations to add in `ChatHandler` at `server/routes.go` (before rendering):
 
 | # | What to Validate | Where | How |
 |---|---|---|---|
-| 6 | Grammar pipeline errors → HTTP 400 | Line 2231-2234 | Change `http.StatusInternalServerError` to `http.StatusBadRequest` |
+| 6 | Grammar pipeline errors → HTTP 400 | In `ChatHandler` in `routes.go` | Change `http.StatusInternalServerError` to `http.StatusBadRequest` |
 | 7 | Renderer errors → HTTP 400 | Where `chatPrompt` errors are handled | Check for renderer validation errors, return HTTP 400 |
 
 ### Validations that are NOT worth adding (implicit assumptions, not explicit template rejections):
