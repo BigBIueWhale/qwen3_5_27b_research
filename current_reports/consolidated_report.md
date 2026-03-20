@@ -1,6 +1,6 @@
 # BigBIueWhale/ollama Fork: Comprehensive Research Report for Qwen 3.5 27B
 
-**Date:** 2026-03-13
+**Date:** 2026-03-13 (updated 2026-03-21: Section 4.2 corrected with verified HuggingFace Transformers ground truth — exact `ToolProperty` struct layout specified, `items` ordering confirmed non-issue, blast radius table added; new Section 4.4 for `formatToolCallArgument` scalar divergences; action items updated)
 **Fork:** `BigBIueWhale/ollama` on branch `main`, merge base `cc90a035` (Ollama `v0.17.4`). Use `git log --oneline cc90a035..HEAD` for the current commit list.
 **Model:** Qwen 3.5 27B (Alibaba Qwen), a hybrid recurrent architecture (`qwen3next`) combining GatedDeltaNet recurrent layers with standard full-attention layers. Running via Unsloth Dynamic 2.0 `UD-Q4_K_XL` GGUF quantization (17.6 GB, 851 tensors, text-only, at `/tmp/Qwen3.5-27B-UD-Q4_K_XL.gguf`)
 **Inference engine:** Ollama — a Go-based inference engine that vendors the GGML tensor math library from the llama.cpp project (maintained by ggml-org) but reimplements everything else in Go: chat template rendering uses hardcoded Go renderers instead of llama.cpp's Jinja2 template engine, sampling is a Go rewrite instead of llama.cpp's `llama-sampler.cpp`, and the model runner is `ollamarunner` instead of llama.cpp's HTTP server. This means llama.cpp bugs in GGML affect Ollama, but llama.cpp's correct Jinja2 template handling does NOT help Ollama — Ollama must reimplement the same logic in Go renderers and parsers.
@@ -50,7 +50,7 @@ The important Devstral-specific point: **Devstral Small 2 (`mistralai/Devstral-S
 | GGUF converter KV emission | Unconditional (always writes `rope.mrope_interleaved` and `ssm.v_head_reordered`) | Conditional (only writes when `true` — third-party GGUFs that omit the key fall through to wrong default) | N/A (different convention) | **Fork** |
 | `SetInplace` → balanced concat tree | Fixed (matches upstream Ollama commit `3490e959`) | Fixed | Uses `ggml_set_inplace()` (works in llama.cpp's GGML but not on Ollama's Metal/Vulkan backends) | Tie (Ollama) |
 | Tokenizer performance | Binary search prompt truncation, `strings.Contains` early-out, stack buffer BPE merge | None of these optimizations | N/A (different tokenizer implementation) | **Fork** |
-| JSON tool serialization | Fixed: shared tool-definition HTML-escaping end-to-end + Qwen-local `formatToolCallArgument` spaced JSON. Remaining open: `ToolFunctionParameters` key ordering + `ToolProperty` field loss (`nullable`, `additionalProperties`, `prefixItems`). | Full original bug set (HTML escaping, compact separators, key ordering, field loss) | Correct — Jinja2 `tojson` with no HTML escaping, spaced separators, preserved dict insertion order | **Fork** (fork > upstream; llama.cpp > both) |
+| JSON tool serialization | Fixed: shared tool-definition HTML-escaping end-to-end + Qwen-local `formatToolCallArgument` spaced JSON + `required`/`properties` ordering. Remaining open: `ToolProperty` `enum`/`description` ordering, `ToolProperty` field loss (`nullable`, `additionalProperties`, `prefixItems`), `formatToolCallArgument` scalar boolean/None capitalization (`true`/`false`/`null` instead of `True`/`False`/`None`). For simple tools (no enum, no Optional, no bool args), the fork produces **byte-identical** output to HuggingFace Transformers — verified by saving both outputs and running `diff`. | Full original bug set (HTML escaping, compact separators, key ordering, field loss) | Correct — Jinja2 `tojson` with no HTML escaping, spaced separators, preserved dict insertion order | **Fork** (fork > upstream; llama.cpp > both) |
 | `enable_thinking` generation prompt | Correct via `emitEmptyThinkOnNoThink` — prefills `<think>\n\n</think>\n\n` when `think: false` | Same (correct) | **Fixed in post-refactor versions** (`0cd4f47`+): unified `common_chat_template_direct_apply()` passes `enable_thinking` at `chat.cpp:773`, so the template produces the correct 6-token prefill. **Broken in versions up to `c5a7788`**: the old per-model handler `common_chat_params_init_qwen3_coder` at `chat.cpp:1527` did not pass `enable_thinking` to Jinja; post-processing at `chat.cpp:1534-1536` produced `<think>\n</think>` (3 tokens) instead of the official `<think>\n\n</think>\n\n` (6 tokens) — a token sequence never seen in training | **Fork** and **Upstream Ollama** (for older llama.cpp); **Tie** (for post-refactor llama.cpp) |
 | History `<think>` blocks gated on thinking mode | **FIXED** (commit `4044b63f`) — unconditional `<think>` wrapping for messages after `lastQueryIndex` | **BROKEN** (gated on `isThinking`) | **Correct** (template handles it) | **Fork** |
 | Tool call parser robustness | Free-form streaming parser + **grammar-constrained generation DONE** (commit `4044b63f`): lazy GBNF grammar activates on `<tool_call>`, enforces valid function/parameter names and XML structure. Mode-dependent triggers, dead-end detection, Format→Grammar guard. | Same free-form parser (trusts model output, no grammar constraints) | Grammar-constrained — PEG parser forces model to produce syntactically valid tool calls during generation | **Fork matches llama.cpp** — both use grammar-constrained generation. Fork is the first Ollama model with this. |
@@ -341,7 +341,7 @@ The fork (and upstream Ollama) serialize tool definitions differently from the Q
 
 llama.cpp avoids these bugs because it executes the Jinja2 template directly via its vendored Jinja engine, producing the same JSON the model was trained on.
 
-> **CRITICAL IMPLEMENTATION NOTE:** These sub-bugs range from "straightforward but requires care" (Sub-bug C) to "deceptively dangerous shared infrastructure change" (Sub-bug B's key ordering and field loss). The core danger is that much of the serialization code is **shared infrastructure** used by many renderers (DeepSeek, GLM, Cogito, Olmo3, Nemotron, etc.), not just the Qwen family.
+> **CRITICAL IMPLEMENTATION NOTE:** These sub-bugs range from "straightforward" (Sub-bug C, Sub-bug D) to "shared infrastructure change requiring per-model verification" (Sub-bug B's key ordering and field loss). The core concern is that `ToolProperty` and `ToolFunctionParameters` are **shared types** used by many renderers (DeepSeek, GLM, Cogito, Olmo3, Nemotron, etc.), not just the Qwen family. However, per-model verification of all accessible templates shows all use HuggingFace Transformers' insertion-order override — no verified model uses stock Jinja2's `sort_keys=True`.
 
 ### 4.1 Sub-Bug A — HTML Character Escaping — DONE (2026-03-11)
 
@@ -353,7 +353,7 @@ The fork now fixes the **full tool-definition serialization path** by switching 
 
 *Shared infrastructure concern (verified):* `marshalWithSpaces` is called by the Olmo3, Qwen 3.5, and Qwen3VL renderers. Official HuggingFace templates for `Qwen/Qwen3.5-*`, `Qwen/Qwen3-VL-*`, `allenai/Olmo-3-7B-Instruct`, and `allenai/Olmo-3.1-32B-Instruct` all use `tools | tojson` for tool definitions, so disabling HTML escaping is correct for those paths.
 
-### 4.2 Sub-Bug B — Key Ordering and Field Loss in Tool Definition Serialization — PARTIALLY DONE (`required`/`properties` fixed; `enum`/`description` and field loss remain OPEN)
+### 4.2 Sub-Bug B — Key Ordering and Field Loss in Tool Definition Serialization — PARTIALLY DONE (`required`/`properties` fixed; `enum`/`description` ordering, field loss for `nullable`/`additionalProperties`/`prefixItems`, and scalar boolean/None tool-call-argument capitalization remain OPEN)
 
 Go's `json.Marshal` outputs struct fields in declaration order and sorts `map[string]any` keys alphabetically. Additionally, Go's `ToolProperty` struct lacks three fields that HuggingFace's `_parse_type_hint()` can produce — `nullable`, `additionalProperties`, and `prefixItems` — which are silently dropped during JSON deserialization. Both issues were empirically verified by running Go's `json.Marshal` on the actual Ollama `api.Tool` struct types and comparing against HuggingFace's `get_json_schema()` output (traced through `chat_template_utils.py` source code — `_parse_type_hint()` constructs dicts with specific insertion order, then `get_json_schema()` appends fields like `description` and `enum` in a specific sequence, and Python's `json.dumps` with `sort_keys=False` preserves that insertion order):
 
@@ -361,7 +361,7 @@ Go's `json.Marshal` outputs struct fields in declaration order and sorts `map[st
 |---|---|---|---|
 | `Tool` | `type`, [`items`†], `function` | `type`, `function` | **Yes**† |
 | `ToolFunction` | `name`, `description`, `parameters` | `name`, `description`, `parameters` | **Yes** |
-| `ToolFunctionParameters` | `type`, [`$defs`†], [`items`†], [`required`‡], `properties` | `type`, `properties`, [`required`‡] | **No — `required`/`properties` swapped** |
+| `ToolFunctionParameters` | `type`, [`$defs`†], [`items`†], `properties`, [`required`‡] | `type`, `properties`, [`required`‡] | **Yes** — FIXED (struct reordered, `Properties` now declared before `Required`) |
 | `ToolProperty` (with enum) | `type`, `description`, `enum` | `type`, `enum`, `description` | **No — `enum`/`description` swapped** |
 | `ToolProperty` (no enum) | `type`, `description` | `type`, `description` | **Yes** |
 | `ToolProperty` (`Optional[T]`) | `type`, `description` | `type`, `nullable`, `description` | **No — `nullable` field lost** |
@@ -374,9 +374,30 @@ Go's `json.Marshal` outputs struct fields in declaration order and sorts `map[st
 
 ‡`ToolFunctionParameters.Required` (in `api/types.go`) also has `omitempty`, correctly matching Python's conditional `if required: schema["required"] = required` guard in `chat_template_utils.py` — when no parameters are required, both Go and Python omit the field entirely. The ordering deviation (before `properties` in Go, after in Python) applies only when `required` is present, which is the common case for tool-calling models. **Crucially, this fix is safe to apply globally (by reordering the Go struct) without per-model verification:** since `p` < `r` alphabetically, even stock Jinja2's `sort_keys=True` produces `properties` before `required`. Every possible Python/Jinja2 configuration — HuggingFace Transformers' insertion-order-preserving override, stock Jinja2's alphabetical sorting, and llama.cpp's insertion-order-preserving engine — produces `properties` before `required`. The Go struct's current declaration order is the only system that produces the reversed ordering. Per-model template verification confirmed this: Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, and GLM-4 all use `tojson` with insertion order preserved; DeepSeek V3's template doesn't render tool definitions at all (Ollama constructs them); gated models (Cogito, LFM2, GLM-OCR) are safe regardless because both possible Python orderings agree.
 
-The `ToolProperty` enum/description mismatch arises because `_parse_type_hint()` at `chat_template_utils.py:139-142` constructs `{"type": ..., "enum": [...]}` first, then `get_json_schema()` at line 380 appends `schema["description"] = desc` last. Python dicts preserve insertion order, so the training data has `enum` before `description`. Go's `ToolProperty` struct declares `Description` before `Enum`, producing the opposite order. (The same ordering holds when `enum` comes from a docstring's `(choices: ...)` block instead of a `Literal` type hint — `get_json_schema()` at line 378 inserts `schema["enum"]` before line 380 inserts `schema["description"]`, producing the same `enum`-before-`description` order.) **Unlike the `required`/`properties` fix, this reorder is NOT safe to apply globally without per-model verification.** Since `d` < `e` alphabetically, stock Jinja2's `sort_keys=True` produces `description` before `enum` — the same order as Go's current struct. HuggingFace Transformers' insertion-order-preserving override produces the opposite (`enum` before `description`). These two Python/Jinja2 configurations disagree, so the correct order depends on which Jinja2 implementation each model's training pipeline used. Reordering the Go struct to match HuggingFace would improve fidelity for HF-trained models but could worsen fidelity for any model trained with stock Jinja2. This fix should remain renderer-local or wait for per-model verification.
+The `ToolProperty` enum/description mismatch arises because `_parse_type_hint()` at `chat_template_utils.py:139-142` constructs `{"type": ..., "enum": [...]}` first, then `get_json_schema()` at line 380 appends `schema["description"] = desc` last. Python dicts preserve insertion order, so the training data has `enum` before `description`. Go's `ToolProperty` struct declares `Description` before `Enum`, producing the opposite order. (The same ordering holds when `enum` comes from a docstring's `(choices: ...)` block instead of a `Literal` type hint — `get_json_schema()` at line 378 inserts `schema["enum"]` before line 380 inserts `schema["description"]`, producing the same `enum`-before-`description` order.)
 
-The field loss rows (`Optional[T]`, `Dict[str, T]`, `Tuple[T1, T2]`) arise because Go's `ToolProperty` struct (in `api/types.go`) has six fields (`anyOf`, `type`, `items`, `description`, `enum`, `properties`) but HuggingFace's `_parse_type_hint()` can produce three additional fields: `nullable` (line 127, for `Optional[T]` / `Union[T, None]`), `additionalProperties` (line 175, for `Dict[str, T]`), and `prefixItems` (line 168, for `Tuple[T1, T2]`). Go's `json.Unmarshal` silently drops unknown fields, so these constraints vanish during the client→Go→renderer round-trip. The model then sees a tool schema missing type constraints it was trained on — `{"type": "string"}` instead of `{"type": "string", "nullable": true}`, or `{"type": "object"}` instead of `{"type": "object", "additionalProperties": {"type": "integer"}}`. Of the three, `nullable` is the most impactful — `Optional[T]` parameters are common in Python tool definitions.
+**Global safety assessment for this struct reorder:** Since `d` < `e` alphabetically, stock Jinja2's `sort_keys=True` would produce `description` before `enum` — the same order as Go's current struct. HuggingFace Transformers' insertion-order-preserving override produces the opposite (`enum` before `description`). These two Python/Jinja2 configurations disagree in theory, so the correct order depends on which Jinja2 implementation each model's training pipeline used. However, every model whose HuggingFace template has been verified — Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, and GLM-4 — was trained with HuggingFace Transformers' insertion-order override. No verified model uses stock Jinja2's `sort_keys=True`. The safest approach is to swap `Enum` and `Description` in the `ToolProperty` struct globally (changing field order from `{AnyOf, Type, Items, Description, Enum, Properties}` to `{AnyOf, Type, Items, Enum, Description, Properties}`), which matches all verified models. Alternatively, implement renderer-local custom marshaling for `ToolProperty` in specific renderers to avoid any risk to unverified models.
+
+The field loss rows (`Optional[T]`, `Dict[str, T]`, `Tuple[T1, T2]`) arise because Go's `ToolProperty` struct (in `api/types.go`) has six fields (`anyOf`, `type`, `items`, `description`, `enum`, `properties`) but HuggingFace Transformers' `_parse_type_hint()` can produce three additional fields: `nullable` (line 127, for `Optional[T]` / `Union[T, None]`), `additionalProperties` (line 175, for `Dict[str, T]`), and `prefixItems` (line 168, for `Tuple[T1, T2]`). Go's `json.Unmarshal` silently drops unknown fields, so these constraints vanish during the client→Go→renderer round-trip. The model then sees a tool schema missing type constraints it was trained on — `{"type": "string"}` instead of `{"type": "string", "nullable": true}`, or `{"type": "object"}` instead of `{"type": "object", "additionalProperties": {"type": "integer"}}`. Of the three, `nullable` is the most impactful — `Optional[T]` parameters are common in Python tool definitions.
+
+The fix requires rewriting the `ToolProperty` struct to match the exact field ordering that HuggingFace Transformers' `get_json_schema()` produces. This struct was verified against every type combination in HuggingFace Transformers v5.3.0 — `_parse_type_hint()` builds the base dict with `type` first, then adds type-specific fields (`items`/`additionalProperties`/`prefixItems`) and `nullable` in insertion order, then `get_json_schema()` appends `enum` (from choices annotations) and `description` last:
+
+```go
+// CORRECT ToolProperty struct (matches HF get_json_schema insertion order)
+type ToolProperty struct {
+    AnyOf                []ToolProperty     `json:"anyOf,omitempty"`
+    Type                 PropertyType       `json:"type,omitempty"`
+    Items                any                `json:"items,omitempty"`
+    AdditionalProperties any               `json:"additionalProperties,omitempty"`
+    PrefixItems          []any              `json:"prefixItems,omitempty"`
+    Nullable             *bool              `json:"nullable,omitempty"`
+    Enum                 []any              `json:"enum,omitempty"`
+    Description          string             `json:"description,omitempty"`
+    Properties           *ToolPropertiesMap `json:"properties,omitempty"`
+}
+```
+
+Verified examples: `Optional[list[str]]` → `type, items, nullable, description` ✓; `Optional[str]` with `(choices: ...)` → `type, nullable, enum, description` ✓; `str` with `(choices: ...)` → `type, enum, description` ✓.
 
 The `Items` alphabetization is a non-issue for training data. `get_json_schema()` never adds `description` to items sub-objects — items are single-key dicts like `{"type": "string"}`, which have no ordering to break. Only client-provided multi-key items schemas would be affected.
 
@@ -384,22 +405,72 @@ The `Items` alphabetization is a non-issue for training data. `get_json_schema()
 - **Python (training data):** `..., "format": {"type": "string", "enum": ["json", "xml"], "description": "Output format"}, ...`
 - **Go (fork output):** `..., "format": {"type": "string", "description": "Output format", "enum": ["json", "xml"]}, ...`
 
-**This is NOT a simple "swap a few struct fields" fix.** `ToolFunctionParameters` and `ToolProperty` are shared types used by **every single renderer** in Ollama that supports tool calling. HuggingFace Transformers' `tojson` override (at `chat_template_utils.py:463-466`, using `json.dumps` with `sort_keys=False`) preserves **dict insertion order** — and llama.cpp's `tojson` does the same (via `as_ordered_object()` at `value.cpp:1330`). This means the JSON key ordering in tool definitions is an artifact of how each model's specific Jinja2 template (or its caller's `get_json_schema()`) constructs its Python dicts. Stock Jinja2's `tojson` would alphabetically sort keys (default `sort_keys=True`), but neither major inference framework uses the stock filter. Different model families have different templates that may construct dicts in different orders. The `Items` issue is harder still — it requires either a custom ordered-map type (like `ToolPropertiesMap`) or renderer-local marshaling to preserve insertion order through a JSON round-trip. The field loss issue requires adding `nullable`, `additionalProperties`, and `prefixItems` fields to `ToolProperty` — straightforward structurally, but changes the serialization output of every renderer that marshals `ToolProperty`.
+**Shared infrastructure concern — blast radius analysis.** Rewriting the `ToolProperty` struct changes the JSON output of **every renderer that calls `json.Marshal` on `api.Tool` or `api.ToolProperty`**. These are:
 
-**Per-model verification status (completed for `required`/`properties`):** The `ToolFunctionParameters` `required`/`properties` ordering has been verified across all accessible model templates. Every model whose HF template is accessible (Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, GLM-4 family) uses `tojson` with insertion order preserved → `properties` before `required`. DeepSeek V3's template doesn't render tool definitions. Gated models (Cogito, LFM2, GLM-OCR) are safe because even alphabetical sorting (`sort_keys=True`) produces `properties` before `required` (`p` < `r`). **The `ToolFunctionParameters` struct can be safely reordered globally** by moving the `Properties` field before `Required` in `api/types.go`. No per-model template verification gap remains for this specific fix.
+| Renderer | Marshal call | Affected by struct change? |
+|---|---|---|
+| `qwen35.go` | `marshalWithSpaces(tool)` | Yes — the fix target |
+| `qwen3vl.go` | `marshalWithSpaces(tool)` | Yes — same `tojson` template |
+| `olmo3.go` | `marshalWithSpaces(tools)` | Yes — same `tojson` template |
+| `cogito.go` | `json.MarshalIndent(tool)` | Yes — **gated model, template unverified** |
+| `deepseek3.go` | `json.Marshal(tool.Function.Parameters)` | Yes (parameters only) — but template doesn't render tool defs |
+| `glm46.go` | `json.Marshal(tool)` | Yes — verified, uses `tojson` |
+| `glm47.go` | `json.Marshal(tool)` + post-process | Yes — verified, uses `tojson` |
+| `glmocr.go` | `json.Marshal(tool)` + post-process | Yes — **gated model, template unverified** |
+| `lfm2.go` | `json.Marshal(tool.Function)` via helper | Yes — **gated model, template unverified** |
+| `nemotron3nano.go` | Manual field access | No — immune |
+| `qwen3coder.go` | Manual field access | No — immune |
+| `functiongemma.go` | Manual field access | No — immune |
 
-The correct approach for the remaining issues is one of:
-1. **Renderer-local custom marshaling** — Have specific renderers control `ToolProperty` field ordering (`enum`/`description`), leaving the shared struct untouched
-2. **Per-model verification** — For the `enum`/`description` reorder, verify each model's training pipeline before changing the shared `ToolProperty` struct (stock Jinja2 and HF Transformers disagree on this ordering)
-3. **Per-renderer struct wrapper** — Define a wrapper type with the desired field order for models that need it
+The change only affects output when both `Enum` and `Description` (or any new field) are present in a `ToolProperty`. For properties with only `Type` + `Description` (the common case), the output is unchanged. The risk is limited to Cogito, GLM-OCR, and LFM2 (gated, unverified templates) — and even then, only for tools with enum parameters.
 
-For Qwen 3.5 specifically, success should mean the full round-trip consistency test in `server/qwen35_kvcache_roundtrip_test.go` passes completely.
+Every verified model (Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, GLM-4.6, GLM-4.7) uses HuggingFace Transformers' insertion-order `tojson` override, which produces `enum` before `description`. No verified model uses stock Jinja2's `sort_keys=True`. The `Items` ordering issue is a **non-issue**: HuggingFace Transformers' `get_json_schema()` produces single-key `items` sub-objects (`{"type": "string"}`), which have no ordering to break. No fix is needed for `Items`.
+
+**Per-model verification status:** Completed for all accessible model templates. Every model whose HuggingFace template is accessible (Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, GLM-4 family) uses `tojson` with insertion order preserved. DeepSeek V3's template doesn't render tool definitions. Gated models (Cogito, LFM2, GLM-OCR) are safe because even alphabetical sorting (`sort_keys=True`) produces the same ordering for the `required`/`properties` and `enum`/`description` cases that matter:
+- `properties` before `required`: `p` < `r` alphabetically — matches HuggingFace Transformers insertion order. **FIXED.**
+- `enum` before `description`: HuggingFace Transformers produces `enum` first (insertion order). Stock Jinja2 produces `description` first (`d` < `e`). All verified models use HuggingFace Transformers. Swapping `Enum` and `Description` in the `ToolProperty` struct is safe for all verified models.
+
+**Remaining fixes — recommended approach:**
+1. **`enum`/`description` swap** — Swap the `Enum` and `Description` field declarations in `ToolProperty` in `api/types.go`. Safe for all verified models.
+2. **Field loss** — Add `Nullable *bool`, `AdditionalProperties any`, `PrefixItems []any` fields to `ToolProperty` with correct json tags and field ordering matching HuggingFace Transformers' `get_json_schema()` insertion order.
+3. **Boolean/None capitalization** — Add `bool` type switch cases and update `nil` handling in `formatToolCallArgument` in `model/renderers/qwen3coder.go`.
+
+For Qwen 3.5 specifically, success means the full round-trip consistency test in `server/qwen35_kvcache_roundtrip_test.go` passes completely, and the rewritten `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` (see `test_gap_analysis.md` Gap 4) passes for all tool types including enum parameters.
 
 ### 4.3 Sub-Bug C — Compact Separators in `formatToolCallArgument` — DONE (2026-03-10)
 
 The fork now fixes this locally in `qwen3coder.go`: `formatToolCallArgument` emits spaced JSON (`{"key": "value"}`) with HTML escaping disabled, matching the Qwen-family `tojson` convention for tool call arguments. This change is scoped to the Qwen renderers and avoids touching shared serializer infrastructure.
 
-### 4.4 Why These Bugs Matter — Two Distinct Failure Modes
+### 4.4 Sub-Bug D — Scalar Boolean and None Capitalization in `formatToolCallArgument` — OPEN
+
+The official Qwen 3.5 Jinja2 template (line 122 of `chat_template.jinja`) renders tool call arguments using two code paths based on the argument's type:
+
+- For dicts and lists: `args_value | tojson | safe` — serializes to JSON. Booleans become `true`/`false`, null becomes `null`. This is standard JSON.
+- For everything else (strings, numbers, booleans, None): `args_value | string` — calls Python's `str()` function. `str(True)` produces `True` (capital T), `str(False)` produces `False` (capital F), `str(None)` produces `None`.
+
+Go's `formatToolCallArgument` in `model/renderers/qwen3coder.go` line 256 uses `fmt.Sprintf("%v", value)` for non-string, non-collection types. `fmt.Sprintf("%v", true)` produces `true` (lowercase), not `True`. For `nil`, line 237 hardcodes `"null"`, not `"None"`.
+
+**Byte-exact verification:** Both HuggingFace Transformers v5.3.0 and Go `Qwen35Renderer` outputs were saved to files and diffed for a conversation containing past tool calls with boolean and None arguments. The diff shows exactly three changed lines:
+
+| Argument value | HuggingFace Transformers renders | Go renders | Match? |
+|---|---|---|---|
+| Scalar `True` | `True` | `true` | **No** |
+| Scalar `False` | `False` | `false` | **No** |
+| Scalar `None` | `None` | `null` | **No** |
+| Large integer `10000000000` | `10000000000` | `1e+10` | **No** |
+| `True` inside a list | `true` | `true` | **Yes** (both use JSON) |
+| `None` inside a dict | `null` | `null` | **Yes** (both use JSON) |
+
+The boolean/None mismatch affects **top-level scalar** booleans and None. Inside collections (lists, dicts), both pipelines use JSON serialization, which produces lowercase `true`/`false`/`null` — these match. The large integer mismatch affects `float64` values that are integer-valued and >= 1e7 (where Go's `fmt.Sprintf("%v")` switches to exponential notation). JSON integers unmarshal as `float64` in Go, and Go loses the int/float distinction. Python's `json.loads("10000000000")` produces `int(10000000000)`, and `str(10000000000)` produces `"10000000000"`.
+
+**Fix:** Rewrite the type handling in `formatToolCallArgument`:
+- `bool`: `true` → `"True"`, `false` → `"False"` (matching Python `str(True)`, `str(False)`)
+- `nil`: `"null"` → `"None"` (matching Python `str(None)`)
+- `float64` (integer-valued): use `strconv.FormatInt(int64(v), 10)` instead of `fmt.Sprintf("%v", v)`. This produces `"10000000000"` instead of `"1e+10"`. Non-integer floats keep `fmt.Sprintf("%v")` which already matches Python (e.g., `"3.14"`, `"1e-05"`).
+
+This fix is scoped to the Qwen renderers (`formatToolCallArgument` is only called by `Qwen35Renderer` and `Qwen3CoderRenderer`). Both the Qwen 3.5 and Qwen3-Coder official Jinja2 templates use the identical `| string` filter line for scalar tool call arguments (verified by reading both templates).
+
+### 4.5 Why These Bugs Matter — Two Distinct Failure Modes
 
 **Failure mode 1 — Training distribution shift:** Every time the model uses tools, it sees a prompt format that differs from its training data.
 
@@ -423,11 +494,11 @@ llama.cpp avoids all three sub-bugs by executing the Jinja2 template directly. I
 
 However, llama.cpp's `tojson` has **one minor flaw**: float serialization at `value.cpp:1290` uses C++ `ostringstream` default formatting (6 significant digits), while Python's `json.dumps` preserves ~17 digits. Additionally, `1.0` becomes `1` in C++ but stays `1.0` in Python. Unlikely to affect model behavior in practice.
 
-### 4.5 KV Cache Round-Trip Test (`server/qwen35_kvcache_roundtrip_test.go`)
+### 4.6 KV Cache Round-Trip Test (`server/qwen35_kvcache_roundtrip_test.go`)
 
 The fork has 22 parameterized test cases covering round-trip consistency. The `allowCanonicalizationDrift` mechanism is broken — it checks raw form versus raw form instead of re-rendered form. The tests correctly identify 4 classes of round-trip failures: spacing, key ordering, number lexical forms, and HTML escaping.
 
-### 4.6 Prerequisite Research for Remaining Fixes
+### 4.7 Prerequisite Research for Remaining Fixes
 
 **Research topic 1 — Shared infrastructure dependency map:** Build a complete call graph of which renderers call which shared functions (`marshalWithSpaces`, `jsonMarshalNoEscape` if created, `formatToolCallArgument`, `renderAdditionalKeys`, `formatToolDefinitionType`). For each call site, document whether the caller is model-family-specific or shared across families. Map which renderers serialize `ToolFunctionParameters` and how (direct `json.Marshal`, `json.MarshalIndent`, `marshalWithSpaces`, or custom). This determines the blast radius of each change.
 
@@ -750,8 +821,10 @@ llama.cpp demonstrates this works using `split_equal(n_ubatch, true)` — per-se
 | Issue | Impact | Status |
 |-------|--------|--------|
 | `ToolFunctionParameters` key ordering: `required` before `properties` (should be reversed) | Distribution shift on every tool definition in every system prompt. **Safe to fix globally** — every Python/Jinja2 configuration produces `properties` first (`p` < `r` alphabetically, and HF insertion order also puts `properties` first). Per-model verification complete. | **DONE** — struct reordered in `api/types.go`, all renderer and API tests updated |
-| `ToolProperty` key ordering: `description` before `enum` (should be reversed for HF-trained models) | Distribution shift on tool parameters with enumerated values. **NOT safe to fix globally** — stock Jinja2 (`sort_keys=True`) produces `description` first (`d` < `e`), matching Go's current order; only HF Transformers' insertion-order override produces `enum` first. Requires per-model verification or renderer-local fix. | **OPEN** |
-| `ToolProperty.Items` map key alphabetization | Non-issue for training data (items are single-key dicts) | **Won't fix** |
+| `ToolProperty` key ordering: `description` before `enum` (should be reversed for HF-trained models) | Distribution shift on tool parameters with enumerated values. Every verified model (Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, GLM-4) was trained with HuggingFace Transformers' insertion-order override, which produces `enum` before `description`. Fix: swap `Enum` and `Description` field declarations in `ToolProperty` in `api/types.go`. | **OPEN** |
+| `ToolProperty` field loss: `nullable`, `additionalProperties`, `prefixItems` silently dropped during `json.Unmarshal` | Model sees tool schema missing type constraints it was trained on. `Optional[T]` parameters (producing `nullable: true`) are common in Python tool definitions. Fix: add `Nullable *bool`, `AdditionalProperties any`, `PrefixItems []any` fields to `ToolProperty` in `api/types.go`. | **OPEN** |
+| `formatToolCallArgument` scalar boolean/None capitalization: Go produces `true`/`false`/`null`, HuggingFace Transformers template produces `True`/`False`/`None` | Different token IDs for past tool call arguments in multi-turn conversations. Fix: add `bool` type switch cases and update `nil` handling in `formatToolCallArgument` in `model/renderers/qwen3coder.go`. | **OPEN** |
+| `ToolProperty.Items` map key alphabetization | Non-issue for training data — HuggingFace Transformers' `get_json_schema()` produces single-key `items` sub-objects (`{"type": "string"}`), which have no ordering to break. | **Won't fix** |
 
 ### Performance Opportunities
 
@@ -825,7 +898,9 @@ Ollama bundles vision tensors into the main GGUF (1307 tensors). llama.cpp uses 
 |----------|------|--------|--------|
 | **P0** | Adopt CUDA async copy + reduced sync from `ggml-cuda.cu` and `ggml-backend.cpp` | Medium (2 files, conflict resolution) | **OPEN** |
 | ~~**P1**~~ | ~~Fix `ToolFunctionParameters` key ordering: move `Properties` before `Required` in `api/types.go`~~ | ~~Small~~ | **DONE** — struct reordered, all tests updated, test renamed to `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` with HF ground truth |
-| **P2** | Fix `ToolProperty` key ordering (`enum`/`description` swapped) — requires renderer-local marshaling or per-model verification because stock Jinja2 (`d` < `e`) and HF Transformers (insertion order) disagree | Medium | **OPEN** |
+| **P2** | Fix `ToolProperty` key ordering (`enum`/`description` swapped) — swap `Enum` and `Description` field declarations in `ToolProperty` in `api/types.go`. All verified models (Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, GLM-4) were trained with HuggingFace Transformers' insertion-order override which produces `enum` before `description`. | Small | **OPEN** |
+| **P2** | Fix `ToolProperty` field loss and ordering — rewrite the `ToolProperty` struct in `api/types.go` to the exact 9-field layout specified in Section 4.2 (verified against every HuggingFace Transformers v5.3.0 type combination). Adds `AdditionalProperties any`, `PrefixItems []any`, `Nullable *bool` at positions 4-6, moves `Enum` to position 7 and `Description` to position 8. This single struct change fixes BOTH the field loss AND the `enum`/`description` ordering. | Small-Medium | **OPEN** |
+| **P2** | Fix `formatToolCallArgument` scalar type rendering — rewrite type handling in `model/renderers/qwen3coder.go`: (1) `bool`: `true`→`"True"`, `false`→`"False"`. (2) `nil`: `"null"`→`"None"`. (3) `float64` integer-valued: use `strconv.FormatInt(int64(v), 10)` to produce `"10000000000"` instead of `"1e+10"`. Matches Python `str()` used by both the Qwen 3.5 and Qwen3-Coder templates' `| string` filter (both templates verified identical). | Small | **OPEN** |
 | **P1** | Adopt M-RoPE `can_shift()` guard in vendored `llama-kv-cache.cpp` | Small (3 lines) | **OPEN** |
 | **P2** | Increase `num_batch` to 2048 in the Modelfile | Zero (config-only) | **OPEN** |
 | **P3** | Verify `Qwen3VLRenderer` thinking variant needs `emitEmptyThinkOnNoThink: true` | Research | **OPEN** |
