@@ -608,6 +608,12 @@ func TestQwen35RendererFieldLossRoundTrip(t *testing.T) {
                     "ToolProperty in api/types.go is missing fields that "+
                     "HuggingFace Transformers' get_json_schema() produces. "+
                     "json.Unmarshal silently drops unknown JSON keys.\n\n"+
+                    "These are not informational fields — they carry type "+
+                    "constraint semantics. For example, 'nullable: true' means "+
+                    "'accepts null' and is a fundamentally different schema from "+
+                    "one without it. A developer using Optional[int] in Python "+
+                    "gets 'nullable: true' from get_json_schema() automatically "+
+                    "and has no way to avoid Ollama silently removing it.\n\n"+
                     "Fix: add the missing fields to ToolProperty in "+
                     "api/types.go (Nullable *bool, AdditionalProperties any, "+
                     "PrefixItems []any) with correct json tags and field "+
