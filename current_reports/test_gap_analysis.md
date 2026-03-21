@@ -1,6 +1,6 @@
 # Qwen 3.5 Renderer and Parser Test Gap Analysis
 
-**Date:** 2026-03-13 (updated 2026-03-21: Gap 4 rewritten with verified HuggingFace Transformers ground truth; Gap 10 rewritten with `formatToolCallArgument` scalar divergences including bool/None/large-integer)
+**Date:** 2026-03-13 (updated 2026-03-22: Gap 4 rewritten with verified HuggingFace Transformers ground truth; Items ordering corrected from "non-issue" to real issue for complex element types — `Items *ToolProperty` recursive type fix specified; proposed struct uses recursive types throughout; Gap 10 rewritten with `formatToolCallArgument` scalar divergences including bool/None/large-integer)
 **Fork:** `BigBIueWhale/ollama` at `/home/user/shared_vm/ollama/`, branch `main`, merge base `cc90a035` (Ollama `v0.17.4`)
 **Model:** Qwen 3.5 27B (Alibaba Qwen), a hybrid recurrent architecture (`qwen3next`). Currently the most promising open-source large language model that can run on consumer-grade hardware (17.6 GB at Q4_K_XL quantization).
 **Scope:** This document covers only the test gaps that need to be closed for the Qwen 3.5 prompt template renderer (`model/renderers/qwen35.go`) and parser (`model/parsers/qwen35.go`, which delegates tool call parsing to `model/parsers/qwen3coder.go`), and the grammar-constrained tool call generation pipeline. It does not cover model architecture, GGUF conversion, penalty sampling, or performance — those are covered in `consolidated_report.md`.
@@ -33,7 +33,7 @@ Both failure modes are especially damaging for this specific model because Qwen 
 
 **`TestQwen35RendererStructuredToolArgumentsUseSpacedJSON`**: Verifies that when a tool call argument is a Go `map[string]any` containing `{"content": "if (x < 5 && y > 3) {}"}`, the rendered output uses spaced JSON separators (`: ` after colons, `, ` after commas) and preserves literal HTML characters (`<`, `>`, `&`) without escaping them to `\u003c`, `\u003e`, `\u0026`. Uses `strings.Contains` with the exact expected substring `<parameter=payload>\n{"content": "if (x < 5 && y > 3) {}"}\n</parameter>`.
 
-**`TestQwen35RendererToolDefinitionsMatchOfficialTemplate`**: Claims to verify byte-exact match with HuggingFace Transformers output. Uses a fabricated multi-key `items` sub-object (`{"type": "string", "description": "..."}`) that HuggingFace Transformers' `get_json_schema()` does not produce — real `items` objects are single-key (`{"type": "string"}`). The test fails on the fabricated items ordering assertion, masking the real issues. **Needs rewrite** (see Gap 4) to use realistic tools matching `get_json_schema()` output, and to test the real divergences: `enum`/`description` field ordering, field loss (`nullable`, `additionalProperties`, `prefixItems`), and scalar boolean/None capitalization in `formatToolCallArgument`.
+**`TestQwen35RendererToolDefinitionsMatchOfficialTemplate`**: Claims to verify byte-exact match with HuggingFace Transformers output. Uses a fabricated multi-key `items` sub-object (`{"type": "string", "description": "..."}`) that HuggingFace Transformers' `get_json_schema()` does not produce — `description` is never added to items sub-objects. However, `get_json_schema()` DOES produce multi-key items for complex element types: `list[dict[str, int]]` → items = `{"type": "object", "additionalProperties": {"type": "integer"}}` (2 keys), `list[Optional[int]]` → items = `{"type": "integer", "nullable": true}` (2 keys). The test fails on the wrong fabricated scenario while missing the real one. **Needs rewrite** (see Gap 4) to use realistic tools matching `get_json_schema()` output, and to test the real divergences: `enum`/`description` field ordering, field loss (`nullable`, `additionalProperties`, `prefixItems`), recursive key ordering in items for complex element types, and scalar boolean/None capitalization in `formatToolCallArgument`.
 
 **`TestQwen35RendererInterleavedThinkingAndTools`**: Verifies two consecutive assistant turns, each with thinking content, visible content, and a tool call, separated by a tool response. The `think=true` subtest checks exact multi-line substrings including the `<think>` block, the `</think>` close, the blank line separator, the visible content, and the `<tool_call>` XML, plus the think=true generation prompt suffix. The `think=false` subtest is the primary regression detector for the fork's unconditional thinking block fix (Gap 2): it renders the same messages with `ThinkValue{Value: false}` and verifies that both historical assistant messages retain their `<think>` blocks with full reasoning text, and that the generation prompt uses the non-thinking form (`<think>\n\n</think>\n\n`). This catches both regression vectors: re-adding `isThinking` to `splitQwen35ReasoningContent` or re-adding `isThinking &&` to the `<think>` wrapping condition.
 
@@ -319,9 +319,9 @@ Running HuggingFace Transformers v5.3.0 `get_json_schema()` on a Python function
 "items": {"type": "string"}
 ```
 
-One key. No description. HuggingFace Transformers' (`transformers` @ `3a3b59c`) `_parse_type_hint()` function at line 146 of `chat_template_utils.py` returns `{"type": "array", "items": _parse_type_hint(args[0])}`, and `_parse_type_hint()` for basic types returns `{"type": "string"}` — a single-key dict. The `description` field is only added to **top-level properties** by `get_json_schema()` at line 377 (`schema["description"] = desc`), never to nested `items` sub-objects. The test fabricates a multi-key `items` object that HuggingFace Transformers' tool schema pipeline cannot produce.
+One key. No description. HuggingFace Transformers' (`transformers` @ `3a3b59c`) `_parse_type_hint()` function at line 146 of `chat_template_utils.py` returns `{"type": "array", "items": _parse_type_hint(args[0])}`, and `_parse_type_hint()` for basic types returns `{"type": "string"}` — a single-key dict. The `description` field is only added to **top-level properties** by `get_json_schema()` at line 377 (`schema["description"] = desc`), never to nested `items` sub-objects. The test's specific fabrication — putting `description` inside items — was correctly identified as impossible via `get_json_schema()`.
 
-The test fails because Go's `json.Marshal` alphabetizes `map[string]any` keys, producing `{"description": ..., "type": ...}` instead of the expected `{"type": ..., "description": ...}`. This failure tests a non-existent problem: since real `items` objects have exactly one key, alphabetical ordering is irrelevant.
+However, the original conclusion that "items are always single-key" was an overgeneralization. `_parse_type_hint()` recurses into complex element types and produces **multi-key** items sub-objects through a different mechanism than `description`: `list[dict[str, int]]` → items = `{"type": "object", "additionalProperties": {"type": "integer"}}` (2 keys), `list[Optional[int]]` → items = `{"type": "integer", "nullable": true}` (2 keys). These are real outputs from `get_json_schema()`, verified empirically by running the official `Qwen/Qwen3.5-27B` tokenizer's `apply_chat_template` (script: `/tmp/qwen35-check/prove_multikey_items.py`). Go's `json.Marshal` alphabetizes `map[string]any` keys, so it would produce `{"additionalProperties": ..., "type": ...}` (wrong) instead of `{"type": ..., "additionalProperties": ...}` (correct HF insertion order). The fix is to use `Items *ToolProperty` instead of `Items any`, so struct field ordering applies recursively — see the corrected struct below.
 
 Meanwhile, the test **does not test** the three real divergences that exist right now between the Go renderer and HuggingFace Transformers ground truth:
 
@@ -335,7 +335,7 @@ The following ground truth strings were generated by running HuggingFace Transfo
 
 **Tool 1: Simple tool — `get_weather(location: str, filters: list[str])`**
 
-This tool tests: no HTML escaping, `properties` before `required`, single-key `items`, `description` after `items` at the property level.
+This tool tests: no HTML escaping, `properties` before `required`, basic single-key `items` (only basic element types like `list[str]` produce single-key items; complex types like `list[dict[str,int]]` produce multi-key items — see Items ordering status below), `description` after `items` at the property level.
 
 HuggingFace Transformers ground truth (the `tojson` line for this tool):
 ```
@@ -368,7 +368,7 @@ Go `Qwen35Renderer` output for the same tool:
 
 Root cause: HuggingFace Transformers' (`transformers` @ `3a3b59c`) `get_json_schema()` at `chat_template_utils.py` line 375 adds `schema["enum"] = [...]` before line 377 adds `schema["description"] = desc`. Python dicts preserve insertion order, and HuggingFace Transformers' `tojson` override (lines 465-468) uses `json.dumps(sort_keys=False)`, so the training data has `enum` before `description`. Go's `ToolProperty` struct in `api/types.go` declares `Description` (field 4) before `Enum` (field 5), and `json.Marshal` emits struct fields in declaration order.
 
-Fix: The `enum`/`description` swap is part of the larger `ToolProperty` struct rewrite described below (Tool 3). The struct change from `{AnyOf, Type, Items, Description, Enum, Properties}` to `{AnyOf, Type, Items, AdditionalProperties, PrefixItems, Nullable, Enum, Description, Properties}` fixes both the `enum`/`description` ordering AND the field loss in a single change.
+Fix: The `enum`/`description` swap is part of the larger `ToolProperty` struct rewrite described below (Tool 3). The struct change from `{AnyOf, Type, Items any, Description, Enum, Properties}` to `{AnyOf, Type, Items *ToolProperty, AdditionalProperties *ToolProperty, PrefixItems []ToolProperty, Nullable *bool, Enum, Description, Properties}` fixes the `enum`/`description` ordering, the field loss, AND the recursive nested key ordering for complex element types (like `list[dict[str, int]]` whose items sub-object has 2 keys) — all in a single change.
 
 **Blast radius of the struct change:** The `ToolProperty` struct is serialized via `json.Marshal` or `marshalWithSpaces` by 9 renderers. Only the `enum`/`description` field swap affects output (the new fields are `omitempty` and don't change output for tools that lack them). The GLM-4.6 and GLM-OCR renderers have tool tests but they are currently **SKIPPED** upstream (`"tool call ordering not guaranteed yet"`, added by jmorganca in commit `4f138a17`). The Qwen3VL test comments already show the correct HF ordering (`"enum": [...], "description": "..."`). No non-skipped test in any renderer has expected output that depends on the current `description`-before-`enum` ordering. Every verified model (Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, and the GLM-4 family including GLM-5) uses HuggingFace Transformers' `tojson` with `sort_keys=False`, which preserves insertion order and produces `enum` before `description`. GLM templates were verified from `tokenizer_config.json` on HuggingFace (see `consolidated_report.md` Section 4.2, GLM verification note). The swap moves all models closer to their training data; no model gets worse output. Note: the Ollama GLM renderers have broader issues beyond field ordering — `glm46.go` uses compact `json.Marshal(tool)` while the official GLM-4 templates use `tojson(indent=4)` (pretty-printed), and the renderer structure (English UI, whole-tool serialization) matches GLM-5's template rather than GLM-4's. GLM tool tests being skipped/commented out reflects this incomplete state.
 
@@ -407,13 +407,14 @@ type ToolProperty struct {
 The correct struct, verified against every type combination in HuggingFace Transformers v5.3.0 `get_json_schema()` (`_parse_type_hint()` builds the base dict, then `get_json_schema()` appends `enum` from choices annotations and `description` last):
 
 ```go
-// CORRECT (matches HF get_json_schema insertion order for all types)
+// CORRECT (matches HF get_json_schema insertion order for all types,
+// with recursive types for correct key ordering at ALL nesting levels)
 type ToolProperty struct {
     AnyOf                []ToolProperty     `json:"anyOf,omitempty"`
     Type                 PropertyType       `json:"type,omitempty"`
-    Items                any                `json:"items,omitempty"`
-    AdditionalProperties any               `json:"additionalProperties,omitempty"`
-    PrefixItems          []any              `json:"prefixItems,omitempty"`
+    Items                *ToolProperty      `json:"items,omitempty"`
+    AdditionalProperties *ToolProperty      `json:"additionalProperties,omitempty"`
+    PrefixItems          []ToolProperty     `json:"prefixItems,omitempty"`
     Nullable             *bool              `json:"nullable,omitempty"`
     Enum                 []any              `json:"enum,omitempty"`
     Description          string             `json:"description,omitempty"`
@@ -421,7 +422,9 @@ type ToolProperty struct {
 }
 ```
 
-Why this specific order (all line numbers reference `transformers` @ `3a3b59c`, `chat_template_utils.py`): `_parse_type_hint()` builds the dict with `type` first, then adds `items` (line 146, for `list[T]`), `additionalProperties` (line 172, for `dict[K,V]`), `prefixItems` (line 165, for `tuple[T1,T2]`), or `nullable` (line 124, for `Optional[T]`) in insertion order. These fields are mutually exclusive per type, but `nullable` always comes after the others (because `_parse_type_hint` recurses into the inner type first, then appends `nullable`). Then `get_json_schema()` appends `enum` (from `(choices: ...)` annotations or `Literal` types — line 375), then `description` (line 377). `Properties` is never produced by `get_json_schema()` — it only appears in client-provided schemas.
+**Why `*ToolProperty` instead of `any`:** `Items`, `AdditionalProperties`, and `PrefixItems` hold nested JSON Schema objects that follow the same structure as `ToolProperty`. If they were `any`, Go's `json.Unmarshal` would parse them into `map[string]any`, and `json.Marshal` would alphabetize the keys — producing wrong ordering for complex element types. `list[dict[str, int]]` produces items = `{"type": "object", "additionalProperties": {"type": "integer"}}` (2 keys), and `list[Optional[int]]` produces items = `{"type": "integer", "nullable": true}` (2 keys). With `Items any`, Go would output `{"additionalProperties": ..., "type": ...}` (alphabetical, wrong). With `Items *ToolProperty`, Go outputs keys in struct declaration order — correct at all depths. Empirically verified: `/tmp/qwen35-check/prove_multikey_items.py`.
+
+Why this specific **field order** (all line numbers reference `transformers` @ `3a3b59c`, `chat_template_utils.py`): `_parse_type_hint()` builds the dict with `type` first, then adds `items` (line 146, for `list[T]`), `additionalProperties` (line 172, for `dict[K,V]`), `prefixItems` (line 165, for `tuple[T1,T2]`), or `nullable` (line 124, for `Optional[T]`) in insertion order. These fields are mutually exclusive per type, but `nullable` always comes after the others (because `_parse_type_hint` recurses into the inner type first, then appends `nullable`). Then `get_json_schema()` appends `enum` (from `(choices: ...)` annotations or `Literal` types — line 375), then `description` (line 377). `Properties` is never produced by `get_json_schema()` — it only appears in client-provided schemas.
 
 Verified against these exact combinations:
 - `Optional[list[str]]` → `type, items, nullable, description` ✓
@@ -450,8 +453,11 @@ func TestQwen35RendererToolDefinitionsMatchOfficialTemplate(t *testing.T) {
     renderer := &Qwen35Renderer{isThinking: true}
 
     // Tool 1: get_weather(location: str, filters: list[str])
-    // Exercises: no HTML escaping, properties before required, single-key items,
-    //   description after items at property level. Currently PASSES.
+    // Exercises: no HTML escaping, properties before required, basic
+    //   single-key items (list[str] → {"type": "string"}), description
+    //   after items at property level. Currently PASSES.
+    //   Note: complex element types like list[dict[str,int]] produce
+    //   multi-key items — tested separately via the field loss test.
     tool1 := api.Tool{
         Type: "function",
         Function: api.ToolFunction{
@@ -466,7 +472,7 @@ func TestQwen35RendererToolDefinitionsMatchOfficialTemplate(t *testing.T) {
                     }},
                     {Key: "filters", Value: api.ToolProperty{
                         Type: api.PropertyType{"array"},
-                        Items: map[string]any{"type": "string"},
+                        Items: &api.ToolProperty{Type: api.PropertyType{"string"}},
                         Description: "Weather filter names",
                     }},
                 }),
@@ -553,27 +559,54 @@ func TestQwen35RendererToolDefinitionsMatchOfficialTemplate(t *testing.T) {
             "(line 377). Python dicts preserve insertion order, and HF's "+
             "tojson uses sort_keys=False. Go's ToolProperty struct declares "+
             "Description before Enum, producing the opposite order.\n\n"+
-            "Fix: swap the Enum and Description field declarations in "+
-            "ToolProperty in api/types.go, changing the struct field order "+
-            "from {AnyOf, Type, Items, Description, Enum, Properties} to "+
-            "{AnyOf, Type, Items, Enum, Description, Properties}.\n\n"+
+            "Fix: rewrite the ToolProperty struct in api/types.go to the "+
+            "9-field layout with recursive types: {AnyOf, Type, "+
+            "Items *ToolProperty, AdditionalProperties *ToolProperty, "+
+            "PrefixItems []ToolProperty, Nullable *bool, Enum, "+
+            "Description, Properties}. This fixes enum/description "+
+            "ordering, field loss, AND recursive nested key ordering "+
+            "for complex element types like list[dict[str,int]].\n\n"+
             "want: %s\n got: %s", wantTool2, gotTool2)
     }
 }
 ```
 
-### Additional test: Field loss round-trip
+### Additional test: `ToolProperty` struct round-trip fidelity
 
-A separate test should verify that tool schemas with `nullable`, `additionalProperties`, and `prefixItems` fields survive the API `json.Unmarshal` → `marshalWithSpaces` round-trip. Unlike the `"return"` field (informational metadata that the model handles with or without — both variants are in-distribution), these fields carry type constraint semantics: dropping them changes what the schema means to the model. The test simulates what happens when a client sends an HuggingFace-Transformers-generated tool schema through the Ollama API — the standard workflow for any developer using `Optional[int]`, `dict[str, int]`, or `tuple[str, int]` in their Python tool functions:
+**Status: NOT YET IMPLEMENTED.** This test does not exist in the fork. It needs to be created as a new test function in `model/renderers/qwen35_test.go`.
+
+A separate test — `TestQwen35ToolPropertyRoundTripFidelity` — must verify that tool schemas produced by HuggingFace Transformers' `get_json_schema()` function survive the full Ollama API round-trip (`json.Unmarshal` into Go's `api.Tool` struct → `marshalWithSpaces` back to JSON bytes) with zero byte-level differences. This test exercises the `ToolProperty` struct rewrite in `api/types.go` — the same single struct change that fixes `enum`/`description` field ordering, field loss for `nullable`/`additionalProperties`/`prefixItems`, AND recursive key ordering inside nested `items` sub-objects for complex element types. All five test cases below fail for the same root cause (the current `ToolProperty` struct has wrong field order, missing fields, and uses `Items any` instead of `Items *ToolProperty`) and all five pass after the same fix (the 9-field struct with recursive types).
+
+The test simulates what happens when a client sends an HuggingFace-Transformers-generated tool schema through Ollama's HTTP API. This is the standard workflow for any Python developer who writes a function with type hints (e.g., `def process(values: list[Optional[int]])`) and uses HuggingFace Transformers' `get_json_schema()` to convert it into a tool definition JSON object, then sends that JSON object to Ollama's `/api/chat` endpoint in the `tools` array. Ollama's `server/routes.go` deserializes the JSON into Go's `api.Tool` struct via `json.Unmarshal`, then the renderer serializes it back to JSON via `marshalWithSpaces` to build the prompt the model sees. If ANY byte changes during this round-trip — a field silently dropped, a key reordered — the model receives a prompt that differs from what HuggingFace Transformers' `apply_chat_template` would produce for the same tool, causing training distribution shift.
+
+Unlike the `"return"` field that HuggingFace Transformers' `get_json_schema()` also produces (which is informational metadata the model was trained to see or not see — both variants are in-distribution and carry no constraint semantics), the fields tested here carry **type constraint semantics**: `"nullable": true` means "this parameter accepts null," and dropping it changes the schema's meaning to the model. A developer using `Optional[int]` in Python gets `"nullable": true` from `get_json_schema()` automatically and has no way to know Ollama silently removed it.
+
+The five test cases cover two categories of bugs fixed by the struct rewrite:
+
+**Cases 1–3: Field loss at the top-level property** — HuggingFace Transformers' `get_json_schema()` produces fields that Go's current `ToolProperty` struct lacks. `json.Unmarshal` silently drops unknown JSON keys, destroying the fields during the client→Go→renderer round-trip.
+
+**Cases 4–5: Key ordering inside nested `items` sub-objects** — HuggingFace Transformers' `get_json_schema()` produces multi-key `items` sub-objects for complex element types (empirically verified: `/tmp/qwen35-check/prove_multikey_items.py`). Go's current `Items any` field causes `json.Unmarshal` to parse items into `map[string]any`, and `json.Marshal` alphabetizes map keys — producing wrong key ordering. The fix (`Items *ToolProperty` instead of `Items any`) makes `json.Marshal` emit keys in struct declaration order at every nesting level recursively.
+
+All five HuggingFace Transformers ground truth strings below were generated by running `get_json_schema()` on Python functions with the specified type hints, then rendering through the official `Qwen/Qwen3.5-27B` tokenizer's `apply_chat_template` with HuggingFace Transformers v5.3.0 (`transformers` @ `3a3b59c`). Every byte was verified.
 
 ```go
-func TestQwen35RendererFieldLossRoundTrip(t *testing.T) {
+func TestQwen35ToolPropertyRoundTripFidelity(t *testing.T) {
     cases := []struct {
         name    string
-        hfJSON  string // What a client sends (HF get_json_schema output)
+        hfJSON  string // Byte-exact HF Transformers get_json_schema() output
     }{
+        // Case 1: Optional[int] parameter at the top-level property.
+        // Python: def set_age(name: str, age: Optional[int] = None)
+        // HF's _parse_type_hint(Optional[int]) at chat_template_utils.py
+        // line 124 adds "nullable": true to the property dict. Go's
+        // current ToolProperty struct has no Nullable field, so
+        // json.Unmarshal silently drops "nullable": true — the model
+        // sees {"type": "integer", "description": "User age"} instead
+        // of {"type": "integer", "nullable": true, "description": ...}.
+        // These are semantically different schemas: one allows null,
+        // the other requires an integer.
         {
-            "Optional[int] — nullable field preserved",
+            "Optional[int] — nullable field preserved at property level",
             `{"type": "function", "function": {"name": "set_age", ` +
                 `"description": "Set user age", "parameters": {"type": ` +
                 `"object", "properties": {"name": {"type": "string", ` +
@@ -581,8 +614,18 @@ func TestQwen35RendererFieldLossRoundTrip(t *testing.T) {
                 `"nullable": true, "description": "User age"}}, ` +
                 `"required": ["name"]}}}`,
         },
+
+        // Case 2: dict[str, int] parameter at the top-level property.
+        // Python: def store_data(key: str, metadata: dict[str, int])
+        // HF's _parse_type_hint(dict[str, int]) at chat_template_utils.py
+        // lines 170-172 produces {"type": "object", "additionalProperties":
+        // {"type": "integer"}}. Go's current ToolProperty struct has no
+        // AdditionalProperties field, so json.Unmarshal silently drops
+        // "additionalProperties" — the model sees {"type": "object"}
+        // (any object) instead of {"type": "object", "additionalProperties":
+        // {"type": "integer"}} (a dict whose values must be integers).
         {
-            "dict[str, int] — additionalProperties field preserved",
+            "dict[str, int] — additionalProperties field preserved at property level",
             `{"type": "function", "function": {"name": "store_data", ` +
                 `"description": "Store data", "parameters": {"type": ` +
                 `"object", "properties": {"key": {"type": "string", ` +
@@ -591,33 +634,113 @@ func TestQwen35RendererFieldLossRoundTrip(t *testing.T) {
                 `"description": "Key-value pairs"}}, ` +
                 `"required": ["key", "metadata"]}}}`,
         },
+
+        // Case 3: tuple[str, int] parameter at the top-level property.
+        // Python: def set_coords(coords: tuple[str, int])
+        // HF's _parse_type_hint(tuple[str, int]) at chat_template_utils.py
+        // line 165 produces {"type": "array", "prefixItems": [{"type":
+        // "string"}, {"type": "integer"}]}. Go's current ToolProperty
+        // struct has no PrefixItems field, so json.Unmarshal silently
+        // drops "prefixItems" — the model sees {"type": "array"} (any
+        // array) instead of a fixed-length 2-element tuple schema.
+        {
+            "tuple[str, int] — prefixItems field preserved at property level",
+            `{"type": "function", "function": {"name": "set_coords", ` +
+                `"description": "Set coordinates", "parameters": {"type": ` +
+                `"object", "properties": {"coords": {"type": "array", ` +
+                `"prefixItems": [{"type": "string"}, {"type": "integer"}], ` +
+                `"description": "The coordinates"}}, ` +
+                `"required": ["coords"]}}}`,
+        },
+
+        // Case 4: list[Optional[int]] — nullable INSIDE the items
+        // sub-object, not at the top-level property.
+        // Python: def process(values: list[int | None])
+        // HF's _parse_type_hint(list[int | None]) recurses: first
+        // _parse_type_hint(int | None) produces {"type": "integer",
+        // "nullable": true} (2 keys), then the list wrapper produces
+        // {"type": "array", "items": {"type": "integer", "nullable":
+        // true}}. The items sub-object has 2 keys in HF insertion order:
+        // "type" first, "nullable" second. Go's current Items field is
+        // typed as `any`, so json.Unmarshal parses items into
+        // map[string]any, and json.Marshal alphabetizes the keys —
+        // producing {"nullable": true, "type": "integer"} instead of
+        // {"type": "integer", "nullable": true}. The fix is Items
+        // *ToolProperty instead of Items any, so json.Marshal emits
+        // keys in struct declaration order at every nesting level.
+        // Empirically verified: /tmp/qwen35-check/prove_multikey_items.py
+        {
+            "list[Optional[int]] — nullable key ordering preserved inside items sub-object",
+            `{"type": "function", "function": {"name": "process", ` +
+                `"description": "Process values", "parameters": {"type": ` +
+                `"object", "properties": {"values": {"type": "array", ` +
+                `"items": {"type": "integer", "nullable": true}, ` +
+                `"description": "The values"}}, ` +
+                `"required": ["values"]}}}`,
+        },
+
+        // Case 5: list[dict[str, int]] — additionalProperties INSIDE
+        // the items sub-object, not at the top-level property.
+        // Python: def ingest(data: list[dict[str, int]])
+        // HF's _parse_type_hint(list[dict[str, int]]) recurses: first
+        // _parse_type_hint(dict[str, int]) produces {"type": "object",
+        // "additionalProperties": {"type": "integer"}} (2 keys), then
+        // the list wrapper produces {"type": "array", "items": {"type":
+        // "object", "additionalProperties": {"type": "integer"}}}.
+        // The items sub-object has 2 keys in HF insertion order: "type"
+        // first, "additionalProperties" second. Go's current Items any
+        // field causes alphabetization: {"additionalProperties": ...,
+        // "type": ...} — wrong. Same fix as Case 4: Items *ToolProperty.
+        // Empirically verified: /tmp/qwen35-check/prove_multikey_items.py
+        {
+            "list[dict[str, int]] — additionalProperties key ordering preserved inside items sub-object",
+            `{"type": "function", "function": {"name": "ingest", ` +
+                `"description": "Ingest data", "parameters": {"type": ` +
+                `"object", "properties": {"data": {"type": "array", ` +
+                `"items": {"type": "object", "additionalProperties": ` +
+                `{"type": "integer"}}, "description": "The data entries"}}, ` +
+                `"required": ["data"]}}}`,
+        },
     }
 
     for _, c := range cases {
         t.Run(c.name, func(t *testing.T) {
             var tool api.Tool
             if err := json.Unmarshal([]byte(c.hfJSON), &tool); err != nil {
-                t.Fatalf("unmarshal: %v", err)
+                t.Fatalf("json.Unmarshal failed: %v", err)
             }
             goBytes, err := marshalWithSpaces(tool)
             if err != nil {
-                t.Fatalf("marshal: %v", err)
+                t.Fatalf("marshalWithSpaces failed: %v", err)
             }
             if string(goBytes) != c.hfJSON {
-                t.Errorf("Field loss during round-trip.\n\n"+
-                    "ToolProperty in api/types.go is missing fields that "+
-                    "HuggingFace Transformers' get_json_schema() produces. "+
-                    "json.Unmarshal silently drops unknown JSON keys.\n\n"+
-                    "These are not informational fields — they carry type "+
-                    "constraint semantics. For example, 'nullable: true' means "+
-                    "'accepts null' and is a fundamentally different schema from "+
-                    "one without it. A developer using Optional[int] in Python "+
-                    "gets 'nullable: true' from get_json_schema() automatically "+
-                    "and has no way to avoid Ollama silently removing it.\n\n"+
-                    "Fix: add the missing fields to ToolProperty in "+
-                    "api/types.go (Nullable *bool, AdditionalProperties any, "+
-                    "PrefixItems []any) with correct json tags and field "+
-                    "ordering to match HF's insertion order.\n\n"+
+                t.Errorf("ToolProperty round-trip fidelity failure.\n\n"+
+                    "The ToolProperty struct in api/types.go does not faithfully "+
+                    "preserve tool schemas produced by HuggingFace Transformers' "+
+                    "get_json_schema() function through the json.Unmarshal → "+
+                    "marshalWithSpaces round-trip. This means the model receives "+
+                    "a different tool schema than what HuggingFace Transformers' "+
+                    "apply_chat_template would produce for the same tool — a "+
+                    "training distribution shift that silently degrades tool-calling "+
+                    "accuracy.\n\n"+
+                    "There are two categories of failure:\n\n"+
+                    "1. FIELD LOSS (cases 1-3): Go's ToolProperty struct is missing "+
+                    "fields that get_json_schema() produces (nullable, "+
+                    "additionalProperties, prefixItems). json.Unmarshal silently "+
+                    "drops unknown JSON keys. These fields carry type constraint "+
+                    "semantics — dropping 'nullable: true' changes the schema from "+
+                    "'accepts null' to 'requires a value.'\n\n"+
+                    "2. NESTED KEY ORDERING (cases 4-5): Go's Items field is typed "+
+                    "as 'any', so json.Unmarshal parses items sub-objects into "+
+                    "map[string]any, and json.Marshal alphabetizes the keys. For "+
+                    "complex element types like list[dict[str, int]], items has 2 "+
+                    "keys that get reordered.\n\n"+
+                    "Fix: rewrite ToolProperty in api/types.go with recursive types "+
+                    "(Items *ToolProperty, AdditionalProperties *ToolProperty, "+
+                    "PrefixItems []ToolProperty, Nullable *bool). Using *ToolProperty "+
+                    "instead of 'any' ensures json.Marshal emits keys in struct "+
+                    "declaration order at every nesting level — fixing both field "+
+                    "loss and nested key ordering in one change.\n\n"+
                     "input:  %s\noutput: %s", c.hfJSON, string(goBytes))
             }
         })
@@ -631,7 +754,19 @@ func TestQwen35RendererFieldLossRoundTrip(t *testing.T) {
 
 ### Status of the `items` ordering issue
 
-**Non-issue — closed.** HuggingFace Transformers' `get_json_schema()` produces single-key `items` sub-objects (`{"type": "string"}`). A single key has no ordering. The test's multi-key items object was fabricated and does not represent training data. No fix is needed.
+**Real issue — OPEN.** The old test's specific fabrication (putting `description` inside items) was correctly identified as impossible via `get_json_schema()`. But the conclusion that "items are always single-key" was an overgeneralization that missed the real multi-key cases. HuggingFace Transformers' `get_json_schema()` produces multi-key `items` sub-objects for complex element types:
+
+- `list[dict[str, int]]` → items = `{"type": "object", "additionalProperties": {"type": "integer"}}` — **2 keys**
+- `list[Optional[int]]` → items = `{"type": "integer", "nullable": true}` — **2 keys**
+- `list[str]` → items = `{"type": "string"}` — 1 key (no ordering issue)
+
+This was empirically verified by running `get_json_schema()` on Python functions with these type hints, then rendering through the official `Qwen/Qwen3.5-27B` tokenizer's `apply_chat_template`. The rendered prompt contains the multi-key items objects with `type` first (Python insertion order). Script: `/tmp/qwen35-check/prove_multikey_items.py`.
+
+Go's `Items any` field causes `json.Unmarshal` to parse items into `map[string]any`, and `json.Marshal` alphabetizes map keys. For `list[dict[str, int]]`, Go would produce `{"additionalProperties": {"type": "integer"}, "type": "object"}` — alphabetical, wrong. The HF training data has `{"type": "object", "additionalProperties": {"type": "integer"}}` — insertion order, correct.
+
+**Fix:** Change `Items any` to `Items *ToolProperty` in the `ToolProperty` struct. This is part of the same 9-field struct rewrite — no additional code change beyond using the correct type. The `*ToolProperty` type means `json.Marshal` emits keys in struct declaration order at every nesting level recursively. Same fix applies to `AdditionalProperties *ToolProperty` and `PrefixItems []ToolProperty`.
+
+**Scope:** This affects every model trained with HuggingFace Transformers. The `tojson` override with `sort_keys=False` is hardcoded globally at `chat_template_utils.py:476` — there is no per-model opt-out. Every verified model (Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, GLM-4 family, GLM-5) uses this override. llama.cpp confirms from the other side: `throw not_implemented_exception("tojson sort_keys=true not implemented")`.
 
 See `consolidated_report.md` Part 4 for the full analysis of all field ordering and field loss issues.
 
@@ -845,7 +980,7 @@ Gaps 1, 2, and 3 are now closed. Gaps 1 and 2 protect the fork's two most import
 
 **Gaps 2 and 3 are two levels of the same fix.** The fork's unconditional thinking block fix involved two code changes: removing the `isThinking` parameter from `splitQwen35ReasoningContent`( tested by Gap 3) and removing the `isThinking &&` gate from the rendering condition( tested by Gap 2). Gap 2 catches the regression at the integration level (someone re-adds the `isThinking` gate). Gap 3 catches bugs in the extraction logic itself (wrong tag stripping, wrong fallback priority, wrong whitespace handling, broken path equivalence). Both are now closed.
 
-Gap 4 (tool definition serialization) requires rewriting the test to use realistic HuggingFace Transformers `get_json_schema()` output AND implementing three code fixes simultaneously: (1) the `ToolProperty` struct rewrite in `api/types.go` (fixes `enum`/`description` ordering and adds `nullable`/`additionalProperties`/`prefixItems` fields — these carry type constraint semantics, unlike the `"return"` field which is informational and harmless to drop), (2) the `formatToolCallArgument` fix for bool/None/large-integer scalars, and (3) updating the test expectations. The test should be written first (with correct HuggingFace ground truth), then the code changes made until it passes.
+Gap 4 (tool definition serialization) requires rewriting the test to use realistic HuggingFace Transformers `get_json_schema()` output AND implementing code fixes: (1) the `ToolProperty` struct rewrite in `api/types.go` — a single struct change that fixes `enum`/`description` ordering, adds `nullable`/`additionalProperties`/`prefixItems` fields (these carry type constraint semantics, unlike the `"return"` field which is informational and harmless to drop), AND fixes recursive nested key ordering for complex element types by using `Items *ToolProperty`, `AdditionalProperties *ToolProperty`, `PrefixItems []ToolProperty` instead of `any`/`[]any` (so `json.Marshal` produces correct key ordering at all nesting levels, not just the top level), (2) the `formatToolCallArgument` fix for bool/None/large-integer scalars, and (3) updating the test expectations. The test should be written first (with correct HuggingFace ground truth), then the code changes made until it passes.
 
 Gap 5 (thinking mode switching in KV cache) tests the cache-level consequences of the same renderer behavior that Gap 2 tests at the unit level. Both are needed — Gap 2 catches thinking blocks being stripped, Gap 5 catches subtler byte-level divergences that only manifest as cache misses.
 
