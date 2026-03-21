@@ -99,6 +99,12 @@
 |------|-------------|
 | `/tmp/resources_reference/` | Ground truth reference data for template verification. Contains: `hf-Qwen3.5-27B/` and `hf-Qwen3.5-35B-A3B/` (HuggingFace model snapshots with `tokenizer_config.json` and extracted `chat_template.jinja` — the authoritative source for how the model was trained), `Qwen3.5-github/` (`QwenLM/Qwen3.5` @ `7e103ae`, Qwen's official reference code, shallow clone), `Qwen3-Coder-30B-A3B-Instruct.tokenizer_config.json` (Qwen3-Coder template, gated), `sglang/` (`sgl-project/sglang` @ `6dfa8a4`, shallow clone), `transformers/` (`huggingface/transformers` @ `3a3b59c`, shallow clone), `vllm/` (`vllm-project/vllm` @ `298e510`, shallow clone). The official Qwen 3.5 template in these snapshots confirms that `enable_thinking` is checked in exactly one place (the `add_generation_prompt` block) and never in the message rendering loop. |
 
+## GLM Template Downloads
+
+| Path | Description |
+|------|-------------|
+| `/tmp/glm4-templates/` | GLM-4 and GLM-5 chat templates extracted from `tokenizer_config.json` on HuggingFace (2026-03-21). Contains: `glm-4-9b-chat.jinja` (`THUDM/glm-4-9b-chat`, 1625 chars — `tool['function'] \| tojson(indent=4)`), `glm-4-9b-chat-1m.jinja` (`THUDM/glm-4-9b-chat-1m`, 1623 chars — same format), `glm-z1-9b-0414.jinja` (`THUDM/GLM-Z1-9B-0414`, 1033 chars — `function \| tojson(indent=4, ensure_ascii=False)`), `glm5.jinja` (`zai-org/GLM-5`, 3123 chars — `tool \| tojson(ensure_ascii=False)`, no indent). Also contains raw `tokenizer_config.json` files for `THUDM/GLM-4-9B-0414` (892-char template, `function \| tojson(indent=4, ensure_ascii=False)`) and `THUDM/GLM-Z1-32B-0414`. `THUDM/GLM-4-32B-0414` is gated (401). All accessible GLM templates use `tojson` with HF's `sort_keys=False` override — insertion order preserved. |
+
 ---
 
 ## Research Documents

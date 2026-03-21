@@ -319,7 +319,7 @@ Running HuggingFace Transformers v5.3.0 `get_json_schema()` on a Python function
 "items": {"type": "string"}
 ```
 
-One key. No description. HuggingFace Transformers' `_parse_type_hint()` function at line 149 of `chat_template_utils.py` returns `{"type": "array", "items": _parse_type_hint(args[0])}`, and `_parse_type_hint()` for basic types returns `{"type": "string"}` — a single-key dict. The `description` field is only added to **top-level properties** by `get_json_schema()` at line 380 (`schema["description"] = desc`), never to nested `items` sub-objects. The test fabricates a multi-key `items` object that HuggingFace Transformers' tool schema pipeline cannot produce.
+One key. No description. HuggingFace Transformers' (`transformers` @ `3a3b59c`) `_parse_type_hint()` function at line 146 of `chat_template_utils.py` returns `{"type": "array", "items": _parse_type_hint(args[0])}`, and `_parse_type_hint()` for basic types returns `{"type": "string"}` — a single-key dict. The `description` field is only added to **top-level properties** by `get_json_schema()` at line 377 (`schema["description"] = desc`), never to nested `items` sub-objects. The test fabricates a multi-key `items` object that HuggingFace Transformers' tool schema pipeline cannot produce.
 
 The test fails because Go's `json.Marshal` alphabetizes `map[string]any` keys, producing `{"description": ..., "type": ...}` instead of the expected `{"type": ..., "description": ...}`. This failure tests a non-existent problem: since real `items` objects have exactly one key, alphabetical ordering is irrelevant.
 
@@ -366,11 +366,11 @@ Go `Qwen35Renderer` output for the same tool:
 
 **MISMATCH.** Go produces `"description"` before `"enum"`. HuggingFace Transformers produces `"enum"` before `"description"`.
 
-Root cause: HuggingFace Transformers' `get_json_schema()` at `chat_template_utils.py` line 378 adds `schema["enum"] = [...]` before line 380 adds `schema["description"] = desc`. Python dicts preserve insertion order, and HuggingFace Transformers' `tojson` override uses `json.dumps(sort_keys=False)`, so the training data has `enum` before `description`. Go's `ToolProperty` struct in `api/types.go` declares `Description` (field 4) before `Enum` (field 5), and `json.Marshal` emits struct fields in declaration order.
+Root cause: HuggingFace Transformers' (`transformers` @ `3a3b59c`) `get_json_schema()` at `chat_template_utils.py` line 375 adds `schema["enum"] = [...]` before line 377 adds `schema["description"] = desc`. Python dicts preserve insertion order, and HuggingFace Transformers' `tojson` override (lines 465-468) uses `json.dumps(sort_keys=False)`, so the training data has `enum` before `description`. Go's `ToolProperty` struct in `api/types.go` declares `Description` (field 4) before `Enum` (field 5), and `json.Marshal` emits struct fields in declaration order.
 
 Fix: The `enum`/`description` swap is part of the larger `ToolProperty` struct rewrite described below (Tool 3). The struct change from `{AnyOf, Type, Items, Description, Enum, Properties}` to `{AnyOf, Type, Items, AdditionalProperties, PrefixItems, Nullable, Enum, Description, Properties}` fixes both the `enum`/`description` ordering AND the field loss in a single change.
 
-**Blast radius of the struct change:** The `ToolProperty` struct is serialized via `json.Marshal` or `marshalWithSpaces` by 9 renderers. Only the `enum`/`description` field swap affects output (the new fields are `omitempty` and don't change output for tools that lack them). The GLM-4.6 and GLM-OCR renderers have tool tests but they are currently **SKIPPED** (`"tool call ordering not guaranteed yet"`). The Qwen3VL test comments already show the correct HF ordering (`"enum": [...], "description": "..."`). No non-skipped test in any renderer has expected output that depends on the current `description`-before-`enum` ordering. Every verified model (Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, GLM-4.6, GLM-4.7) uses HuggingFace Transformers' insertion-order `tojson` override, which produces `enum` before `description`.
+**Blast radius of the struct change:** The `ToolProperty` struct is serialized via `json.Marshal` or `marshalWithSpaces` by 9 renderers. Only the `enum`/`description` field swap affects output (the new fields are `omitempty` and don't change output for tools that lack them). The GLM-4.6 and GLM-OCR renderers have tool tests but they are currently **SKIPPED** upstream (`"tool call ordering not guaranteed yet"`, added by jmorganca in commit `4f138a17`). The Qwen3VL test comments already show the correct HF ordering (`"enum": [...], "description": "..."`). No non-skipped test in any renderer has expected output that depends on the current `description`-before-`enum` ordering. Every verified model (Qwen 3.5, Qwen3VL, OLMo3, OLMo3.1, and the GLM-4 family including GLM-5) uses HuggingFace Transformers' `tojson` with `sort_keys=False`, which preserves insertion order and produces `enum` before `description`. GLM templates were verified from `tokenizer_config.json` on HuggingFace (see `consolidated_report.md` Section 4.2, GLM verification note). The swap moves all models closer to their training data; no model gets worse output. Note: the Ollama GLM renderers have broader issues beyond field ordering — `glm46.go` uses compact `json.Marshal(tool)` while the official GLM-4 templates use `tojson(indent=4)` (pretty-printed), and the renderer structure (English UI, whole-tool serialization) matches GLM-5's template rather than GLM-4's. GLM tool tests being skipped/commented out reflects this incomplete state.
 
 **Tool 3: Nullable tool — `set_age(name: str, age: Optional[int] = None)`**
 
@@ -421,7 +421,7 @@ type ToolProperty struct {
 }
 ```
 
-Why this specific order: `_parse_type_hint()` builds the dict with `type` first, then adds `items` (for `list[T]`), `additionalProperties` (for `dict[K,V]`), `prefixItems` (for `tuple[T1,T2]`), or `nullable` (for `Optional[T]`) in insertion order. These fields are mutually exclusive per type, but `nullable` always comes after the others (because `_parse_type_hint` recurses into the inner type first, then appends `nullable`). Then `get_json_schema()` appends `enum` (from `(choices: ...)` annotations or `Literal` types — line 378), then `description` (line 380). `Properties` is never produced by `get_json_schema()` — it only appears in client-provided schemas.
+Why this specific order (all line numbers reference `transformers` @ `3a3b59c`, `chat_template_utils.py`): `_parse_type_hint()` builds the dict with `type` first, then adds `items` (line 146, for `list[T]`), `additionalProperties` (line 172, for `dict[K,V]`), `prefixItems` (line 165, for `tuple[T1,T2]`), or `nullable` (line 124, for `Optional[T]`) in insertion order. These fields are mutually exclusive per type, but `nullable` always comes after the others (because `_parse_type_hint` recurses into the inner type first, then appends `nullable`). Then `get_json_schema()` appends `enum` (from `(choices: ...)` annotations or `Literal` types — line 375), then `description` (line 377). `Properties` is never produced by `get_json_schema()` — it only appears in client-provided schemas.
 
 Verified against these exact combinations:
 - `Optional[list[str]]` → `type, items, nullable, description` ✓
@@ -511,7 +511,7 @@ func TestQwen35RendererToolDefinitionsMatchOfficialTemplate(t *testing.T) {
                 "HTML-escaped sequence %q found in tool definition.\n\n"+
                     "HuggingFace Transformers overrides Jinja2's tojson filter "+
                     "with json.dumps(ensure_ascii=False) at chat_template_utils.py"+
-                    ":463-466. Go's default json.Marshal HTML-escapes these "+
+                    ":465-468. Go's default json.Marshal HTML-escapes these "+
                     "characters; the fix is jsonutil.Marshal with "+
                     "SetEscapeHTML(false).\n\ngot:\n%s", esc, got)
         }
@@ -549,8 +549,8 @@ func TestQwen35RendererToolDefinitionsMatchOfficialTemplate(t *testing.T) {
     if gotTool2 != wantTool2 {
         t.Errorf("Tool 2 (choose_color) enum/description field ordering "+
             "mismatch.\n\nHuggingFace Transformers' get_json_schema() adds "+
-            "enum (line 378 of chat_template_utils.py) before description "+
-            "(line 380). Python dicts preserve insertion order, and HF's "+
+            "enum (line 375 of chat_template_utils.py) before description "+
+            "(line 377). Python dicts preserve insertion order, and HF's "+
             "tojson uses sort_keys=False. Go's ToolProperty struct declares "+
             "Description before Enum, producing the opposite order.\n\n"+
             "Fix: swap the Enum and Description field declarations in "+
