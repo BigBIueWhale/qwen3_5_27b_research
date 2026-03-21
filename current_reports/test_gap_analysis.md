@@ -326,7 +326,7 @@ The test fails because Go's `json.Marshal` alphabetizes `map[string]any` keys, p
 Meanwhile, the test **does not test** the three real divergences that exist right now between the Go renderer and HuggingFace Transformers ground truth:
 
 1. **`enum`/`description` field ordering in `ToolProperty`** — a real mismatch for any tool with enum/choices parameters.
-2. **Silent field loss during `json.Unmarshal`** — `nullable`, `additionalProperties`, `prefixItems` fields are dropped.
+2. **Silent field loss during `json.Unmarshal`** — `nullable`, `additionalProperties`, `prefixItems` fields are silently destroyed. Unlike informational metadata (e.g., the `"return"` field that `get_json_schema()` also produces, which is harmless to drop because the model was trained on both with-and-without variants), these fields carry **type constraint semantics** — `"nullable": true` means "accepts null" and is a fundamentally different schema from one without it. A developer using `Optional[int]` in Python has no way to avoid this: HF's `get_json_schema()` adds `"nullable": true` automatically, and Ollama drops it on unmarshal with no error.
 3. **Scalar boolean/None capitalization in `formatToolCallArgument`** — `true`/`false`/`null` instead of `True`/`False`/`None`.
 
 ### What the correct test must verify — with byte-exact HuggingFace ground truth
@@ -386,9 +386,9 @@ Go round-trip output (unmarshal HF JSON into `api.Tool`, then re-serialize with 
 {"type": "function", "function": {"name": "set_age", "description": "Set user age", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "User name"}, "age": {"type": "integer", "description": "User age"}}, "required": ["name"]}}}
 ```
 
-**MISMATCH.** The `"nullable": true` field is silently dropped. The model sees `{"type": "integer", "description": "User age"}` instead of `{"type": "integer", "nullable": true, "description": "User age"}` — the nullability constraint vanishes.
+**MISMATCH.** The `"nullable": true` field is silently dropped. The model sees `{"type": "integer", "description": "User age"}` instead of `{"type": "integer", "nullable": true, "description": "User age"}`. These are not two representations of the same thing — they are semantically different schemas. `"nullable": true` means "this parameter accepts an integer or null." Without it, the schema says "this parameter must be an integer." The model was trained on both schemas, but they mean different things: one allows the model to pass `null` for this argument, the other does not. Dropping `"nullable"` silently changes the tool's contract.
 
-Root cause: Go's `ToolProperty` struct has no `Nullable` field. `json.Unmarshal` silently drops JSON keys that don't map to struct fields. The data is destroyed during the API request unmarshal in `server/routes.go` (before the renderer ever sees it).
+Root cause: Go's `ToolProperty` struct has no `Nullable` field. `json.Unmarshal` silently drops JSON keys that don't map to struct fields. The data is destroyed during the API request unmarshal in `server/routes.go` (before the renderer ever sees it). The developer who wrote `def set_age(name: str, age: Optional[int] = None)` in Python and used HF's `get_json_schema()` has no way to know this happened — no error, no warning, no indication that the nullable constraint was removed.
 
 Fix: The `ToolProperty` struct in `api/types.go` must be rewritten to match the exact field ordering that HuggingFace Transformers' `get_json_schema()` produces for every possible Python type hint combination. The current struct is:
 
@@ -430,7 +430,7 @@ Verified against these exact combinations:
 - `Optional[str]` with `(choices: ...)` → `type, nullable, enum, description` ✓
 - `Optional[list[str]]` with `(choices: ...)` → `type, items, nullable, enum, description` ✓
 
-Of the three new fields, `nullable` is the most impactful — `Optional[T]` parameters are common in Python tool definitions.
+Of the three new fields, `nullable` is the most impactful — `Optional[T]` parameters are extremely common in Python function signatures, and any developer using HF's `get_json_schema()` on such a function will unknowingly have their nullable constraints silently removed by Ollama. Unlike the `"return"` field (also produced by `get_json_schema()`, but harmless to drop because both with-and-without variants are in-distribution and carry no constraint semantics), `nullable` changes what the schema means to the model.
 
 **Tool 4: Dict tool — `store_data(key: str, metadata: dict[str, int])`**
 
@@ -439,7 +439,7 @@ HuggingFace Transformers ground truth:
 {"type": "function", "function": {"name": "store_data", "description": "Store data", "parameters": {"type": "object", "properties": {"key": {"type": "string", "description": "Storage key"}, "metadata": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "Key-value pairs"}}, "required": ["key", "metadata"]}}}
 ```
 
-Go round-trip output: `"additionalProperties"` field silently dropped. Same root cause and fix as `nullable`.
+Go round-trip output: `"additionalProperties"` field silently dropped. Same root cause as `nullable` — Go's `ToolProperty` struct has no `AdditionalProperties` field, so `json.Unmarshal` discards it. Same semantic problem: `{"type": "object", "additionalProperties": {"type": "integer"}}` means "a dict whose values are integers," while `{"type": "object"}` means "any object" — a different, less constrained schema. A developer using `dict[str, int]` in Python cannot avoid this.
 
 ### What the rewritten test should look like
 
@@ -564,7 +564,7 @@ func TestQwen35RendererToolDefinitionsMatchOfficialTemplate(t *testing.T) {
 
 ### Additional test: Field loss round-trip
 
-A separate test should verify that tool schemas with `nullable`, `additionalProperties`, and `prefixItems` fields survive the API `json.Unmarshal` → `marshalWithSpaces` round-trip. The test simulates what happens when a client sends an HuggingFace-Transformers-generated tool schema through the Ollama API:
+A separate test should verify that tool schemas with `nullable`, `additionalProperties`, and `prefixItems` fields survive the API `json.Unmarshal` → `marshalWithSpaces` round-trip. Unlike the `"return"` field (informational metadata that the model handles with or without — both variants are in-distribution), these fields carry type constraint semantics: dropping them changes what the schema means to the model. The test simulates what happens when a client sends an HuggingFace-Transformers-generated tool schema through the Ollama API — the standard workflow for any developer using `Optional[int]`, `dict[str, int]`, or `tuple[str, int]` in their Python tool functions:
 
 ```go
 func TestQwen35RendererFieldLossRoundTrip(t *testing.T) {
@@ -839,7 +839,7 @@ Gaps 1, 2, and 3 are now closed. Gaps 1 and 2 protect the fork's two most import
 
 **Gaps 2 and 3 are two levels of the same fix.** The fork's unconditional thinking block fix involved two code changes: removing the `isThinking` parameter from `splitQwen35ReasoningContent`( tested by Gap 3) and removing the `isThinking &&` gate from the rendering condition( tested by Gap 2). Gap 2 catches the regression at the integration level (someone re-adds the `isThinking` gate). Gap 3 catches bugs in the extraction logic itself (wrong tag stripping, wrong fallback priority, wrong whitespace handling, broken path equivalence). Both are now closed.
 
-Gap 4 (tool definition serialization) requires rewriting the test to use realistic HuggingFace Transformers `get_json_schema()` output AND implementing three code fixes simultaneously: (1) the `ToolProperty` struct rewrite in `api/types.go` (fixes `enum`/`description` ordering and adds `nullable`/`additionalProperties`/`prefixItems` fields), (2) the `formatToolCallArgument` fix for bool/None/large-integer scalars, and (3) updating the test expectations. The test should be written first (with correct HuggingFace ground truth), then the code changes made until it passes.
+Gap 4 (tool definition serialization) requires rewriting the test to use realistic HuggingFace Transformers `get_json_schema()` output AND implementing three code fixes simultaneously: (1) the `ToolProperty` struct rewrite in `api/types.go` (fixes `enum`/`description` ordering and adds `nullable`/`additionalProperties`/`prefixItems` fields — these carry type constraint semantics, unlike the `"return"` field which is informational and harmless to drop), (2) the `formatToolCallArgument` fix for bool/None/large-integer scalars, and (3) updating the test expectations. The test should be written first (with correct HuggingFace ground truth), then the code changes made until it passes.
 
 Gap 5 (thinking mode switching in KV cache) tests the cache-level consequences of the same renderer behavior that Gap 2 tests at the unit level. Both are needed — Gap 2 catches thinking blocks being stripped, Gap 5 catches subtler byte-level divergences that only manifest as cache misses.
 
