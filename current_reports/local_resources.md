@@ -97,7 +97,7 @@
 
 | Path | Description |
 |------|-------------|
-| `/tmp/resources_reference/` | Ground truth reference data for template verification. Contains: `hf-Qwen3.5-27B/` and `hf-Qwen3.5-35B-A3B/` (HuggingFace model snapshots with `tokenizer_config.json` containing the official Jinja2 chat template — the authoritative source for how the model was trained), `Qwen3.5-github/` (Qwen's official reference code), `Qwen3-Coder-30B-A3B-Instruct.tokenizer_config.json` (Qwen3-Coder template), `sglang/` / `transformers/` / `vllm/` (reference inference framework code for cross-checking template handling). The official Qwen 3.5 template in these snapshots confirms that `enable_thinking` is checked in exactly one place (the `add_generation_prompt` block) and never in the message rendering loop. |
+| `/tmp/resources_reference/` | Ground truth reference data for template verification. Contains: `hf-Qwen3.5-27B/` and `hf-Qwen3.5-35B-A3B/` (HuggingFace model snapshots with `tokenizer_config.json` and extracted `chat_template.jinja` — the authoritative source for how the model was trained), `Qwen3.5-github/` (`QwenLM/Qwen3.5` @ `7e103ae`, Qwen's official reference code, shallow clone), `Qwen3-Coder-30B-A3B-Instruct.tokenizer_config.json` (Qwen3-Coder template, gated), `sglang/` (`sgl-project/sglang` @ `6dfa8a4`, shallow clone), `transformers/` (`huggingface/transformers` @ `3a3b59c`, shallow clone), `vllm/` (`vllm-project/vllm` @ `298e510`, shallow clone). The official Qwen 3.5 template in these snapshots confirms that `enable_thinking` is checked in exactly one place (the `add_generation_prompt` block) and never in the message rendering loop. |
 
 ---
 
