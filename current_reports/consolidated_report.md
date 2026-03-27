@@ -411,7 +411,7 @@ type ToolProperty struct {
 
 With `Items any` (the old proposal), Go would produce `{"additionalProperties": ..., "type": ...}` and `{"nullable": true, "type": ...}` — alphabetical, wrong. With `Items *ToolProperty`, Go produces the keys in struct declaration order — correct at all depths.
 
-Note: the old test's fabricated multi-key items (`{"type": "string", "description": "..."}`) was correctly identified as fake — HF's `get_json_schema()` never puts `description` inside items sub-objects. But the conclusion that "items are always single-key" was an overgeneralization. The REAL multi-key items come from complex element types via `_parse_type_hint()` recursion (e.g., `dict[str, int]` → `{"type": "object", "additionalProperties": {"type": "integer"}}`), not from `description`.
+Note: the old test's multi-key items sub-object (`{"type": "string", "description": "..."}`) catches a real key-ordering bug (Go's `json.Marshal` alphabetizes `map[string]any` keys) but uses an out-of-training-distribution example — HuggingFace Transformers' `get_json_schema()` function never puts `description` inside `items` sub-objects. The test should compare against the training data format produced by `get_json_schema()`. The real multi-key `items` sub-objects come from complex element types via `_parse_type_hint()` recursion (e.g., `list[dict[str, int]]` → items = `{"type": "object", "additionalProperties": {"type": "integer"}}`), not from `description`.
 
 Verified examples at the **property level**: `Optional[list[str]]` → `type, items, nullable, description` ✓; `Optional[str]` with `(choices: ...)` → `type, nullable, enum, description` ✓; `str` with `(choices: ...)` → `type, enum, description` ✓.
 
