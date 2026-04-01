@@ -300,11 +300,17 @@ Not needed. The fork's `splitQwen35ReasoningContent` is a pure function of its t
 
 ---
 
-## Gap 4: Tool Definition Serialization Tests — SIMPLE TOOL TEST DONE, STRUCT REWRITE TESTS OPEN
+## Gap 4: Tool Definition Serialization Tests — SIMPLE TOOL PASSES, ENUM TOOL FAILS BY DESIGN, STRUCT REWRITE TESTS OPEN
 
 ### Simple tool ground truth test — DONE (2026-04-01)
 
-The `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` test in `model/renderers/qwen35_test.go` was rewritten to use byte-exact HuggingFace Transformers ground truth. The old test used an out-of-training-distribution `items` example (`{"type": "string", "description": "..."}` — HF's `get_json_schema()` never puts `description` inside `items` sub-objects), causing the test to fail for the wrong reason (alphabetized map keys on fake data). The rewritten test uses a realistic tool definition matching `def get_weather(location: str, filters: list[str])` with: single-key `items` (`{"type": "string"}`), `description` at the property level, both parameters in `required`, literal `<`, `>`, `&` characters. The tool JSON line is compared byte-exact against HF Transformers v5.3.0 ground truth (verified by a comparison script that renders both HF and Go outputs and diffs them). The test passes — the simple-tool serialization path already produces byte-identical output to HF. The test now guards this correct behavior against regressions: any deviation in field ordering, HTML escaping, or spacing causes a failure with a diagnostic citing the specific struct field or code path to fix.
+The `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` test in `model/renderers/qwen35_test.go` uses byte-exact HuggingFace Transformers ground truth for two tools. Tool 1 (`get_weather`, matching `def get_weather(location: str, filters: list[str])`) exercises no HTML escaping, `properties` before `required`, single-key `items`, and `items` before `description`. This tool **passes** — Go's struct field order already matches `get_json_schema()`'s insertion order for these fields.
+
+### Enum tool ground truth test — DONE (2026-04-01), FAILS BY DESIGN
+
+Tool 2 (`choose_color`, matching `def choose_color(color: Literal["red", "green", "blue"])`) exercises `enum`/`description` field ordering at the property level. HF's `get_json_schema()` inserts `enum` before `description`. HF's `tojson` override uses `sort_keys=False` (not stock Jinja2's `sort_keys=True`), preserving insertion order. The training data has `{"type": "string", "enum": ["red", "green", "blue"], "description": "The color to use"}`. Go's `ToolProperty` struct declares `Description` (field 4) before `Enum` (field 5), producing `{"type": "string", "description": "The color to use", "enum": ["red", "green", "blue"]}`. The test **FAILS by design** until the struct is rewritten. The error message gives the exact 9-field struct layout to apply.
+
+**Critical tojson clarification:** stock Jinja2's `tojson` uses `sort_keys=True`, which would produce `description` before `enum` (d < e alphabetically) — matching Go's current wrong order. This is why the divergence is not obvious: Go and stock Jinja2 agree, but the model was trained with HF's override (`sort_keys=False`), not stock Jinja2. This was verified empirically by running both stock Jinja2 and HF's `apply_chat_template` on the same tool and comparing the output.
 
 ### Remaining open: tests for ToolProperty struct rewrite
 
