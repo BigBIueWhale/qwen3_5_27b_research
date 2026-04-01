@@ -1,7 +1,7 @@
 # Client Input Validation: What Exists, What's Missing, and How to Fix It Without Code Duplication
 
 **Date:** 2026-03-14
-**Fork:** `BigBIueWhale/ollama` at `/home/user/shared_vm/ollama/`, branch `main`
+**Fork:** `BigBIueWhale/ollama`, branch `main`
 **Scope:** Validation of chat API requests from client applications — preventing clients from constructing conversations that produce prompt formats the Qwen 3.5 model was never trained on.
 
 ---
@@ -56,14 +56,14 @@ Here is every stage a chat request passes through, from the moment the client se
 
 None of these checks exist in the fork's `ChatHandler`.
 
-**What llama.cpp does at this stage:** The llama.cpp HTTP server validates at `tools/server/server-common.cpp`:
-- Messages field is present and is a JSON array (lines 938-944)
-- All non-assistant messages have a `content` field (line 947-949)
-- No 2 or more consecutive assistant messages at the end of the list (line 1055-1057)
-- `enable_thinking` must be boolean, not a quoted string (line 1042-1043)
-- Assistant prefill and `enable_thinking` cannot both be active (line 1062-1064)
+**What llama.cpp does at this stage:** The llama.cpp HTTP server validates in the `oaicompat_completion_params_parse` function in `tools/server/server-common.cpp`:
+- Messages field is present and is a JSON array
+- All non-assistant messages have a `content` field
+- No 2 or more consecutive assistant messages at the end of the list
+- `enable_thinking` must be boolean, not a quoted string
+- Assistant prefill and `enable_thinking` cannot both be active
 
-These are all returned as HTTP 400 responses. Additionally, llama.cpp executes the official Jinja2 template directly, so the template's own 8 `raise_exception()` calls fire naturally during rendering. When a Qwen 3.5 template calls `raise_exception("System message must be at the beginning.")`, the exception propagates through the Jinja2 runtime → gets wrapped in `std::invalid_argument` at `chat.cpp:1532` → gets caught by the HTTP server's `ex_wrapper()` at `server.cpp:43-46` → returns HTTP 400 to the client. (Earlier research incorrectly stated this mapped to HTTP 500 — the wrapping at `chat.cpp:1532` converts it to `std::invalid_argument` first.)
+These are all returned as HTTP 400 responses. Additionally, llama.cpp executes the official Jinja2 template directly, so the template's own 8 `raise_exception()` calls fire naturally during rendering. When a Qwen 3.5 template calls `raise_exception("System message must be at the beginning.")`, the exception propagates through the Jinja2 runtime → gets wrapped in `std::invalid_argument` in `common_chat_apply()` in `chat.cpp` → gets caught by the HTTP server's `ex_wrapper()` in `server.cpp` → returns HTTP 400 to the client. (Earlier research incorrectly stated this mapped to HTTP 500 — the `common_chat_apply()` wrapping converts it to `std::invalid_argument` first.)
 
 ### Stage 2: System Message Prepending (in `ChatHandler` in `server/routes.go`)
 
@@ -214,7 +214,7 @@ Yes<|im_end|>
 Two consecutive `<|im_start|>user` blocks. The model was trained exclusively on alternating user-assistant turns. This is out-of-distribution.
 
 *Official template:* Does NOT reject this — the template doesn't enforce role alternation either. This is an implicit training assumption, not an explicit template guard.
-*llama.cpp:* Does not validate this either, except for consecutive assistant messages at the END of the list (line 1055-1057).
+*llama.cpp:* Does not validate this either, except for consecutive assistant messages at the END of the list (checked in `oaicompat_completion_params_parse`).
 
 **Example 5 — Tool message without preceding assistant tool call (orphaned):**
 
@@ -291,7 +291,7 @@ The C++ `tool_call_grammar_from_json()` function in `sampling_ext.cpp` has 10 er
 
 The per-tool validation function `validate_tool_json()` in `sampling_ext.cpp` performs detailed checks: tool must be an object, must have a `"function"` key, function must be an object, must have a `"name"` key, name must be a string, name must be non-empty, name must not contain null bytes, name must not contain characters that would break XML (`>`, `<`) or GBNF rule names (`\n`, `\r`), and if `required` parameters are declared, every required parameter name must exist in the `properties` object.
 
-**These tool-level checks are unique to the fork.** llama.cpp's `common_chat_tools_parse_oaicompat()` at `common/chat.cpp:396-428` only checks: tools is an array, each tool has `type: "function"`, each tool has a `function` object, and each function has a `name` field (presence only — an empty string `""` passes). No duplicate name detection, no forbidden character check, no null byte check, no required-in-properties check.
+**These tool-level checks are unique to the fork.** llama.cpp's `common_chat_tools_parse_oaicompat()` in `common/chat.cpp` only checks: tools is an array, each tool has `type: "function"`, each tool has a `function` object, and each function has a `name` field (presence only — an empty string `""` passes). No duplicate name detection, no forbidden character check, no null byte check, no required-in-properties check.
 
 **What validation is missing at this stage:**
 - **No Go-level pre-validation.** The Go wrapper `ToolCallGrammarFromJSON()` in `llama/llama.go` passes the JSON string straight to C++ with zero pre-checks. If the C++ function returns an error code, it's translated into a Go error like `"tool_call_grammar_from_json (code -7): tools[2]: function name is empty"` — technically descriptive but not formatted for end-user consumption.
