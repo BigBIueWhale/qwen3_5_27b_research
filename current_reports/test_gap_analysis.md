@@ -1,6 +1,6 @@
 # Qwen 3.5 Renderer and Parser Test Gap Analysis
 
-**Date:** 2026-03-13 (updated 2026-03-22: Gap 4 rewritten with verified HuggingFace Transformers ground truth; Items ordering corrected from "non-issue" to real issue for complex element types — `Items *ToolProperty` recursive type fix specified; proposed struct uses recursive types throughout; Gap 10 rewritten with `formatToolCallArgument` scalar divergences including bool/None/large-integer) (updated 2026-04-01: Gap 4 simple-tool ground truth test implemented and passing — `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` rewritten with byte-exact HF ground truth, realistic `items`, corrected `required`; `TestQwen35RendererBackToBackToolCallsAndResponses` upgraded to byte-exact comparison with `think=true`/`think=false` subtests — locks in multi-tool-call rendering, tool response grouping, pre-lastQueryIndex thinking omission, tool definition JSON, and generation prompt for both think modes; `TestQwen35RendererUsesXMLToolCallingFormat` upgraded to byte-exact with `think=true`/`think=false` subtests — the last loose (`strings.Contains`) renderer test, now locks in single-tool-call, single-tool-response, no-description, no-Thinking-field paths; includes boolean argument `verbose: true` that enforces Gap 10's `true`→`True` divergence (test FAILS by design until `formatToolCallArgument` is fixed); targeted diagnostics for tool JSON, boolean capitalization with exact fix, content-to-tool separator, and `<|im_end|>` closure; all 9 renderer tests (19 subtests) are now byte-exact against official template ground truth; think=false coverage matrix updated from 5 to 6 tests; test status descriptions updated throughout; `TestFormatToolCallArgumentMatchesOfficialTemplate` replaces the old `TestFormatToolCallArgument` — 11 cases with template ground truth verified against both Qwen 3.5 (line 122) and Qwen3-Coder (line 89) templates, FAILS on 4 (bool_true, bool_false, nil, large_int), PASSES on 7; `TestFormatToolCallArgumentThinkingVL` deleted — tested a function the VL renderer doesn't call, with wrong expected values that would block the fix) (updated 2026-04-02: `TestQwen35RendererInterleavedThinkingAndTools` upgraded to byte-exact `got != want` comparison with official Jinja2 template ground truth — both think=true (1981 bytes) and think=false (1992 bytes) verified byte-identical between Go renderer output and Python template output via diff; corrects the 2026-04-01 claim that `UsesXMLToolCallingFormat` was "the last loose renderer test" — `InterleavedThinkingAndTools` also used `strings.Contains`/`strings.HasSuffix` and is now the final test upgraded to full byte-exact; think=false targeted diagnostics preserved as `t.Errorf` before byte-exact `t.Fatalf` gate; Gap 2 status updated; think mode coverage matrix description updated; `TestQwen35RendererNoThinkPrefill` upgraded from `strings.HasSuffix` to byte-exact `got != want` (74 bytes) — all 9 renderer tests (20 subtests) now use full byte-exact comparison, zero substring matching remaining) (updated 2026-04-03: Gap 10 **DONE** — `formatToolCallArgument` in `model/renderers/qwen3coder.go` rewritten to match Python `str()`: `nil`→`"None"`, `bool`→`"True"`/`"False"`, integer-valued `float64`→`strconv.FormatInt`; `TestFormatToolCallArgumentMatchesOfficialTemplate` now 11/11 PASS (was 7/11); `TestQwen35RendererUsesXMLToolCallingFormat` now 2/2 PASS (was 0/2); the sole remaining renderer test failure is `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` Tool 2 enum/description ordering (Gap 4 ToolProperty struct rewrite); Gap 10 section, test descriptions, and relationship section updated throughout)
+**Date:** 2026-03-13 (updated 2026-03-22: Gap 4 rewritten with verified HuggingFace Transformers ground truth; Items ordering corrected from "non-issue" to real issue for complex element types — `Items *ToolProperty` recursive type fix specified; proposed struct uses recursive types throughout; Gap 10 rewritten with `formatToolCallArgument` scalar divergences including bool/None/large-integer) (updated 2026-04-01: Gap 4 simple-tool ground truth test implemented and passing — `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` rewritten with byte-exact HF ground truth, realistic `items`, corrected `required`; `TestQwen35RendererBackToBackToolCallsAndResponses` upgraded to byte-exact comparison with `think=true`/`think=false` subtests — locks in multi-tool-call rendering, tool response grouping, pre-lastQueryIndex thinking omission, tool definition JSON, and generation prompt for both think modes; `TestQwen35RendererUsesXMLToolCallingFormat` upgraded to byte-exact with `think=true`/`think=false` subtests — the last loose (`strings.Contains`) renderer test, now locks in single-tool-call, single-tool-response, no-description, no-Thinking-field paths; includes boolean argument `verbose: true` that enforces Gap 10's `true`→`True` divergence (test FAILS by design until `formatToolCallArgument` is fixed); targeted diagnostics for tool JSON, boolean capitalization with exact fix, content-to-tool separator, and `<|im_end|>` closure; all 9 renderer tests (19 subtests) are now byte-exact against official template ground truth; think=false coverage matrix updated from 5 to 6 tests; test status descriptions updated throughout; `TestFormatToolCallArgumentMatchesOfficialTemplate` replaces the old `TestFormatToolCallArgument` — 11 cases with template ground truth verified against both Qwen 3.5 (line 122) and Qwen3-Coder (line 89) templates, FAILS on 4 (bool_true, bool_false, nil, large_int), PASSES on 7; `TestFormatToolCallArgumentThinkingVL` deleted — tested a function the VL renderer doesn't call, with wrong expected values that would block the fix) (updated 2026-04-02: `TestQwen35RendererInterleavedThinkingAndTools` upgraded to byte-exact `got != want` comparison with official Jinja2 template ground truth — both think=true (1981 bytes) and think=false (1992 bytes) verified byte-identical between Go renderer output and Python template output via diff; corrects the 2026-04-01 claim that `UsesXMLToolCallingFormat` was "the last loose renderer test" — `InterleavedThinkingAndTools` also used `strings.Contains`/`strings.HasSuffix` and is now the final test upgraded to full byte-exact; think=false targeted diagnostics preserved as `t.Errorf` before byte-exact `t.Fatalf` gate; Gap 2 status updated; think mode coverage matrix description updated; `TestQwen35RendererNoThinkPrefill` upgraded from `strings.HasSuffix` to byte-exact `got != want` (74 bytes) — all 9 renderer tests (20 subtests) now use full byte-exact comparison, zero substring matching remaining) (updated 2026-04-03: Gap 10 **DONE** — `formatToolCallArgument` in `model/renderers/qwen3coder.go` rewritten to match Python `str()`: `nil`→`"None"`, `bool`→`"True"`/`"False"`, integer-valued `float64`→`strconv.FormatInt`; `TestFormatToolCallArgumentMatchesOfficialTemplate` now 11/11 PASS (was 7/11); `TestQwen35RendererUsesXMLToolCallingFormat` now 2/2 PASS (was 0/2); the sole remaining renderer test failure is `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` Tool 2 enum/description ordering (Gap 4 ToolProperty struct rewrite); Gap 10 section, test descriptions, and relationship section updated throughout) (updated 2026-04-03: **Major structural reorganization.** Added Property-Based Test Organization section with 8 independently-enforceable template properties (P1-P8). Added Coverage Matrix showing (property x test) holes. Added "Not Broken But Untested" section (NBU-1 through NBU-4) tracking correct-but-unprotected properties. New Gap 12 specifies 6-subtest upgrade to `TestQwen35RendererAssistantPrefillWithThinking` covering Properties 1, 2, 3 simultaneously — all `want` strings verified against the official template with `add_generation_prompt=False`. New Gap 13 specifies pre-lastQueryIndex reasoning discarding enforcement (Property 2 boundary). Gap 5 renamed to "Property 1 at the KV Cache Level" with cross-references. Gap 11 restructured — pathological edge cases (no user messages, template raises exception) removed as testing-undefined-behavior; useful boundary testing merged into Gaps 12/13. **Critical correction:** the claim that `AssistantPrefillWithThinking` "does not need a think=false variant" was wrong — think-independence is a property to enforce, not a reason to skip the test. Think mode coverage paragraph and test description updated.)
 **Fork:** `BigBIueWhale/ollama`, branch `main`, merge base `cc90a035` (Ollama `v0.17.4`)
 **Model:** Qwen 3.5 27B (Alibaba Qwen), a hybrid recurrent architecture (`qwen3next`). Currently the most promising open-source large language model that can run on consumer-grade hardware (17.6 GB at Q4_K_XL quantization).
 **Scope:** This document covers only the test gaps that need to be closed for the Qwen 3.5 prompt template renderer (`model/renderers/qwen35.go`) and parser (`model/parsers/qwen35.go`, which delegates tool call parsing to `model/parsers/qwen3coder.go`), and the grammar-constrained tool call generation pipeline. It does not cover model architecture, GGUF conversion, penalty sampling, or performance — those are covered in `consolidated_report.md`.
@@ -21,6 +21,140 @@ Both failure modes are especially damaging for this specific model because Qwen 
 
 ---
 
+## Property-Based Test Organization
+
+The gaps in this document were originally numbered by discovery order — each tracked a specific bug found and fixed. This section reorganizes coverage around the **8 independently-enforceable properties** of the official Qwen 3.5 Jinja2 template. Each property has a defined scope, a template line reference, and a clear meaning: "if this test fails, this specific template rule was violated." The gap entries below remain for detailed specifications and status tracking, but this section is the authoritative inventory of what must be enforced and where coverage holes exist.
+
+### Property 1 — Think-independence of historical messages
+
+**Template rule:** `enable_thinking` is checked in exactly one place — line 149, inside the `if add_generation_prompt` block. It has **zero effect** on historical message rendering. Lines 90-130 (the entire message rendering loop for assistant messages) never reference `enable_thinking`.
+
+**What to test:** For every type of historical assistant message (with reasoning, without reasoning, with tool calls, prefill), rendering with `think=true` and `think=false` must produce **byte-identical** output for the historical portion. The only bytes that may differ are the generation prompt suffix.
+
+**Current coverage:** `InterleavedThinkingAndTools/think=false` covers post-lastQueryIndex assistants with reasoning (Gap 2 — DONE). `BackToBackToolCallsAndResponses/think=false` covers pre-lastQueryIndex. `StructuredToolArgumentsUseSpacedJSON/think=false` covers post-lastQueryIndex with empty reasoning. `AssistantToolCallIsNotPrefill/think=false` covers the prefill guard.
+
+**Gap:** The **prefill path** is untested for think-independence. `TestQwen35RendererAssistantPrefillWithThinking` has no think=false subtest. The same messages rendered with think=true and think=false must produce identical output (since prefill has no generation prompt, the ENTIRE output must match). Verified by running the official template with `add_generation_prompt=False` for `enable_thinking=True`, `enable_thinking=False`, and `enable_thinking=undefined` — all three produce identical output. See Gap 12.
+
+**Related gaps:** Gap 2 (DONE), Gap 5 (OPEN — Property 1 at the KV cache level), Gap 12 (NEW).
+
+### Property 2 — Positional `<think>` wrapping boundary
+
+**Template rule:** Line 100: `loop.index0 > ns.last_query_index`. Strictly greater-than, not >=. Not gated on `enable_thinking` or any other condition. Messages after `last_query_index` get `<think>\n{reasoning}\n</think>\n\n{content}` wrapping. Messages at or before `last_query_index` get plain `{content}` rendering — **reasoning is computed then silently discarded** (lines 102-103).
+
+**What to test:** (a) Assistant messages before `last_query_index` must render as plain `<|im_start|>assistant\n{content}` with zero trace of any `reasoning_content` or `Thinking` field. (b) Assistant messages after `last_query_index` must render with `<think>` wrapping, even if reasoning is empty. (c) A single multi-turn conversation must have both types simultaneously to verify the boundary.
+
+**Current coverage:** `BackToBackToolCallsAndResponses` has a pre-lastQueryIndex assistant and a targeted diagnostic checking that thinking "doesn't leak." `InterleavedThinkingAndTools` has two post-lastQueryIndex assistants. But **no test has BOTH** in the same conversation verifying both sides of the boundary byte-exact.
+
+**Gap:** No test verifies that reasoning from a pre-lastQueryIndex assistant is positively discarded (i.e., the rendered bytes are exactly `<|im_start|>assistant\n{content}` — not just "thinking doesn't appear" but "the exact right bytes appear instead"). Verified by running the official template — Scenario 5: an assistant with `reasoning_content="I should use the weather tool."` before `last_query_index` renders as `<|im_start|>assistant\nLet me check.` with zero trace of reasoning. See Gap 13.
+
+**Related gaps:** Gap 11 (RESTRUCTURED — pathological edge cases removed, useful boundary testing merged here), Gap 12 subtest 5 (multi-turn tool history verifies boundary), Gap 13 (NEW).
+
+### Property 3 — Prefill suppresses `<|im_end|>` and generation prompt
+
+**Template rule:** `<|im_end|>` is unconditional for all assistant messages (line 130). Ollama's prefill deliberately deviates: when the last message is an assistant message without tool calls, it omits `<|im_end|>` and the generation prompt, leaving the message open for continuation. This is correct behavior — it maps to the template's `add_generation_prompt=False` minus the trailing `<|im_end|>\n`.
+
+**What to test:** (a) Prefill output must not end with `<|im_end|>`. (b) Prefill output must not end with a generation prompt. (c) Everything before the omitted `<|im_end|>\n` must match the template's `add_generation_prompt=False` output exactly. (d) These properties must hold regardless of think mode, reasoning content, or conversation history.
+
+**Current coverage:** `AssistantPrefillWithThinking` — one scenario, think=true only, byte-exact. `AssistantToolCallIsNotPrefill` — negative test (tool calls prevent prefill).
+
+**Gap:** Only 1 of 6 meaningful prefill scenarios is tested. Missing: think=false, no-reasoning, tool history, lastQueryIndex boundary. See Gap 12.
+
+### Property 4 — Reasoning extraction path equivalence
+
+**Template rule:** Lines 91-98: `reasoning_content` field (if string) takes priority; else inline `<think>...</think>` tags are parsed. Both paths feed into the same `<think>\n{reasoning}\n</think>\n\n{content}` wrapper. All client encodings of the same model turn must produce identical rendered output.
+
+**What to test:** Three encodings — explicit `Thinking` field, inline close-only (`reasoning\n</think>\n\ncontent`), inline both tags (`<think>\nreasoning\n</think>\n\ncontent`) — must produce byte-identical full renderer output.
+
+**Current coverage:** `SplitQwen35ReasoningContent` tests this at the function level (12 subtests, path equivalence assertion). No **integration-level** test verifies the full renderer output is identical across the three encoding paths.
+
+**Gap:** A renderer-level test that feeds the three encodings through `Render()` and asserts identical output would catch bugs that the unit test misses (e.g., if the renderer treats the content differently when it contains literal `<think>` tags passed through by Path 1). Low priority — the unit test coverage is strong and the renderer's use of `splitQwen35ReasoningContent`'s output is simple string concatenation.
+
+### Property 5 — Tool call argument formatting
+
+**Template rule:** Line 122: scalars use `args_value | string` (Python `str()`), collections use `args_value | tojson | safe`. This produces `True`/`False`/`None` for scalar booleans/nil, JSON `true`/`false`/`null` inside collections.
+
+**What to test:** bool → `True`/`False`, nil → `None`, int → str, float → str, large int → no scientific notation, string → verbatim, dict → spaced JSON with no HTML escaping, list → spaced JSON.
+
+**Current coverage:** `FormatToolCallArgumentMatchesOfficialTemplate` (11 cases, all PASS). `UsesXMLToolCallingFormat` (boolean `True`). `StructuredToolArgumentsUseSpacedJSON` (dict with HTML chars). **Good coverage — DONE (Gap 10).**
+
+### Property 6 — Tool definition serialization
+
+**Template rule:** Line 50: `{{ tool | tojson }}` with HuggingFace Transformers' `sort_keys=False` override (not stock Jinja2's `sort_keys=True`). Produces spaced separators (`, ` and `: `), no HTML escaping, insertion-order key preservation.
+
+**What to test:** Field ordering at every nesting level, no HTML escaping, spaced separators, recursive key ordering for complex element types, field preservation through unmarshal/marshal round-trip.
+
+**Current coverage:** `ToolDefinitionsMatchOfficialTemplate` — Tool 1 PASSES, Tool 2 FAILS by design (enum/description ordering). **Partially done — Gap 4.**
+
+### Property 7 — Tool response grouping and wrapping
+
+**Template rule:** Lines 131-142: consecutive tool messages share one `<|im_start|>user` block. Non-consecutive tool messages each get their own.
+
+**What to test:** Grouped responses (consecutive tools), non-consecutive responses (tool-assistant-tool), single responses.
+
+**Current coverage:** `BackToBackToolCallsAndResponses` (grouped), `InterleavedThinkingAndTools` (non-consecutive), `UsesXMLToolCallingFormat` (single). **Good coverage.**
+
+### Property 8 — Generation prompt depends on think mode
+
+**Template rule:** Lines 147-153: `add_generation_prompt` controls whether a prompt is appended. Within it, `enable_thinking` controls the format: true/undefined → `<think>\n`, explicitly false → `<think>\n\n</think>\n\n`.
+
+**What to test:** think=true suffix, think=false suffix, think=undefined suffix (same as true).
+
+**Current coverage:** All 6 think=false tests verify the correct suffix. `NoThinkPrefill` covers the standalone generation prompt. **Good coverage.**
+
+---
+
+## Coverage Matrix
+
+Each cell shows which **existing test** enforces the property. **Blank cells are coverage holes.** Think subtests are shown as `✓/✓` (think=true/think=false) or `✓/—` (think=true only).
+
+| Test | P1 Think-indep | P2 Positional wrapping | P3 Prefill | P4 Path equiv | P5 Arg fmt | P6 Tool def | P7 Tool resp | P8 Gen prompt |
+|------|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| `UsesXMLToolCallingFormat` | ✓/✓ | pre-LQI | — | — | bool ✓ | no-desc ✓ | single ✓ | ✓/✓ |
+| `NoThinkPrefill` | — | — | — | — | — | — | — | —/✓ |
+| `BackToBackToolCallsAndResponses` | ✓/✓ | pre-LQI | — | — | int ✓ | two tools ✓ | grouped ✓ | ✓/✓ |
+| `StructuredToolArgumentsUseSpacedJSON` | ✓/✓ | post-LQI (empty) | — | — | dict ✓ | — | — | ✓/✓ |
+| `ToolDefinitionsMatchOfficialTemplate` | — | — | — | — | — | **FAILS** T2 | — | — |
+| `InterleavedThinkingAndTools` | **✓/✓** | post-LQI | — | — | str ✓ | two tools ✓ | non-consec ✓ | ✓/✓ |
+| `AssistantPrefillWithThinking` | **✓/—** | post-LQI | **✓/—** | — | — | — | — | — |
+| `AssistantToolCallIsNotPrefill` | ✓/✓ | post-LQI | neg ✓/✓ | — | str ✓ | — | — | ✓/✓ |
+| `SplitQwen35ReasoningContent` | — | — | — | unit ✓ | — | — | — | — |
+| `FormatToolCallArgumentMatchesOfficialTemplate` | — | — | — | — | 11 cases ✓ | — | — | — |
+| KV cache round-trip (22 cases) | — | — | — | — | ✓ | — | ✓ | — |
+
+**Key:** LQI = lastQueryIndex. "pre-LQI" = assistant before boundary (no `<think>`). "post-LQI" = after boundary (`<think>` wrapping). "neg" = negative test (verifies something does NOT happen).
+
+**Visible holes:**
+- **P1 × Prefill:** `AssistantPrefillWithThinking` has no think=false subtest → ✓/— instead of ✓/✓
+- **P2 boundary:** No test has BOTH pre-LQI and post-LQI assistants verified byte-exact in the same conversation
+- **P3 coverage:** Only 1 of 6 prefill scenarios tested; no think=false, no tool history, no empty reasoning
+- **P4 integration:** Only unit-level (low priority)
+
+---
+
+## Not Broken But Untested
+
+This section tracks properties that the Go renderer handles **correctly** (verified by running the official template and comparing byte-exact), but which have **no test coverage**. These are distinct from gaps (which track things discovered broken). A refactoring or well-intentioned code change could break any of these silently.
+
+### NBU-1: Pre-lastQueryIndex reasoning discarding
+
+The official template (lines 102-103) discards `reasoning_content` for messages at or before `last_query_index`. The Go renderer does the same — `splitQwen35ReasoningContent` extracts reasoning, but the `else` branch at line 152 of `qwen35.go` writes only `content`, silently dropping the reasoning. Verified correct by running the template with an assistant that has `reasoning_content="I should use the weather tool."` before `last_query_index` — the output is `<|im_start|>assistant\nLet me check.` with zero trace of reasoning.
+
+**No test verifies this.** The `BackToBackToolCallsAndResponses` test has a targeted diagnostic checking that thinking "doesn't leak," but this is a `strings.Contains` negative check — it doesn't verify the positive property (exact bytes produced). If someone refactored the pre-lastQueryIndex branch to accidentally include an empty `<think>` block, the negative check would still pass. See Gap 13.
+
+### NBU-2: Prefill think-independence
+
+The `TestQwen35RendererAssistantPrefillWithThinking` test only runs with `think=nil` (defaults to true). The same messages rendered with `think=false` must produce **identical** bytes — verified by running the template with `add_generation_prompt=False` for three `enable_thinking` values, all identical. No test enforces this. See Gap 12.
+
+### NBU-3: Mixed lastQueryIndex boundary in one conversation
+
+No test renders a conversation where assistant messages fall on BOTH sides of the `last_query_index` boundary and verifies both sides byte-exact. The existing tests verify one side at a time. See Gap 13.
+
+### NBU-4: Prefill after full agentic loop
+
+No test renders a complete tool-calling conversation (user → assistant+toolcall → tool_result → user → assistant) where the last assistant is a prefill. This is the most realistic prefill scenario (client replays tool-calling history and the user's latest message, with the model's partial response as the final message). See Gap 12 subtest 5.
+
+---
+
 ## What Tests Exist Today
 
 ### Renderer tests: `model/renderers/qwen35_test.go`
@@ -37,13 +171,13 @@ Both failure modes are especially damaging for this specific model because Qwen 
 
 **`TestQwen35RendererInterleavedThinkingAndTools`**: Byte-exact comparison of the entire rendered output for two interleaved assistant+tool turns where both assistant messages are after lastQueryIndex and have non-empty Thinking fields. The expected strings were derived by running the official Qwen/Qwen3.5-27B Jinja2 chat template with the same message array and tools (HuggingFace Transformers' tojson override with ensure_ascii=False, sort_keys=False), then verified byte-identical against Go renderer output via diff (1981 bytes for think=true, 1992 bytes for think=false). Has `think=true` and `think=false` subtests. The `think=false` subtest is the primary regression detector for the fork's unconditional thinking block fix (Gap 2): it has two targeted `t.Errorf` diagnostics that verify both historical assistant messages retain their `<think>` blocks with full reasoning text despite think=false, then a byte-exact `got != want` comparison as the final `t.Fatalf` gate. This catches both regression vectors: re-adding `isThinking` to `splitQwen35ReasoningContent` or re-adding `isThinking &&` to the `<think>` wrapping condition. The byte-exact comparison additionally locks in: tool definition JSON for two tools (field ordering, spaced separators), the `\n\n` content-to-tool separator (template line 112), non-consecutive tool response wrapping (each gets its own `<|im_start|>user` block since they are separated by assistant messages), `<|im_end|>` closures, system prompt with tools-first pattern, and the generation prompt suffix for both think modes.
 
-**`TestQwen35RendererAssistantPrefillWithThinking`**: Uses `got != want` to compare the entire rendered output. Verifies that when the last message is an assistant message with `Thinking: "Keep it short."` and `Content: "Hello world"` but NO tool calls, the output is a prefill: no `<|im_end|>` after the assistant content, and no generation prompt appended. This is the correct prefill behavior for an assistant message without tool calls (the `len(message.ToolCalls) == 0` condition is true, so `prefill` is true).
+**`TestQwen35RendererAssistantPrefillWithThinking`**: Uses `got != want` to compare the entire rendered output. Verifies that when the last message is an assistant message with `Thinking: "Keep it short."` and `Content: "Hello world"` but NO tool calls, the output is a prefill: no `<|im_end|>` after the assistant content, and no generation prompt appended. This is the correct prefill behavior for an assistant message without tool calls (the `len(message.ToolCalls) == 0` condition is true, so `prefill` is true). **Coverage holes:** (1) No think=false subtest — think-independence of prefill output is unprotected (see Property 1, Gap 12). (2) No comment block explaining the test's purpose. (3) Generic error message ("unexpected prefill output") instead of targeted diagnostics. (4) Only 1 of 6 meaningful prefill scenarios tested — no empty-reasoning, no tool history, no lastQueryIndex boundary variant. (5) No targeted assertion for the critical negative properties (no `<|im_end|>`, no generation prompt). See Gap 12 for the full upgrade specification.
 
 **`TestQwen35RendererAssistantToolCallIsNotPrefill`**: Tests the fork's most important correctness fix — the `len(message.ToolCalls) == 0` guard on the prefill condition. Verifies that when the last message is an assistant message WITH tool calls, the renderer emits `<|im_end|>` after the tool calls and appends the generation prompt. Has `think=true` and `think=false` subtests. The `think=true` subtest checks the generation prompt suffix `<|im_start|>assistant\n<think>\n`. The `think=false` subtest checks `<|im_start|>assistant\n<think>\n\n</think>\n\n`. Both subtests also verify the `</tool_call><|im_end|>` closing sequence. See Gap 1 for the full analysis of why this test exists.
 
 **`TestSplitQwen35ReasoningContent`**: Tests the reasoning extraction function `splitQwen35ReasoningContent` in isolation with 11 table-driven subtests plus a cross-encoding equivalence assertion. Covers three client encoding paths, multi-line reasoning, close-tag-only, explicit field priority, whitespace-only thinking field, empty content, both-empty, and multiple `</think>` tags. See Gap 3 for full details.
 
-**Think mode coverage across renderer tests:** All renderer tests construct the `Qwen35Renderer` with `isThinking: true`. Six tests exercise `think: false` at runtime: `TestQwen35RendererNoThinkPrefill` (generation prompt only, no assistant messages), `TestQwen35RendererUsesXMLToolCallingFormat/think=false` (byte-exact single-tool-call scenario — pre-lastQueryIndex assistant with no Thinking field, string + boolean arguments; PASSES — boolean `True` capitalization fixed 2026-04-03; confirms output identical to think=true except generation prompt suffix), `TestQwen35RendererBackToBackToolCallsAndResponses/think=false` (byte-exact verification of pre-lastQueryIndex thinking omission, multi-tool rendering, and non-thinking generation prompt — confirms that the entire output is identical to think=true except the generation prompt suffix, as the official template checks `enable_thinking` in exactly one place), `TestQwen35RendererStructuredToolArgumentsUseSpacedJSON/think=false` (byte-exact verification including unconditional `<think>` wrapping with empty reasoning and non-thinking generation prompt suffix), `TestQwen35RendererAssistantToolCallIsNotPrefill/think=false` (generation prompt after tool-calling assistant, empty historical thinking block from post-lastQueryIndex wrapping), and `TestQwen35RendererInterleavedThinkingAndTools/think=false` (byte-exact with targeted `t.Errorf` diagnostics for thinking block preservation + `got != want` gate — the Gap 2 regression detector). Together, the six think=false tests form a complementary coverage matrix over the `lastQueryIndex` and `enable_thinking` dimensions: `UsesXMLToolCallingFormat` covers pre-lastQueryIndex with no Thinking field (Path 3 fallthrough) and boolean argument capitalization (Gap 10 — now fixed and passing), `BackToBackToolCallsAndResponses` covers pre-lastQueryIndex with a Thinking field (thinking correctly omitted by position), `InterleavedThinkingAndTools` covers post-lastQueryIndex (thinking unconditionally preserved — byte-exact verification of the entire output including system prompt, tool definitions, tool responses, and all closures), `StructuredToolArgumentsUseSpacedJSON` covers post-lastQueryIndex with empty reasoning, `AssistantToolCallIsNotPrefill` covers the prefill guard, and `NoThinkPrefill` covers the standalone generation prompt. As documented in "Why Exact Template Fidelity Matters," the official template checks `enable_thinking` in exactly one place — the generation prompt. Historical `<think>` block rendering is unconditional — it does not check `isThinking` (this is the fork's fix, now protected by Gap 2's test). Content formatting, tool call XML, tool definition JSON, and `<|im_end|>` placement are all independent of think mode. `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` does not need a think=false variant because tool definition JSON in the system prompt is identical regardless of think mode. `TestQwen35RendererAssistantPrefillWithThinking` also does not need a think=false variant because prefill behavior is independent of think mode.
+**Think mode coverage across renderer tests:** All renderer tests construct the `Qwen35Renderer` with `isThinking: true`. Six tests exercise `think: false` at runtime: `TestQwen35RendererNoThinkPrefill` (generation prompt only, no assistant messages), `TestQwen35RendererUsesXMLToolCallingFormat/think=false` (byte-exact single-tool-call scenario — pre-lastQueryIndex assistant with no Thinking field, string + boolean arguments; PASSES — boolean `True` capitalization fixed 2026-04-03; confirms output identical to think=true except generation prompt suffix), `TestQwen35RendererBackToBackToolCallsAndResponses/think=false` (byte-exact verification of pre-lastQueryIndex thinking omission, multi-tool rendering, and non-thinking generation prompt — confirms that the entire output is identical to think=true except the generation prompt suffix, as the official template checks `enable_thinking` in exactly one place), `TestQwen35RendererStructuredToolArgumentsUseSpacedJSON/think=false` (byte-exact verification including unconditional `<think>` wrapping with empty reasoning and non-thinking generation prompt suffix), `TestQwen35RendererAssistantToolCallIsNotPrefill/think=false` (generation prompt after tool-calling assistant, empty historical thinking block from post-lastQueryIndex wrapping), and `TestQwen35RendererInterleavedThinkingAndTools/think=false` (byte-exact with targeted `t.Errorf` diagnostics for thinking block preservation + `got != want` gate — the Gap 2 regression detector). Together, the six think=false tests form a complementary coverage matrix over the `lastQueryIndex` and `enable_thinking` dimensions: `UsesXMLToolCallingFormat` covers pre-lastQueryIndex with no Thinking field (Path 3 fallthrough) and boolean argument capitalization (Gap 10 — now fixed and passing), `BackToBackToolCallsAndResponses` covers pre-lastQueryIndex with a Thinking field (thinking correctly omitted by position), `InterleavedThinkingAndTools` covers post-lastQueryIndex (thinking unconditionally preserved — byte-exact verification of the entire output including system prompt, tool definitions, tool responses, and all closures), `StructuredToolArgumentsUseSpacedJSON` covers post-lastQueryIndex with empty reasoning, `AssistantToolCallIsNotPrefill` covers the prefill guard, and `NoThinkPrefill` covers the standalone generation prompt. As documented in "Why Exact Template Fidelity Matters," the official template checks `enable_thinking` in exactly one place — the generation prompt. Historical `<think>` block rendering is unconditional — it does not check `isThinking` (this is the fork's fix, now protected by Gap 2's test). Content formatting, tool call XML, tool definition JSON, and `<|im_end|>` placement are all independent of think mode. `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` does not need a think=false variant because tool definition JSON in the system prompt is identical regardless of think mode. **`TestQwen35RendererAssistantPrefillWithThinking` DOES need a think=false variant** — "prefill behavior is independent of think mode" is a property that must be **enforced by test**, not a reason to skip the test. If someone introduces a think-mode dependency into the prefill path, nothing currently catches the regression. The template was run with `add_generation_prompt=False` for `enable_thinking=True`, `False`, and `undefined` — all three produce identical output. This invariant is unprotected. See Gap 12 and Property 1 in the coverage matrix (the ✓/— cell).
 
 ### Parser tests: `model/parsers/qwen35_test.go` (382 lines, 11 test functions)
 
@@ -771,7 +905,9 @@ See `consolidated_report.md` Part 4 for the full analysis of all field ordering 
 
 ---
 
-## Gap 5: No Test for Thinking Mode Switching Across a Full Agentic Loop (KV Cache Round-Trip)
+## Gap 5: Property 1 at the KV Cache Level — Think Mode Switching Across a Full Agentic Loop
+
+**Property enforced:** Property 1 (think-independence of historical messages), verified at the KV cache round-trip level rather than the renderer unit level.
 
 **What is missing:** The 22 KV cache round-trip test cases in `server/qwen35_kvcache_roundtrip_test.go` all use a single `think` value for the entire test. No test simulates a multi-turn agentic conversation where thinking mode changes between turns — for example, turn 1 with `think: true` (the assistant produces reasoning + tool call), then turn 2 with `think: false` (the user wants a direct answer without reasoning).
 
@@ -782,7 +918,7 @@ See `consolidated_report.md` Part 4 for the full analysis of all field ordering 
 2. Turn 2: `think=false`, send back the parsed tool call + tool result + new user message. Render the new prompt.
 3. Verify that the historical assistant message in the turn-2 prompt still contains `<think>reasoning</think>` (not stripped), so the KV cache prefix from turn 1 is reused.
 
-**Relationship to Gap 2:** This gap tests the KV cache consequences of the same renderer behavior that Gap 2 tests at the unit level. Gap 2 verifies that the renderer output is correct (thinking blocks preserved in history when think mode switches). This gap verifies that the correct output actually produces byte-identical prefixes across the mode switch — a stronger assertion, because it is possible for the output to be semantically correct but byte-different in a way that invalidates the cache (for example, if the renderer introduced extra whitespace or reordered attributes in think=false mode). Both gaps are needed: Gap 2 catches the most obvious regression (thinking blocks stripped entirely), while this gap catches subtler regressions that only manifest as cache misses in multi-turn agentic conversations.
+**Relationship to Property 1 and Gap 2:** Property 1 is tested at three levels: (a) Gap 2 / `InterleavedThinkingAndTools/think=false` verifies the renderer output is correct (thinking blocks preserved). (b) Gap 12 / `AssistantPrefillWithThinking` subtests 2 and 4 verify think-independence in the prefill path. (c) This gap verifies that the correct output actually produces byte-identical prefixes across the mode switch — a stronger assertion, because it is possible for the output to be semantically correct but byte-different in a way that invalidates the cache. All three levels are needed: Gap 2 catches thinking blocks being stripped, Gap 12 catches prefill think-dependence, and this gap catches subtler byte-level divergences that only manifest as cache misses in multi-turn agentic conversations.
 
 **Think mode variants:** Inherent to this gap — the entire point is testing behavior when the think mode changes between turns. The test requires at minimum two renders with different think values for the same conversation history. The minimum viable test covers think=true→think=false (the common direction: user starts with reasoning enabled, then switches to direct answers for speed). The reverse (think=false→think=true) is also worth testing but is lower priority because it is less common in practice and the renderer code path is symmetric.
 
@@ -940,33 +1076,265 @@ The ground truth was verified against BOTH official templates that use this func
 
 ---
 
-## Gap 11: No Test for `lastQueryIndex` Edge Cases
+## Gap 11: ~~No Test for `lastQueryIndex` Edge Cases~~ RESTRUCTURED — pathological cases removed, boundary testing merged into Property 2 and Gap 13
 
 **What `lastQueryIndex` does:** In `Render()` in `model/renderers/qwen35.go`, the renderer walks messages backwards to find the last user message that is NOT a `<tool_response>`-wrapped message. Messages after `lastQueryIndex` get `<think>` blocks unconditionally. Messages at or before `lastQueryIndex` get plain rendering.
 
-**What is missing:** No test verifies the behavior when:
-- All user messages are `<tool_response>`-wrapped (meaning every user message is a tool result). In this case, `lastQueryIndex` stays at `len(messages) - 1` (the initial value), and no assistant messages get `<think>` blocks. The official Jinja2 template raises an exception in this case (`raise_exception("No user message found")`), but the Go renderer silently proceeds. A test should document which behavior the fork chooses and why.
-- There is only one user message and it is a `<tool_response>` message. Same edge case as above but simpler.
-- The conversation has no user messages at all (only system + assistant). `lastQueryIndex` stays at `len(messages) - 1`. The assistant message would be at an index <= `lastQueryIndex`, so it gets plain rendering (no `<think>` block). A test should verify this.
+**What was originally specified here (now removed):** Three pathological edge cases — all user messages are tool responses, only one user message and it's a tool response, no user messages at all. These all result in `lastQueryIndex` staying at `len(messages) - 1` and the template raising `raise_exception("No user query found")`. Testing that the Go renderer silently produces undefined output for an input the template rejects is not useful — it's testing undefined behavior. If the fork wants to handle these gracefully, that should be a deliberate design decision with its own test, not a gap in template fidelity testing.
 
-**Think mode variants:** The `lastQueryIndex` computation itself is independent of think mode — it walks messages backwards looking for non-tool-response user messages, with no reference to `isThinking`. However, the edge case where `lastQueryIndex` stays at `len(messages) - 1` (no non-tool-response user message found) means no assistant messages get `<think>` wrapping, yet the generation prompt at the end still depends on think mode. A test for these edge cases should verify both think=true and think=false to confirm the generation prompt is correct even when no assistant messages receive `<think>` blocks.
+**What moved where:**
+- The **useful** part of Gap 11 — testing the `lastQueryIndex` boundary in normal conversations — is now specified in **Gap 13** (pre-lastQueryIndex reasoning discarding) and **Gap 12 subtest 5** (multi-turn tool history with boundary). These test the positional `<think>` wrapping boundary (Property 2) in realistic scenarios where the boundary matters.
+- The pathological edge cases are **deprioritized**. If they are tested in the future, they should verify the fork's chosen behavior (silently proceed? error? log warning?) against a documented design decision, not against the template's exception.
 
 ---
 
-## Relationship Between Gaps
+## Gap 12: Prefill Property Enforcement — `TestQwen35RendererAssistantPrefillWithThinking` Upgrade (Properties 1, 2, 3)
 
-Gaps 1, 2, and 3 are now closed. Gaps 1 and 2 protect the fork's two most important correctness fixes (prefill bug and unconditional thinking blocks). Gap 3 completes the depth on the unconditional thinking block fix by testing the extraction function (`splitQwen35ReasoningContent`) in isolation — covering Path 2 (inline `<think>` tags from third-party clients) which had zero coverage, and asserting path equivalence across three client encodings of the same model turn.
+**Status: OPEN.**
 
-**Gaps 2 and 3 are two levels of the same fix.** The fork's unconditional thinking block fix involved two code changes: removing the `isThinking` parameter from `splitQwen35ReasoningContent`( tested by Gap 3) and removing the `isThinking &&` gate from the rendering condition( tested by Gap 2). Gap 2 catches the regression at the integration level (someone re-adds the `isThinking` gate). Gap 3 catches bugs in the extraction logic itself (wrong tag stripping, wrong fallback priority, wrong whitespace handling, broken path equivalence). Both are now closed.
+**What is missing:** The current `TestQwen35RendererAssistantPrefillWithThinking` test has 1 subtest. It should have 6. Each subtest enforces a different combination of (think mode × content type × conversation structure) for the prefill path. All `want` strings are verified against the official Qwen 3.5 template output with `add_generation_prompt=False`, with the trailing `<|im_end|>\n` stripped (the intentional Ollama prefill deviation). The template was run for every scenario with `enable_thinking=True`, `False`, and `undefined` — all three produce identical output for `add_generation_prompt=False`, proving that `enable_thinking` has zero effect on the output when there is no generation prompt.
 
-Gap 4 (tool definition serialization) is **partially closed** (2026-04-01). The simple-tool ground truth test (`TestQwen35RendererToolDefinitionsMatchOfficialTemplate`) has been rewritten with byte-exact HF ground truth and passes — it guards the correct simple-tool serialization against regressions. The remaining work is the `ToolProperty` struct rewrite in `api/types.go` — a single struct change that fixes `enum`/`description` ordering, adds `nullable`/`additionalProperties`/`prefixItems` fields (these carry type constraint semantics, unlike the `"return"` field which is informational and harmless to drop), AND fixes recursive nested key ordering for complex element types by using `Items *ToolProperty`, `AdditionalProperties *ToolProperty`, `PrefixItems []ToolProperty` instead of `any`/`[]any` (so Go's `json.Marshal` produces training-consistent key ordering at all nesting levels). When that struct rewrite lands, two new tests arrive with it: (1) a Tool 2 (enum tool) case added to `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` that verifies the `enum`/`description` field ordering, and (2) the `TestQwen35ToolPropertyRoundTripFidelity` test with 5 cases for field loss and nested key ordering. Go's struct-based serialization normalizes all client inputs to the training-consistent field order — this is superior to the official Jinja2 template's `{{ tool | tojson }}` passthrough, which blindly preserves whatever Python dict ordering the client sends.
+**Why this is not a new test:** This is an upgrade to an existing test that is correct but dangerously incomplete. The test currently passes but provides zero protection against regressions in think-independence (Property 1), empty-reasoning wrapping (Property 2), or prefill in complex conversations (Property 3). It also lacks a comment block and has a generic error message.
 
-**Gap 9.5 is the remaining tool call argument round-trip gap.** Gap 9.5 (object key ordering) is the highest-impact open gap: every tool call with a JSON object argument causes a KV cache miss in multi-turn conversations. Three KV cache round-trip tests (cases 10, 11, 15) and two number normalization tests (cases 12, 13) already exist and correctly fail, documenting the bug. The fix requires an insertion-order-preserving JSON parser for argument values — the same approach llama.cpp uses via `nlohmann::ordered_json`. Gap 10 (scalar boolean/None/large-integer capitalization) is now **DONE** (2026-04-03) — `formatToolCallArgument` in `model/renderers/qwen3coder.go` was fixed to match Python `str()` for bool/nil/integer-valued-float64, and all 11 unit test cases + both integration subtests now PASS. Both gaps affect the tool call argument re-serialization path (`formatToolCallArgument` / `marshalQwenToolCallArgument`), which is distinct from the tool definition serialization path (`marshalWithSpaces`) addressed by Gap 4.
+### Subtest specification
 
-Gap 5 (thinking mode switching in KV cache) tests the cache-level consequences of the same renderer behavior that Gap 2 tests at the unit level. Both are needed — Gap 2 catches thinking blocks being stripped, Gap 5 catches subtler byte-level divergences that only manifest as cache misses.
+**Subtest 1: `think=true`** (existing test, restructured into a subtest)
 
-Gap 7 (no grammar tests) is important for long-term maintenance but lower urgency because the grammar feature is new, the code is unlikely to be accidentally modified, and the grammar's correctness is validated indirectly through the KV cache round-trip tests and real-model integration tests.
+Renderer: `&Qwen35Renderer{isThinking: true}`, think=nil.
+Messages: `[user("Write two words."), assistant(Thinking="Keep it short.", Content="Hello world")]`.
 
-Gaps 6, 8, 9, and 11 are medium-priority gaps that improve confidence in edge cases. They are ordered roughly by the likelihood and severity of the bugs they would catch.
+Template ground truth (`add_generation_prompt=False`, `enable_thinking=True`, trailing `<|im_end|>\n` stripped):
+```
+<|im_start|>user
+Write two words.<|im_end|>
+<|im_start|>assistant
+<think>
+Keep it short.
+</think>
 
-**Think mode coverage as a cross-cutting concern:** The six think=false renderer tests form a complementary coverage matrix over the two dimensions that interact with think mode: the `lastQueryIndex` position (which controls `<think>` wrapping in history) and the `enable_thinking` parameter (which controls only the generation prompt). `BackToBackToolCallsAndResponses/think=false` covers pre-lastQueryIndex (thinking correctly omitted by position, confirming that the entire output is identical to think=true except the generation prompt suffix). `InterleavedThinkingAndTools/think=false` covers post-lastQueryIndex (thinking unconditionally preserved — byte-exact with targeted diagnostics, the Gap 2 regression detector). `StructuredToolArgumentsUseSpacedJSON/think=false` covers post-lastQueryIndex with empty reasoning. `AssistantToolCallIsNotPrefill/think=false` covers the prefill guard. `NoThinkPrefill` covers the standalone generation prompt with no assistant messages. This matrix is complete for the existing renderer code paths — no renderer test needs a think=false variant that does not already have one. The remaining gaps that need both think modes are: Gap 5 (inherent to mode switching — KV cache round-trip level), Gap 8 (different parser code paths), and Gap 11 (generation prompt correctness in lastQueryIndex edge cases). The gaps that do not need think=false variants are: Gap 3 (pure function), Gap 4 (JSON serialization), Gap 6 (tool definition bytes), Gap 7 (grammar components other than trigger patterns), Gap 9 (argument formatting), Gap 9.5 (argument key ordering), and Gap 10 (scalar capitalization). Gap 7's trigger pattern sub-component is inherently mode-dependent and requires both patterns to be tested.
+Hello world
+```
+
+Properties enforced: P2 (post-lastQueryIndex `<think>` wrapping), P3 (no `<|im_end|>`, no generation prompt).
+
+**Subtest 2: `think=false_preserves_reasoning`** (the primary regression detector)
+
+Renderer: `&Qwen35Renderer{isThinking: true, emitEmptyThinkOnNoThink: true}`, think=`&ThinkValue{Value: false}`.
+Messages: **Same** as subtest 1.
+
+Expected: **Identical** to subtest 1 — uses the same `want` constant. Since prefill has no generation prompt, the entire output must be byte-identical regardless of think mode.
+
+Properties enforced: **P1** (think-independence — this is the coverage hole being filled). If someone re-adds `isThinking &&` to line 149 of `qwen35.go` or re-adds `isThinking` to `splitQwen35ReasoningContent`, this subtest fails while subtest 1 passes.
+
+**Subtest 3: `no_reasoning_think=true`**
+
+Renderer: `&Qwen35Renderer{isThinking: true}`, think=nil.
+Messages: `[user("Write two words."), assistant(Content="Hello world")]` — no Thinking field.
+
+Template ground truth:
+```
+<|im_start|>user
+Write two words.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Hello world
+```
+
+Properties enforced: P2 (empty `<think>` wrapping for post-lastQueryIndex with no reasoning — the message is after lastQueryIndex so it gets `<think>` wrapping regardless of whether reasoning exists).
+
+**Subtest 4: `no_reasoning_think=false`**
+
+Renderer: `&Qwen35Renderer{isThinking: true, emitEmptyThinkOnNoThink: true}`, think=`&ThinkValue{Value: false}`.
+Messages: **Same** as subtest 3.
+
+Expected: **Identical** to subtest 3 — uses the same `want` constant.
+
+Properties enforced: **P1** (think-independence for the no-reasoning path).
+
+**Subtest 5: `think_switch_with_tool_history`**
+
+Renderer: `&Qwen35Renderer{isThinking: true, emitEmptyThinkOnNoThink: true}`, think=`&ThinkValue{Value: false}`.
+Messages:
+```go
+[
+  user("What's the weather?"),
+  assistant(Thinking="I should use the weather tool.", Content="Let me check.",
+            ToolCalls=[get_weather(location="Paris")]),
+  tool("22C"),
+  user("Now summarize."),
+  assistant(Thinking="Simple answer from tool result.", Content="It's 22C in Paris."),
+]
+```
+
+Template ground truth (verified — `add_generation_prompt=False`, all three `enable_thinking` values identical):
+```
+<|im_start|>user
+What's the weather?<|im_end|>
+<|im_start|>assistant
+Let me check.
+
+<tool_call>
+<function=get_weather>
+<parameter=location>
+Paris
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+22C
+</tool_response><|im_end|>
+<|im_start|>user
+Now summarize.<|im_end|>
+<|im_start|>assistant
+<think>
+Simple answer from tool result.
+</think>
+
+It's 22C in Paris.
+```
+
+Properties enforced simultaneously:
+- **P1** (think=false, historical reasoning preserved in the last assistant)
+- **P2** (the first assistant at index 1 is BEFORE lastQueryIndex=3 — its reasoning `"I should use the weather tool."` is **silently discarded**, rendered as plain `<|im_start|>assistant\nLet me check.`; the last assistant at index 4 is AFTER lastQueryIndex — reasoning IS preserved)
+- **P3** (last assistant is prefill — no `<|im_end|>`, no generation prompt)
+- **P5** (tool call argument `"Paris"` exercises `formatToolCallArgument` string path)
+- **P7** (single tool response with own `<|im_start|>user` block)
+
+Targeted diagnostics before byte-exact comparison:
+1. `!strings.HasSuffix(got, "<|im_end|>")` — prefill must not close
+2. `!strings.HasSuffix(got, "<think>\n")` and `!strings.HasSuffix(got, "</think>\n\n")` — no generation prompt
+3. `!strings.Contains(firstAssistantBlock, "<think>")` — pre-lastQueryIndex must not have `<think>` wrapping
+4. `strings.Contains(lastAssistantBlock, "<think>\nSimple answer")` — post-lastQueryIndex reasoning preserved despite think=false
+
+**Subtest 6: `pre_lastQueryIndex_reasoning_discarded`**
+
+Renderer: `&Qwen35Renderer{isThinking: true}`, think=nil.
+Messages:
+```go
+[
+  user("First question."),
+  assistant(Thinking="Think first.", Content="First answer."),
+  user("Second question."),
+  assistant(Content="Second answer."),
+]
+```
+
+Template ground truth (verified):
+```
+<|im_start|>user
+First question.<|im_end|>
+<|im_start|>assistant
+First answer.<|im_end|>
+<|im_start|>user
+Second question.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Second answer.
+```
+
+Properties enforced:
+- **P2 boundary** — first assistant (index 1, before lastQueryIndex=2): reasoning `"Think first."` is **discarded**, rendered as plain `First answer.` with no `<think>` wrapper. Second assistant (index 3, after lastQueryIndex=2): no reasoning, rendered with empty `<think>\n\n</think>\n\n` wrapper. Both sides of the boundary verified byte-exact in one conversation.
+- **P3** (last assistant is prefill)
+
+### Cross-subtest assertions
+
+Subtests 1/2 share the same `want` constant. Subtests 3/4 share the same `want` constant. This is a **compile-time guarantee** that the test specification itself does not encode think-mode-dependent behavior — if someone accidentally changes one `want` string but not the other, the code won't compile (or the constant won't match).
+
+### Comment block
+
+The test should have a comment block (matching the style of `TestQwen35RendererAssistantToolCallIsNotPrefill`) explaining:
+- What prefill means in Ollama vs `add_generation_prompt` in the template
+- Why think=false must produce identical output (template evidence)
+- What regressions each subtest catches
+- The template verification methodology (run official template, strip trailing `<|im_end|>\n`)
+
+---
+
+## Gap 13: Pre-lastQueryIndex Reasoning Discarding — Property 2 Boundary Enforcement
+
+**Status: OPEN.**
+
+**What is missing:** No test verifies as a **positive property** that reasoning from assistant messages before `lastQueryIndex` is silently discarded. The `BackToBackToolCallsAndResponses` test has a targeted diagnostic (`strings.Contains` negative check) verifying that thinking "doesn't leak," but this is insufficient:
+
+1. A `strings.Contains` negative check doesn't verify the **exact bytes produced**. If someone refactored the pre-lastQueryIndex branch to accidentally emit `<think>\n\n</think>\n\n{content}` (empty wrapping) instead of plain `{content}`, the "doesn't leak" check would pass — no thinking text leaks — but the output would be wrong (extra `<think>` tags that the template doesn't produce for pre-lastQueryIndex messages).
+
+2. No test has **both sides of the boundary** in the same conversation verified byte-exact. The `BackToBackToolCallsAndResponses` test verifies a pre-lastQueryIndex assistant. The `InterleavedThinkingAndTools` test verifies post-lastQueryIndex assistants. But combining both in one test is important because a refactoring could accidentally change the boundary computation while leaving each side independently correct.
+
+**Template evidence:** Verified by running the official template. An assistant with `reasoning_content="Think first."` at index 1 with `last_query_index=2` renders as:
+```
+<|im_start|>assistant
+First answer.<|im_end|>
+```
+Zero trace of `"Think first."`. The template computes `reasoning_content` (line 91-98) but the `else` branch at line 102-103 writes only `content`, silently discarding the reasoning. The Go renderer does the same (line 152 of `qwen35.go`).
+
+**Relationship to Gap 12:** Gap 12 subtest 5 (tool history) and subtest 6 (boundary) both exercise this property. Gap 13 documents WHY it needs testing (the positive property, not just the negative check) and provides the template evidence. If Gap 12 is implemented, Gap 13 is automatically covered by subtests 5 and 6.
+
+**Status dependency:** Covered by Gap 12 subtests 5 and 6. No separate test needed if Gap 12 is implemented.
+
+---
+
+## Relationship Between Gaps and Properties
+
+### Property coverage summary
+
+| Property | Enforced by (DONE) | Open gaps |
+|----------|-------------------|-----------|
+| P1 Think-independence | Gap 2 (InterleavedThinkingAndTools/think=false) | **Gap 12** subtests 2, 4, 5 (prefill path); **Gap 5** (KV cache level) |
+| P2 Positional wrapping | BackToBackToolCallsAndResponses (pre-LQI); InterleavedThinkingAndTools (post-LQI) | **Gap 12** subtests 5, 6; **Gap 13** (boundary + discarding) |
+| P3 Prefill | AssistantPrefillWithThinking (1 case); AssistantToolCallIsNotPrefill (negative) | **Gap 12** (5 additional scenarios) |
+| P4 Path equivalence | SplitQwen35ReasoningContent (unit level) | Low priority: integration-level |
+| P5 Arg formatting | FormatToolCallArgumentMatchesOfficialTemplate (11 cases) | **Done** (Gap 10) |
+| P6 Tool def serialization | ToolDefinitionsMatchOfficialTemplate (Tool 1 passes) | **Gap 4** (struct rewrite); Gap 6 (KV cache) |
+| P7 Tool response grouping | 3 tests cover grouped, non-consecutive, single | **Done** |
+| P8 Generation prompt | All 6 think=false tests + NoThinkPrefill | **Done** |
+
+### Gap status and relationships
+
+**Closed:** Gaps 1, 2, 3, 10 (4 gaps). These protect the fork's most important correctness fixes. Gaps 2 and 3 are two levels of the same fix — Gap 2 catches the regression at the renderer level, Gap 3 catches bugs in the extraction function.
+
+**Partially closed:** Gap 4 (tool definition serialization). Simple tool passes; enum tool fails by design pending the `ToolProperty` struct rewrite.
+
+**Restructured:** Gap 11 (lastQueryIndex edge cases). Pathological cases (no user messages — template raises exception) removed. The useful boundary testing is now specified in Gap 12 subtests 5/6 and Gap 13.
+
+**NEW — highest priority among open renderer gaps:**
+
+- **Gap 12** (prefill property enforcement) — upgrades `AssistantPrefillWithThinking` from 1 to 6 subtests. Fills the most visible hole in the coverage matrix: think-independence in the prefill path (P1), the lastQueryIndex boundary in realistic multi-turn conversations (P2), and prefill in complex scenarios (P3). All `want` strings are verified against the official template. **This is the recommended next implementation task** — it is entirely self-contained (no code changes, just test restructuring), it fills 3 property gaps simultaneously, and it cannot cause regressions.
+
+- **Gap 13** (pre-lastQueryIndex reasoning discarding) — covered by Gap 12 subtests 5 and 6. No separate test needed.
+
+**Open — serialization and round-trip:**
+
+- **Gap 4** (ToolProperty struct rewrite) — the last remaining renderer test failure. Requires a production code change to `api/types.go`. When implemented, brings two new tests (enum tool byte-exact + 5-case round-trip fidelity).
+
+- **Gap 9.5** (object key ordering in tool call arguments) — highest-impact open gap for KV cache reuse. Every tool call with a JSON object argument causes a cache miss. Requires insertion-order-preserving JSON parser. Three KV cache round-trip tests already document the failure.
+
+**Open — cache and pipeline:**
+
+- **Gap 5** (Property 1 at the KV cache level) — think mode switching in the render→parse→rerender cycle. Tests that byte-identical prefixes are produced across mode switches. Related to Gap 2 but at a stronger assertion level.
+
+- **Gap 6** (tool definition serialization in KV cache round-trip) — verifies tool definition bytes against golden strings, catching formatting regressions.
+
+**Open — grammar and parser:**
+
+- **Gap 7** (grammar-constrained tool call generation) — 5 sub-components, important for long-term maintenance but lower urgency.
+
+- **Gap 8** (parser cancellation unit test) — parser behavior for incomplete tool calls, both think modes.
+
+- **Gap 9** (mixed argument types across parallel tool calls) — exercises both `formatToolCallArgument` paths simultaneously.
+
+### Think mode coverage as a cross-cutting concern
+
+The coverage matrix in the "Coverage Matrix" section above shows think mode coverage visually. The key insight is that **every property-enforcing test should have think subtests unless the property is provably think-independent at the code level** (e.g., Property 5 argument formatting operates on Go values with no access to think state). The previous version of this document incorrectly exempted `AssistantPrefillWithThinking` from this rule with the reasoning "prefill behavior is independent of think mode" — but that independence is precisely the property that must be enforced by test, not assumed. Gap 12 corrects this.
+
+After Gap 12 is implemented, the think=false coverage will increase from 6 to 8 tests (adding subtests 2 and 4 of the prefill test, plus subtest 5 which uses think=false in a tool-history conversation). The coverage matrix's P1 column will change from having a ✓/— hole to full ✓/✓ coverage across all tested paths.
+
+### Not-broken-but-untested items
+
+The "Not Broken But Untested" section above lists 4 items (NBU-1 through NBU-4). All 4 are covered by Gap 12 and Gap 13. When Gap 12 is implemented, all NBU items can be marked resolved.
