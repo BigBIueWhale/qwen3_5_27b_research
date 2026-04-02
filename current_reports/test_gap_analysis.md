@@ -67,7 +67,7 @@ The gaps in this document were originally numbered by discovery order — each t
 
 **Current coverage:** `SplitQwen35ReasoningContent` tests this at the function level (12 subtests, path equivalence assertion). No **integration-level** test verifies the full renderer output is identical across the three encoding paths.
 
-**Gap:** A renderer-level test that feeds the three encodings through `Render()` and asserts identical output would catch bugs that the unit test misses (e.g., if the renderer treats the content differently when it contains literal `<think>` tags passed through by Path 1). Low priority — the unit test coverage is strong and the renderer's use of `splitQwen35ReasoningContent`'s output is simple string concatenation.
+**Gap:** A renderer-level test must feed the three encodings through `Render()` and assert identical output. The unit test alone is insufficient — it doesn't catch cases where the renderer treats content differently when it contains literal `<think>` tags passed through by Path 1 (e.g., if someone adds tag-stripping logic in the renderer after `splitQwen35ReasoningContent` returns). See Gap 12 for integration into the prefill test.
 
 ### Property 5 — Tool call argument formatting
 
@@ -123,17 +123,17 @@ Each cell shows which **existing test** enforces the property. **Blank cells are
 
 **Key:** LQI = lastQueryIndex. "pre-LQI" = assistant before boundary (no `<think>`). "post-LQI" = after boundary (`<think>` wrapping). "neg" = negative test (verifies something does NOT happen).
 
-**Visible holes:**
+**Holes that must be filled:**
 - **P1 × Prefill:** `AssistantPrefillWithThinking` has no think=false subtest → ✓/— instead of ✓/✓
 - **P2 boundary:** No test has BOTH pre-LQI and post-LQI assistants verified byte-exact in the same conversation
 - **P3 coverage:** Only 1 of 6 prefill scenarios tested; no think=false, no tool history, no empty reasoning
-- **P4 integration:** Only unit-level (low priority)
+- **P4 integration:** Only unit-level — renderer-level path equivalence needed to catch post-extraction bugs
 
 ---
 
 ## Not Broken But Untested
 
-This section tracks properties that the Go renderer handles **correctly** (verified by running the official template and comparing byte-exact), but which have **no test coverage**. These are distinct from gaps (which track things discovered broken). A refactoring or well-intentioned code change could break any of these silently.
+This section tracks properties that the Go renderer handles **correctly** (verified by running the official template and comparing byte-exact), but which have **no test coverage**. These are as dangerous as gaps — a refactoring or well-intentioned code change will break them silently, and nothing will catch the regression. The distinction from gaps is only historical (gaps were found broken; these were never broken). The testing requirement is identical: byte-exact enforcement against template ground truth.
 
 ### NBU-1: Pre-lastQueryIndex reasoning discarding
 
@@ -430,7 +430,7 @@ Not needed. The fork's `splitQwen35ReasoningContent` is a pure function of its t
 
 **Status: DONE.** Implemented as `TestSplitQwen35ReasoningContent` in `model/renderers/qwen35_test.go` with 11 table-driven subtests plus an explicit cross-encoding equivalence assertion (12 subtests total). All test inputs use realistic content with `\n` around tags as the model actually generates. The 11 subtests cover: (1a-c) path equivalence across three client encodings of the same model turn, (2) multi-line reasoning with internal newlines preserved, (3) close tag without open tag (model's raw output format), (4) explicit field wins over inline tags (no double-extraction), (5) no thinking baseline, (6) whitespace-only Thinking field, (7) empty content with explicit thinking (tool-call-only turn), (8) both empty, (9) multiple `</think>` tags — reasoning from before the first, remaining from after the last. The equivalence subtest calls the function three times with the three client encodings and asserts identical `(reasoning, remaining)` tuples. Test 9 uncovered a bug where the fork used `strings.Index` (first `</think>`) for both reasoning and remaining content; the fix (commit `ebf97712`) uses `strings.Index` for reasoning and `strings.LastIndex` for remaining content, matching the official template's `split('</think>')[0]`/`split('</think>')[-1]` semantics. This is the 4th renderer difference from upstream (in addition to the prefill fix, history think block fix, and reasoning extraction fix). All 12 subtests pass. KV cache round-trip tests have pre-existing failures unrelated to this change.
 
-**Untested edge case — nested `<think>` tags (low priority):** Input like `<think>outer<think>inner</think>more</think>content` is handled correctly by both the fork and the official template: `strings.LastIndex(before, "<think>")` takes after the last `<think>` before the first `</think>` (producing reasoning `"inner"`), and `strings.LastIndex(content, "</think>")` takes after the last `</think>` (producing remaining `"content"`). The official template does the same via `split('<think>')[-1]` and `split('</think>')[-1]`. Both match. This is untested because the model never generates nested `<think>` tags — grammar constraints prevent it when tools are active, and the training data contains no examples of it. A test would verify defensive correctness but has near-zero practical risk.
+**Untested edge case — nested `<think>` tags:** Input like `<think>outer<think>inner</think>more</think>content` is handled correctly by both the fork and the official template: `strings.LastIndex(before, "<think>")` takes after the last `<think>` before the first `</think>` (producing reasoning `"inner"`), and `strings.LastIndex(content, "</think>")` takes after the last `</think>` (producing remaining `"content"`). The official template does the same via `split('<think>')[-1]` and `split('</think>')[-1]`. Both match. This must be tested defensively — the model doesn't generate nested tags during normal operation (grammar constraints prevent it with tools, training data has no examples), but third-party clients can send arbitrary content. A test locks in the correct behavior so a future refactoring doesn't break it.
 
 ---
 
@@ -920,7 +920,7 @@ See `consolidated_report.md` Part 4 for the full analysis of all field ordering 
 
 **Relationship to Property 1 and Gap 2:** Property 1 is tested at three levels: (a) Gap 2 / `InterleavedThinkingAndTools/think=false` verifies the renderer output is correct (thinking blocks preserved). (b) Gap 12 / `AssistantPrefillWithThinking` subtests 2 and 4 verify think-independence in the prefill path. (c) This gap verifies that the correct output actually produces byte-identical prefixes across the mode switch — a stronger assertion, because it is possible for the output to be semantically correct but byte-different in a way that invalidates the cache. All three levels are needed: Gap 2 catches thinking blocks being stripped, Gap 12 catches prefill think-dependence, and this gap catches subtler byte-level divergences that only manifest as cache misses in multi-turn agentic conversations.
 
-**Think mode variants:** Inherent to this gap — the entire point is testing behavior when the think mode changes between turns. The test requires at minimum two renders with different think values for the same conversation history. The minimum viable test covers think=true→think=false (the common direction: user starts with reasoning enabled, then switches to direct answers for speed). The reverse (think=false→think=true) is also worth testing but is lower priority because it is less common in practice and the renderer code path is symmetric.
+**Think mode variants:** Inherent to this gap — the entire point is testing behavior when the think mode changes between turns. The test requires at minimum two renders with different think values for the same conversation history. Both directions must be tested: think=true→think=false (the common direction: user starts with reasoning enabled, then switches to direct answers for speed) and think=false→think=true (user enables reasoning after starting without it). The renderer code path is symmetric, but a regression could affect one direction and not the other if someone introduces conditional logic.
 
 ---
 
@@ -1084,7 +1084,7 @@ The ground truth was verified against BOTH official templates that use this func
 
 **What moved where:**
 - The **useful** part of Gap 11 — testing the `lastQueryIndex` boundary in normal conversations — is now specified in **Gap 13** (pre-lastQueryIndex reasoning discarding) and **Gap 12 subtest 5** (multi-turn tool history with boundary). These test the positional `<think>` wrapping boundary (Property 2) in realistic scenarios where the boundary matters.
-- The pathological edge cases are **deprioritized**. If they are tested in the future, they should verify the fork's chosen behavior (silently proceed? error? log warning?) against a documented design decision, not against the template's exception.
+- The pathological edge cases require a **design decision** first: should the fork silently proceed, return an error, or log a warning? Once decided, that behavior must be tested. Until then, they are blocked on the design decision, not on testing effort.
 
 ---
 
@@ -1289,7 +1289,7 @@ Zero trace of `"Think first."`. The template computes `reasoning_content` (line 
 | P1 Think-independence | Gap 2 (InterleavedThinkingAndTools/think=false) | **Gap 12** subtests 2, 4, 5 (prefill path); **Gap 5** (KV cache level) |
 | P2 Positional wrapping | BackToBackToolCallsAndResponses (pre-LQI); InterleavedThinkingAndTools (post-LQI) | **Gap 12** subtests 5, 6; **Gap 13** (boundary + discarding) |
 | P3 Prefill | AssistantPrefillWithThinking (1 case); AssistantToolCallIsNotPrefill (negative) | **Gap 12** (5 additional scenarios) |
-| P4 Path equivalence | SplitQwen35ReasoningContent (unit level) | Low priority: integration-level |
+| P4 Path equivalence | SplitQwen35ReasoningContent (unit level) | Integration-level renderer test needed |
 | P5 Arg formatting | FormatToolCallArgumentMatchesOfficialTemplate (11 cases) | **Done** (Gap 10) |
 | P6 Tool def serialization | ToolDefinitionsMatchOfficialTemplate (Tool 1 passes) | **Gap 4** (struct rewrite); Gap 6 (KV cache) |
 | P7 Tool response grouping | 3 tests cover grouped, non-consecutive, single | **Done** |
@@ -1303,27 +1303,27 @@ Zero trace of `"Think first."`. The template computes `reasoning_content` (line 
 
 **Restructured:** Gap 11 (lastQueryIndex edge cases). Pathological cases (no user messages — template raises exception) removed. The useful boundary testing is now specified in Gap 12 subtests 5/6 and Gap 13.
 
-**NEW — highest priority among open renderer gaps:**
+**Open renderer gaps:**
 
-- **Gap 12** (prefill property enforcement) — upgrades `AssistantPrefillWithThinking` from 1 to 6 subtests. Fills the most visible hole in the coverage matrix: think-independence in the prefill path (P1), the lastQueryIndex boundary in realistic multi-turn conversations (P2), and prefill in complex scenarios (P3). All `want` strings are verified against the official template. **This is the recommended next implementation task** — it is entirely self-contained (no code changes, just test restructuring), it fills 3 property gaps simultaneously, and it cannot cause regressions.
+- **Gap 12** (prefill property enforcement) — upgrades `AssistantPrefillWithThinking` from 1 to 6 subtests. Fills holes in P1 (think-independence in prefill path), P2 (lastQueryIndex boundary in multi-turn), and P3 (prefill in complex scenarios). All `want` strings verified against the official template.
 
-- **Gap 13** (pre-lastQueryIndex reasoning discarding) — covered by Gap 12 subtests 5 and 6. No separate test needed.
+- **Gap 13** (pre-lastQueryIndex reasoning discarding) — covered by Gap 12 subtests 5 and 6.
 
-**Open — serialization and round-trip:**
+**Open serialization and round-trip gaps:**
 
 - **Gap 4** (ToolProperty struct rewrite) — the last remaining renderer test failure. Requires a production code change to `api/types.go`. When implemented, brings two new tests (enum tool byte-exact + 5-case round-trip fidelity).
 
-- **Gap 9.5** (object key ordering in tool call arguments) — highest-impact open gap for KV cache reuse. Every tool call with a JSON object argument causes a cache miss. Requires insertion-order-preserving JSON parser. Three KV cache round-trip tests already document the failure.
+- **Gap 9.5** (object key ordering in tool call arguments) — every tool call with a JSON object argument causes a KV cache miss. Requires insertion-order-preserving JSON parser. Three KV cache round-trip tests already document the failure.
 
-**Open — cache and pipeline:**
+**Open cache and pipeline gaps:**
 
-- **Gap 5** (Property 1 at the KV cache level) — think mode switching in the render→parse→rerender cycle. Tests that byte-identical prefixes are produced across mode switches. Related to Gap 2 but at a stronger assertion level.
+- **Gap 5** (Property 1 at the KV cache level) — think mode switching in the render→parse→rerender cycle. Tests that byte-identical prefixes are produced across mode switches.
 
 - **Gap 6** (tool definition serialization in KV cache round-trip) — verifies tool definition bytes against golden strings, catching formatting regressions.
 
-**Open — grammar and parser:**
+**Open grammar and parser gaps:**
 
-- **Gap 7** (grammar-constrained tool call generation) — 5 sub-components, important for long-term maintenance but lower urgency.
+- **Gap 7** (grammar-constrained tool call generation) — 5 sub-components, all required for the first grammar-constrained tool call implementation in Ollama.
 
 - **Gap 8** (parser cancellation unit test) — parser behavior for incomplete tool calls, both think modes.
 
@@ -1331,10 +1331,10 @@ Zero trace of `"Think first."`. The template computes `reasoning_content` (line 
 
 ### Think mode coverage as a cross-cutting concern
 
-The coverage matrix in the "Coverage Matrix" section above shows think mode coverage visually. The key insight is that **every property-enforcing test should have think subtests unless the property is provably think-independent at the code level** (e.g., Property 5 argument formatting operates on Go values with no access to think state). The previous version of this document incorrectly exempted `AssistantPrefillWithThinking` from this rule with the reasoning "prefill behavior is independent of think mode" — but that independence is precisely the property that must be enforced by test, not assumed. Gap 12 corrects this.
+The coverage matrix shows think mode coverage visually. **Every property-enforcing test must have think subtests unless the property is provably think-independent at the code level** (e.g., Property 5 argument formatting operates on Go values with no access to think state). The previous version of this document incorrectly exempted `AssistantPrefillWithThinking` from this rule with the reasoning "prefill behavior is independent of think mode" — but that independence is precisely the property that must be enforced by test, not assumed. Gap 12 corrects this.
 
-After Gap 12 is implemented, the think=false coverage will increase from 6 to 8 tests (adding subtests 2 and 4 of the prefill test, plus subtest 5 which uses think=false in a tool-history conversation). The coverage matrix's P1 column will change from having a ✓/— hole to full ✓/✓ coverage across all tested paths.
+After Gap 12 is implemented, the think=false coverage increases from 6 to 8 tests (adding subtests 2 and 4 of the prefill test, plus subtest 5 which uses think=false in a tool-history conversation). The coverage matrix's P1 column changes from a ✓/— hole to full ✓/✓ coverage across all tested paths.
 
 ### Not-broken-but-untested items
 
-The "Not Broken But Untested" section above lists 4 items (NBU-1 through NBU-4). All 4 are covered by Gap 12 and Gap 13. When Gap 12 is implemented, all NBU items can be marked resolved.
+The "Not Broken But Untested" section lists 4 items (NBU-1 through NBU-4). All 4 are covered by Gap 12 and Gap 13. When Gap 12 is implemented, all NBU items are resolved.
