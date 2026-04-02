@@ -1097,9 +1097,9 @@ The ground truth was verified against BOTH official templates that use this func
 
 ---
 
-## Gap 12: Prefill Property Enforcement — `TestQwen35RendererAssistantPrefillWithThinking` Upgrade (Properties 1, 2, 3)
+## Gap 12: ~~Prefill Property Enforcement~~ DONE — `TestQwen35RendererAssistantPrefillWithThinking` Upgrade (Properties 1, 2, 3)
 
-**Status: OPEN.**
+**Status: DONE (2026-04-03).** Implemented as 6 subtests in `model/renderers/qwen35_test.go` (commit `232e3b97`). All `want` strings verified against the official template. Regression verified: re-adding `isThinking &&` to the wrapping condition causes subtests 2, 4, 5 to fail; re-adding `isThinking` parameter to `splitQwen35ReasoningContent` causes subtests 2, 5 to fail with "reasoning text missing" targeted diagnostic. NBU-1 through NBU-4 are resolved.
 
 **What is missing:** The current `TestQwen35RendererAssistantPrefillWithThinking` test has 1 subtest. It should have 6. Each subtest enforces a different combination of (think mode × content type × conversation structure) for the prefill path. All `want` strings are verified against the official Qwen 3.5 template output with `add_generation_prompt=False`, with the trailing `<|im_end|>\n` stripped (the intentional Ollama prefill deviation). The template was run for every scenario with `enable_thinking=True`, `False`, and `undefined` — all three produce identical output for `add_generation_prompt=False`, proving that `enable_thinking` has zero effect on the output when there is no generation prompt.
 
@@ -1266,9 +1266,9 @@ The test should have a comment block (matching the style of `TestQwen35RendererA
 
 ---
 
-## Gap 13: Pre-lastQueryIndex Reasoning Discarding — Property 2 Boundary Enforcement
+## Gap 13: ~~Pre-lastQueryIndex Reasoning Discarding~~ DONE — Property 2 Boundary Enforcement
 
-**Status: OPEN.**
+**Status: DONE (2026-04-03).** Covered by Gap 12 subtests 5 (`think_switch_with_tool_history`) and 6 (`pre_lastQueryIndex_reasoning_discarded`).
 
 **What is missing:** No test verifies as a **positive property** that reasoning from assistant messages before `lastQueryIndex` is silently discarded. The `BackToBackToolCallsAndResponses` test has a targeted diagnostic (`strings.Contains` negative check) verifying that thinking "doesn't leak," but this is insufficient:
 
