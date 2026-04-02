@@ -1,6 +1,6 @@
 # Qwen 3.5 Renderer and Parser Test Gap Analysis
 
-**Date:** 2026-03-13 (updated 2026-03-22: Gap 4 rewritten with verified HuggingFace Transformers ground truth; Items ordering corrected from "non-issue" to real issue for complex element types — `Items *ToolProperty` recursive type fix specified; proposed struct uses recursive types throughout; Gap 10 rewritten with `formatToolCallArgument` scalar divergences including bool/None/large-integer) (updated 2026-04-01: Gap 4 simple-tool ground truth test implemented and passing — `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` rewritten with byte-exact HF ground truth, realistic `items`, corrected `required`; `TestQwen35RendererBackToBackToolCallsAndResponses` upgraded to byte-exact comparison with `think=true`/`think=false` subtests — locks in multi-tool-call rendering, tool response grouping, pre-lastQueryIndex thinking omission, tool definition JSON, and generation prompt for both think modes; `TestQwen35RendererUsesXMLToolCallingFormat` upgraded to byte-exact with `think=true`/`think=false` subtests — the last loose (`strings.Contains`) renderer test, now locks in single-tool-call, single-tool-response, no-description, no-Thinking-field paths; includes boolean argument `verbose: true` that enforces Gap 10's `true`→`True` divergence (test FAILS by design until `formatToolCallArgument` is fixed); targeted diagnostics for tool JSON, boolean capitalization with exact fix, content-to-tool separator, and `<|im_end|>` closure; all 9 renderer tests (19 subtests) are now byte-exact against official template ground truth; think=false coverage matrix updated from 5 to 6 tests; test status descriptions updated throughout; `TestFormatToolCallArgumentMatchesOfficialTemplate` replaces the old `TestFormatToolCallArgument` — 11 cases with template ground truth verified against both Qwen 3.5 (line 122) and Qwen3-Coder (line 89) templates, FAILS on 4 (bool_true, bool_false, nil, large_int), PASSES on 7; `TestFormatToolCallArgumentThinkingVL` deleted — tested a function the VL renderer doesn't call, with wrong expected values that would block the fix) (updated 2026-04-02: `TestQwen35RendererInterleavedThinkingAndTools` upgraded to byte-exact `got != want` comparison with official Jinja2 template ground truth — both think=true (1981 bytes) and think=false (1992 bytes) verified byte-identical between Go renderer output and Python template output via diff; corrects the 2026-04-01 claim that `UsesXMLToolCallingFormat` was "the last loose renderer test" — `InterleavedThinkingAndTools` also used `strings.Contains`/`strings.HasSuffix` and is now the final test upgraded to full byte-exact; think=false targeted diagnostics preserved as `t.Errorf` before byte-exact `t.Fatalf` gate; Gap 2 status updated; think mode coverage matrix description updated; `TestQwen35RendererNoThinkPrefill` upgraded from `strings.HasSuffix` to byte-exact `got != want` (74 bytes) — all 9 renderer tests (20 subtests) now use full byte-exact comparison, zero substring matching remaining)
+**Date:** 2026-03-13 (updated 2026-03-22: Gap 4 rewritten with verified HuggingFace Transformers ground truth; Items ordering corrected from "non-issue" to real issue for complex element types — `Items *ToolProperty` recursive type fix specified; proposed struct uses recursive types throughout; Gap 10 rewritten with `formatToolCallArgument` scalar divergences including bool/None/large-integer) (updated 2026-04-01: Gap 4 simple-tool ground truth test implemented and passing — `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` rewritten with byte-exact HF ground truth, realistic `items`, corrected `required`; `TestQwen35RendererBackToBackToolCallsAndResponses` upgraded to byte-exact comparison with `think=true`/`think=false` subtests — locks in multi-tool-call rendering, tool response grouping, pre-lastQueryIndex thinking omission, tool definition JSON, and generation prompt for both think modes; `TestQwen35RendererUsesXMLToolCallingFormat` upgraded to byte-exact with `think=true`/`think=false` subtests — the last loose (`strings.Contains`) renderer test, now locks in single-tool-call, single-tool-response, no-description, no-Thinking-field paths; includes boolean argument `verbose: true` that enforces Gap 10's `true`→`True` divergence (test FAILS by design until `formatToolCallArgument` is fixed); targeted diagnostics for tool JSON, boolean capitalization with exact fix, content-to-tool separator, and `<|im_end|>` closure; all 9 renderer tests (19 subtests) are now byte-exact against official template ground truth; think=false coverage matrix updated from 5 to 6 tests; test status descriptions updated throughout; `TestFormatToolCallArgumentMatchesOfficialTemplate` replaces the old `TestFormatToolCallArgument` — 11 cases with template ground truth verified against both Qwen 3.5 (line 122) and Qwen3-Coder (line 89) templates, FAILS on 4 (bool_true, bool_false, nil, large_int), PASSES on 7; `TestFormatToolCallArgumentThinkingVL` deleted — tested a function the VL renderer doesn't call, with wrong expected values that would block the fix) (updated 2026-04-02: `TestQwen35RendererInterleavedThinkingAndTools` upgraded to byte-exact `got != want` comparison with official Jinja2 template ground truth — both think=true (1981 bytes) and think=false (1992 bytes) verified byte-identical between Go renderer output and Python template output via diff; corrects the 2026-04-01 claim that `UsesXMLToolCallingFormat` was "the last loose renderer test" — `InterleavedThinkingAndTools` also used `strings.Contains`/`strings.HasSuffix` and is now the final test upgraded to full byte-exact; think=false targeted diagnostics preserved as `t.Errorf` before byte-exact `t.Fatalf` gate; Gap 2 status updated; think mode coverage matrix description updated; `TestQwen35RendererNoThinkPrefill` upgraded from `strings.HasSuffix` to byte-exact `got != want` (74 bytes) — all 9 renderer tests (20 subtests) now use full byte-exact comparison, zero substring matching remaining) (updated 2026-04-03: Gap 10 **DONE** — `formatToolCallArgument` in `model/renderers/qwen3coder.go` rewritten to match Python `str()`: `nil`→`"None"`, `bool`→`"True"`/`"False"`, integer-valued `float64`→`strconv.FormatInt`; `TestFormatToolCallArgumentMatchesOfficialTemplate` now 11/11 PASS (was 7/11); `TestQwen35RendererUsesXMLToolCallingFormat` now 2/2 PASS (was 0/2); the sole remaining renderer test failure is `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` Tool 2 enum/description ordering (Gap 4 ToolProperty struct rewrite); Gap 10 section, test descriptions, and relationship section updated throughout)
 **Fork:** `BigBIueWhale/ollama`, branch `main`, merge base `cc90a035` (Ollama `v0.17.4`)
 **Model:** Qwen 3.5 27B (Alibaba Qwen), a hybrid recurrent architecture (`qwen3next`). Currently the most promising open-source large language model that can run on consumer-grade hardware (17.6 GB at Q4_K_XL quantization).
 **Scope:** This document covers only the test gaps that need to be closed for the Qwen 3.5 prompt template renderer (`model/renderers/qwen35.go`) and parser (`model/parsers/qwen35.go`, which delegates tool call parsing to `model/parsers/qwen3coder.go`), and the grammar-constrained tool call generation pipeline. It does not cover model architecture, GGUF conversion, penalty sampling, or performance — those are covered in `consolidated_report.md`.
@@ -25,7 +25,7 @@ Both failure modes are especially damaging for this specific model because Qwen 
 
 ### Renderer tests: `model/renderers/qwen35_test.go`
 
-**`TestQwen35RendererUsesXMLToolCallingFormat`**: Byte-exact comparison of a single-tool-call agentic conversation against official Jinja2 template ground truth. System message with one tool definition (no description — verifies `omitempty` omission), a user query, an assistant response with visible content and one tool call with two arguments (string `"Paris"` and boolean `true`), a single tool response, and a follow-up user query. The expected strings were derived by running the official Qwen/Qwen3.5-27B Jinja2 chat template with the same inputs; verified byte-for-byte against the Python output. Has `think=true` and `think=false` subtests. The assistant at index 2 is before `lastQueryIndex=4`, has no `Thinking` field (exercises `splitQwen35ReasoningContent` Path 3 — fallthrough with no thinking). The boolean argument `verbose: true` exercises `formatToolCallArgument`'s scalar bool path and **currently causes the test to FAIL**: the expected string uses `True` (the template's ground truth from Python `str(True)`) but Go's `fmt.Sprintf("%v", true)` produces `true` (lowercase). This is the Gap 10 divergence — the test enforces it until `formatToolCallArgument` is fixed. Four targeted diagnostics fire before the byte-exact comparison: (1) tool definition JSON against HF ground truth, (2) boolean capitalization `true` vs `True` with the exact `case bool:` fix to apply, (3) `\n\n` separator between content and first `<tool_call>` (template line 112), (4) `</tool_call><|im_end|>` closure. This complements `TestQwen35RendererBackToBackToolCallsAndResponses` (back-to-back tool calls, grouped tool responses, integer arguments, tool descriptions present) by testing the single-tool, single-response, mixed-type-argument, no-description paths.
+**`TestQwen35RendererUsesXMLToolCallingFormat`**: Byte-exact comparison of a single-tool-call agentic conversation against official Jinja2 template ground truth. System message with one tool definition (no description — verifies `omitempty` omission), a user query, an assistant response with visible content and one tool call with two arguments (string `"Paris"` and boolean `true`), a single tool response, and a follow-up user query. The expected strings were derived by running the official Qwen/Qwen3.5-27B Jinja2 chat template with the same inputs; verified byte-for-byte against the Python output. Has `think=true` and `think=false` subtests. The assistant at index 2 is before `lastQueryIndex=4`, has no `Thinking` field (exercises `splitQwen35ReasoningContent` Path 3 — fallthrough with no thinking). The boolean argument `verbose: true` exercises `formatToolCallArgument`'s scalar bool path — the expected string uses `True` (the template's ground truth from Python `str(True)`) and Go now correctly produces `True` (the `case bool:` branch added 2026-04-03). Both subtests **PASS**. Four targeted diagnostics fire before the byte-exact comparison: (1) tool definition JSON against HF ground truth, (2) boolean capitalization `true` vs `True` with the exact `case bool:` fix to apply, (3) `\n\n` separator between content and first `<tool_call>` (template line 112), (4) `</tool_call><|im_end|>` closure. This complements `TestQwen35RendererBackToBackToolCallsAndResponses` (back-to-back tool calls, grouped tool responses, integer arguments, tool descriptions present) by testing the single-tool, single-response, mixed-type-argument, no-description paths.
 
 **`TestQwen35RendererNoThinkPrefill`**: Byte-exact `got != want` comparison of the simplest possible prompt shape: one user message, no tools, no system message, no assistant history, with `ThinkValue{Value: false}`. The entire 74-byte output is `<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`. Verifies the official template's add_generation_prompt block (lines 149-150) for enable_thinking=false. The renderer is constructed with `isThinking: true`, and the `ThinkValue{Value: false}` override is passed to `Render()`. This tests the `emitEmptyThinkOnNoThink` field but does NOT test the prefill bug fix because the last message is a user message, not an assistant message.
 
@@ -43,7 +43,7 @@ Both failure modes are especially damaging for this specific model because Qwen 
 
 **`TestSplitQwen35ReasoningContent`**: Tests the reasoning extraction function `splitQwen35ReasoningContent` in isolation with 11 table-driven subtests plus a cross-encoding equivalence assertion. Covers three client encoding paths, multi-line reasoning, close-tag-only, explicit field priority, whitespace-only thinking field, empty content, both-empty, and multiple `</think>` tags. See Gap 3 for full details.
 
-**Think mode coverage across renderer tests:** All renderer tests construct the `Qwen35Renderer` with `isThinking: true`. Six tests exercise `think: false` at runtime: `TestQwen35RendererNoThinkPrefill` (generation prompt only, no assistant messages), `TestQwen35RendererUsesXMLToolCallingFormat/think=false` (byte-exact single-tool-call scenario — pre-lastQueryIndex assistant with no Thinking field, string + boolean arguments; currently FAILS on boolean `true`→`True` divergence from Gap 10; confirms output identical to think=true except generation prompt suffix), `TestQwen35RendererBackToBackToolCallsAndResponses/think=false` (byte-exact verification of pre-lastQueryIndex thinking omission, multi-tool rendering, and non-thinking generation prompt — confirms that the entire output is identical to think=true except the generation prompt suffix, as the official template checks `enable_thinking` in exactly one place), `TestQwen35RendererStructuredToolArgumentsUseSpacedJSON/think=false` (byte-exact verification including unconditional `<think>` wrapping with empty reasoning and non-thinking generation prompt suffix), `TestQwen35RendererAssistantToolCallIsNotPrefill/think=false` (generation prompt after tool-calling assistant, empty historical thinking block from post-lastQueryIndex wrapping), and `TestQwen35RendererInterleavedThinkingAndTools/think=false` (byte-exact with targeted `t.Errorf` diagnostics for thinking block preservation + `got != want` gate — the Gap 2 regression detector). Together, the six think=false tests form a complementary coverage matrix over the `lastQueryIndex` and `enable_thinking` dimensions: `UsesXMLToolCallingFormat` covers pre-lastQueryIndex with no Thinking field (Path 3 fallthrough) and boolean argument capitalization (Gap 10 enforcer), `BackToBackToolCallsAndResponses` covers pre-lastQueryIndex with a Thinking field (thinking correctly omitted by position), `InterleavedThinkingAndTools` covers post-lastQueryIndex (thinking unconditionally preserved — byte-exact verification of the entire output including system prompt, tool definitions, tool responses, and all closures), `StructuredToolArgumentsUseSpacedJSON` covers post-lastQueryIndex with empty reasoning, `AssistantToolCallIsNotPrefill` covers the prefill guard, and `NoThinkPrefill` covers the standalone generation prompt. As documented in "Why Exact Template Fidelity Matters," the official template checks `enable_thinking` in exactly one place — the generation prompt. Historical `<think>` block rendering is unconditional — it does not check `isThinking` (this is the fork's fix, now protected by Gap 2's test). Content formatting, tool call XML, tool definition JSON, and `<|im_end|>` placement are all independent of think mode. `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` does not need a think=false variant because tool definition JSON in the system prompt is identical regardless of think mode. `TestQwen35RendererAssistantPrefillWithThinking` also does not need a think=false variant because prefill behavior is independent of think mode.
+**Think mode coverage across renderer tests:** All renderer tests construct the `Qwen35Renderer` with `isThinking: true`. Six tests exercise `think: false` at runtime: `TestQwen35RendererNoThinkPrefill` (generation prompt only, no assistant messages), `TestQwen35RendererUsesXMLToolCallingFormat/think=false` (byte-exact single-tool-call scenario — pre-lastQueryIndex assistant with no Thinking field, string + boolean arguments; PASSES — boolean `True` capitalization fixed 2026-04-03; confirms output identical to think=true except generation prompt suffix), `TestQwen35RendererBackToBackToolCallsAndResponses/think=false` (byte-exact verification of pre-lastQueryIndex thinking omission, multi-tool rendering, and non-thinking generation prompt — confirms that the entire output is identical to think=true except the generation prompt suffix, as the official template checks `enable_thinking` in exactly one place), `TestQwen35RendererStructuredToolArgumentsUseSpacedJSON/think=false` (byte-exact verification including unconditional `<think>` wrapping with empty reasoning and non-thinking generation prompt suffix), `TestQwen35RendererAssistantToolCallIsNotPrefill/think=false` (generation prompt after tool-calling assistant, empty historical thinking block from post-lastQueryIndex wrapping), and `TestQwen35RendererInterleavedThinkingAndTools/think=false` (byte-exact with targeted `t.Errorf` diagnostics for thinking block preservation + `got != want` gate — the Gap 2 regression detector). Together, the six think=false tests form a complementary coverage matrix over the `lastQueryIndex` and `enable_thinking` dimensions: `UsesXMLToolCallingFormat` covers pre-lastQueryIndex with no Thinking field (Path 3 fallthrough) and boolean argument capitalization (Gap 10 — now fixed and passing), `BackToBackToolCallsAndResponses` covers pre-lastQueryIndex with a Thinking field (thinking correctly omitted by position), `InterleavedThinkingAndTools` covers post-lastQueryIndex (thinking unconditionally preserved — byte-exact verification of the entire output including system prompt, tool definitions, tool responses, and all closures), `StructuredToolArgumentsUseSpacedJSON` covers post-lastQueryIndex with empty reasoning, `AssistantToolCallIsNotPrefill` covers the prefill guard, and `NoThinkPrefill` covers the standalone generation prompt. As documented in "Why Exact Template Fidelity Matters," the official template checks `enable_thinking` in exactly one place — the generation prompt. Historical `<think>` block rendering is unconditional — it does not check `isThinking` (this is the fork's fix, now protected by Gap 2's test). Content formatting, tool call XML, tool definition JSON, and `<|im_end|>` placement are all independent of think mode. `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` does not need a think=false variant because tool definition JSON in the system prompt is identical regardless of think mode. `TestQwen35RendererAssistantPrefillWithThinking` also does not need a think=false variant because prefill behavior is independent of think mode.
 
 ### Parser tests: `model/parsers/qwen35_test.go` (382 lines, 11 test functions)
 
@@ -878,16 +878,16 @@ No test verifies that these regex patterns match the correct strings and reject 
 
 ---
 
-## Gap 10: `formatToolCallArgument` Produces Wrong Output for Scalar Booleans and None
+## Gap 10: ~~`formatToolCallArgument` Produces Wrong Output for Scalar Booleans and None~~ DONE (2026-04-03)
 
-**What is wrong:** The official Qwen 3.5 Jinja2 template (in `chat_template.jinja`'s tool call argument rendering block) renders tool call arguments using two code paths based on the argument's type:
+**What was wrong:** The official Qwen 3.5 Jinja2 template (in `chat_template.jinja`'s tool call argument rendering block) renders tool call arguments using two code paths based on the argument's type:
 
 - For dicts and lists: `args_value | tojson | safe` — serializes to JSON (booleans are `true`/`false`, null is `null`)
 - For everything else (strings, numbers, booleans, None): `args_value | string` — calls Python's `str()` function
 
 Python's `str()` function produces `True` (capital T) for `True`, `False` (capital F) for `False`, and `None` for `None`. This is what the model was trained on.
 
-Go's `formatToolCallArgument` in `model/renderers/qwen3coder.go` uses `fmt.Sprintf("%v", value)` for non-string, non-collection types. `fmt.Sprintf("%v", true)` produces `true` (lowercase). `fmt.Sprintf("%v", false)` produces `false` (lowercase). And for `nil`, the function's nil-check branch hardcodes `"null"`.
+Go's `formatToolCallArgument` in `model/renderers/qwen3coder.go` previously used `fmt.Sprintf("%v", value)` for non-string, non-collection types. `fmt.Sprintf("%v", true)` produced `true` (lowercase). `fmt.Sprintf("%v", false)` produced `false` (lowercase). And for `nil`, the function's nil-check branch hardcoded `"null"`.
 
 This was verified by rendering the same messages through both HuggingFace Transformers' `_compile_jinja_template()` and Go's `Qwen35Renderer.Render()`, saving both outputs to files, and running `diff`. The diff shows three lines that differ:
 
@@ -896,90 +896,31 @@ This was verified by rendering the same messages through both HuggingFace Transf
 | `string` | `hello` | `hello` | **Yes** |
 | `int` | `42` | `42` | **Yes** |
 | `float` | `3.14` | `3.14` | **Yes** |
-| `bool` `True` | `True` | `true` | **No** |
-| `bool` `False` | `False` | `false` | **No** |
-| `None` | `None` | `null` | **No** |
+| `bool` `True` | `True` | `True` | **Yes** — fixed 2026-04-03 (`case bool:` branch) |
+| `bool` `False` | `False` | `False` | **Yes** — fixed 2026-04-03 (`case bool:` branch) |
+| `None` | `None` | `None` | **Yes** — fixed 2026-04-03 (nil returns `"None"`) |
+| `large_int` `10000000000` | `10000000000` | `10000000000` | **Yes** — fixed 2026-04-03 (`case float64:` with `strconv.FormatInt`) |
 | `list` | `[1, "two", true]` | `[1, "two", true]` | **Yes** |
 | `dict` | `{"nested": true, "value": null}` | `{"nested": true, "value": null}` | **Yes** |
 
-Note the asymmetry: booleans and null INSIDE collections (lists, dicts) are rendered via `tojson` (JSON serialization), which produces lowercase `true`/`false`/`null` in both Python and Go — these match. The mismatch is only for **top-level scalar** booleans and None, which use `| string` (Python `str()`) in the template but `fmt.Sprintf("%v")` in Go.
+Note the intentional asymmetry that both the template and Go now handle correctly: booleans and null INSIDE collections (lists, dicts) are rendered via `tojson` (JSON serialization), which produces lowercase `true`/`false`/`null` in both Python and Go. **Top-level scalar** booleans and None use `| string` (Python `str()`) in the template and now matching `case bool:` / nil branches in Go, producing `True`/`False`/`None`.
 
-**When this triggers:** Any multi-turn conversation where a past assistant tool call had a boolean or None argument. The renderer re-renders the entire conversation history on each turn. If a past tool call had `enabled: True` in its arguments, HuggingFace Transformers renders it as `True` but Go renders it as `true`, producing different token IDs and invalidating the KV cache from that point forward.
-
-**What the test should verify:**
+**The fix (applied 2026-04-03):** Three new `case` branches were added to `formatToolCallArgument` in `model/renderers/qwen3coder.go`:
 
 ```go
-func TestFormatToolCallArgumentMatchesOfficialTemplate(t *testing.T) {
-    // The official Qwen 3.5 template uses:
-    //   args_value | string (for scalars) → Python str()
-    //   args_value | tojson | safe (for dicts/lists) → json.dumps()
-    cases := []struct {
-        name     string
-        value    any
-        hfOutput string // What the official template produces
-    }{
-        {"string", "hello", "hello"},
-        {"int", float64(42), "42"},
-        {"float", 3.14, "3.14"},
-        {"bool_true", true, "True"},    // Python str(True) = "True"
-        {"bool_false", false, "False"}, // Python str(False) = "False"
-        {"nil", nil, "None"},           // Python str(None) = "None"
-        {"large_int", float64(1e10), "10000000000"},  // not "1e+10"
-        {"small_float", float64(1e-5), "1e-05"},      // exponential OK
-        {"list", []any{float64(1), "two", true}, `[1, "two", true]`},
-        {"dict", map[string]any{"nested": true, "value": nil},
-            `{"nested": true, "value": null}`},
+case bool:
+    if v {
+        return "True"
     }
-
-    for _, c := range cases {
-        t.Run(c.name, func(t *testing.T) {
-            goOutput := formatToolCallArgument(c.value)
-            if goOutput != c.hfOutput {
-                t.Errorf(
-                    "formatToolCallArgument(%v) = %q, want %q\n\n"+
-                        "The official Qwen 3.5 template uses Python's "+
-                        "str() for scalar values (| string filter), "+
-                        "which produces 'True'/'False'/'None' — not "+
-                        "'true'/'false'/'null'. Fix: add special cases "+
-                        "for bool and nil in formatToolCallArgument "+
-                        "in formatToolCallArgument() in model/renderers/qwen3coder.go.",
-                    c.value, goOutput, c.hfOutput)
-            }
-        })
+    return "False"
+case float64:
+    if v == math.Trunc(v) && !math.IsInf(v, 0) && !math.IsNaN(v) {
+        return strconv.FormatInt(int64(v), 10)
     }
-}
+    return fmt.Sprintf("%v", v)
 ```
 
-Fix: Rewrite the type handling in `formatToolCallArgument` at `model/renderers/qwen3coder.go` to match Python's `str()` for each type:
-
-```go
-func formatToolCallArgument(value any) string {
-    if value == nil {
-        return "None"  // Python str(None) = "None", not "null"
-    }
-    switch v := value.(type) {
-    case string:
-        return v
-    case []byte:
-        return string(v)
-    case bool:
-        if v {
-            return "True"   // Python str(True) = "True"
-        }
-        return "False"      // Python str(False) = "False"
-    case float64:
-        // JSON numbers unmarshal as float64. Integer-valued floats
-        // must format as integers (matching Python str(int_value)).
-        // Without this, float64(1e10) produces "1e+10" but Python
-        // str(10000000000) produces "10000000000".
-        if v == math.Trunc(v) && !math.IsInf(v, 0) && !math.IsNaN(v) {
-            return strconv.FormatInt(int64(v), 10)
-        }
-        return fmt.Sprintf("%v", v)
-    }
-    // ... existing map/slice/array handling ...
-}
-```
+And the nil branch was changed from `return "null"` to `return "None"`. Imports `math` and `strconv` were added.
 
 Verified against Python `str()` output for: `42` ✓, `3.14` ✓, `0` ✓, `-1` ✓, `1e10` → `"10000000000"` (not `"1e+10"`) ✓, `1e-5` → `"1e-05"` ✓, `1e15` → `"1000000000000000"` ✓.
 
@@ -987,9 +928,9 @@ Verified against Python `str()` output for: `42` ✓, `3.14` ✓, `0` ✓, `-1` 
 
 **`TestQwen35RendererStructuredToolArgumentsUseSpacedJSON` byte-exact upgrade: DONE.** Converted from `strings.Contains` to full `got != want` with `think=true` and `think=false` subtests.
 
-**`TestQwen35RendererUsesXMLToolCallingFormat` boolean enforcement: DONE.** The test includes a `verbose: true` boolean argument whose expected output uses `True` (template ground truth). The test FAILS by design until `formatToolCallArgument` is fixed. A targeted diagnostic fires with the exact `case bool:` fix to apply in `model/renderers/qwen3coder.go`. This is the integration-level enforcer — it proves the fix actually affects the rendered prompt.
+**`TestQwen35RendererUsesXMLToolCallingFormat` boolean enforcement: DONE and PASSING (2026-04-03).** The test includes a `verbose: true` boolean argument whose expected output uses `True` (template ground truth). The test now PASSES — `formatToolCallArgument`'s `case bool:` branch produces `True`. The targeted diagnostic for boolean capitalization remains as a first-line regression detector.
 
-**`TestFormatToolCallArgumentMatchesOfficialTemplate` unit test: DONE.** Replaced the old `TestFormatToolCallArgument` in `model/renderers/qwen3coder_test.go` (which locked in Go's wrong output as expected values) with 11 table-driven cases whose expected values are the official template's output. FAILS on exactly 4 cases: `bool_true` (`"true"` vs `"True"`), `bool_false` (`"false"` vs `"False"`), `nil` (`"null"` vs `"None"`), `large_int` (`"1e+10"` vs `"10000000000"`). PASSES on 7 cases: string, int, float, small_float, list, dict_with_bool_and_null, dict_with_html_chars. Each passing case documents that the code path already works correctly. Each failing case has a single error message naming the exact function, the Python `str()` behavior it must match, and the fix to apply. The collection cases (list, dict) document the template's intentional asymmetry: booleans inside collections are JSON-standard lowercase `true`/`false` via `| tojson`, while top-level scalar booleans are Python-standard `True`/`False` via `| string` — both forms are in the training data.
+**`TestFormatToolCallArgumentMatchesOfficialTemplate` unit test: DONE and PASSING (2026-04-03).** Replaced the old `TestFormatToolCallArgument` in `model/renderers/qwen3coder_test.go` (which locked in Go's wrong output as expected values) with 11 table-driven cases whose expected values are the official template's output. All 11 cases now PASS (was 7/11 before the fix). The 4 previously-failing cases (`bool_true`, `bool_false`, `nil`, `large_int`) were fixed by the `case bool:`, nil `"None"`, and `case float64:` branches added 2026-04-03. The collection cases (list, dict) document the template's intentional asymmetry: booleans inside collections are JSON-standard lowercase `true`/`false` via `| tojson`, while top-level scalar booleans are Python-standard `True`/`False` via `| string` — both forms are in the training data.
 
 The ground truth was verified against BOTH official templates that use this function: the Qwen 3.5 template (`/tmp/resources_reference/hf-Qwen3.5-27B/chat_template.jinja`, line 122) and the Qwen3-Coder template (`/tmp/llama_cpp_up_to_date/models/templates/Qwen3-Coder.jinja`, line 89). Both templates have byte-identical argument rendering logic (`args_value | string` for scalars). Jinja2's `| string` filter calls Python's `str()`, which produces `True`/`False`/`None` — verified by running the filter in isolation and by rendering both full templates with boolean arguments.
 
@@ -1020,7 +961,7 @@ Gaps 1, 2, and 3 are now closed. Gaps 1 and 2 protect the fork's two most import
 
 Gap 4 (tool definition serialization) is **partially closed** (2026-04-01). The simple-tool ground truth test (`TestQwen35RendererToolDefinitionsMatchOfficialTemplate`) has been rewritten with byte-exact HF ground truth and passes — it guards the correct simple-tool serialization against regressions. The remaining work is the `ToolProperty` struct rewrite in `api/types.go` — a single struct change that fixes `enum`/`description` ordering, adds `nullable`/`additionalProperties`/`prefixItems` fields (these carry type constraint semantics, unlike the `"return"` field which is informational and harmless to drop), AND fixes recursive nested key ordering for complex element types by using `Items *ToolProperty`, `AdditionalProperties *ToolProperty`, `PrefixItems []ToolProperty` instead of `any`/`[]any` (so Go's `json.Marshal` produces training-consistent key ordering at all nesting levels). When that struct rewrite lands, two new tests arrive with it: (1) a Tool 2 (enum tool) case added to `TestQwen35RendererToolDefinitionsMatchOfficialTemplate` that verifies the `enum`/`description` field ordering, and (2) the `TestQwen35ToolPropertyRoundTripFidelity` test with 5 cases for field loss and nested key ordering. Go's struct-based serialization normalizes all client inputs to the training-consistent field order — this is superior to the official Jinja2 template's `{{ tool | tojson }}` passthrough, which blindly preserves whatever Python dict ordering the client sends.
 
-**Gaps 9.5 and 10 are the tool call argument round-trip gaps.** Gap 9.5 (object key ordering) is the highest-impact open gap: every tool call with a JSON object argument causes a KV cache miss in multi-turn conversations. Three KV cache round-trip tests (cases 10, 11, 15) and two number normalization tests (cases 12, 13) already exist and correctly fail, documenting the bug. The fix requires an insertion-order-preserving JSON parser for argument values — the same approach llama.cpp uses via `nlohmann::ordered_json`. Gap 10 (scalar boolean/None/large-integer capitalization) is a separate divergence in the same `formatToolCallArgument` function in `model/renderers/qwen3coder.go`, affecting top-level scalar booleans and None values. Both gaps affect the tool call argument re-serialization path (`formatToolCallArgument` / `marshalQwenToolCallArgument`), which is distinct from the tool definition serialization path (`marshalWithSpaces`) addressed by Gap 4.
+**Gap 9.5 is the remaining tool call argument round-trip gap.** Gap 9.5 (object key ordering) is the highest-impact open gap: every tool call with a JSON object argument causes a KV cache miss in multi-turn conversations. Three KV cache round-trip tests (cases 10, 11, 15) and two number normalization tests (cases 12, 13) already exist and correctly fail, documenting the bug. The fix requires an insertion-order-preserving JSON parser for argument values — the same approach llama.cpp uses via `nlohmann::ordered_json`. Gap 10 (scalar boolean/None/large-integer capitalization) is now **DONE** (2026-04-03) — `formatToolCallArgument` in `model/renderers/qwen3coder.go` was fixed to match Python `str()` for bool/nil/integer-valued-float64, and all 11 unit test cases + both integration subtests now PASS. Both gaps affect the tool call argument re-serialization path (`formatToolCallArgument` / `marshalQwenToolCallArgument`), which is distinct from the tool definition serialization path (`marshalWithSpaces`) addressed by Gap 4.
 
 Gap 5 (thinking mode switching in KV cache) tests the cache-level consequences of the same renderer behavior that Gap 2 tests at the unit level. Both are needed — Gap 2 catches thinking blocks being stripped, Gap 5 catches subtler byte-level divergences that only manifest as cache misses.
 
