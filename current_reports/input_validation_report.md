@@ -432,7 +432,8 @@ The grammar pipeline error in `ChatHandler` in `routes.go` should also change fr
 | 2 | System message not at index 0 | Change behavior of mid-conversation system message handling in `Render()` | `return "", fmt.Errorf(...)` | Rejection 2: `"System message must be at the beginning."` |
 | 3 | No real user query found | Check `multiStepTool` after the `lastQueryIndex` backward scan | `return "", fmt.Errorf(...)` | Rejection 3: `"No user query found in messages."` |
 | 4 | Images in system message | Add role-aware check in `renderContent()` | `return "", 0, fmt.Errorf(...)` | Rejection 5: `"System message cannot contain images."` |
-| 5 | Empty tool function name | Check before tool call function name concatenation in `Render()` | `return "", fmt.Errorf(...)` | No equivalent (implicit) |
+| 5 | Empty tool function name | Check before tool call function name concatenation in `Render()` | `return "", fmt.Errorf(...)` | No equivalent — template silently produces `<function=>`. Fork is intentionally stricter: this token sequence is absent from training data. |
+| 6 | No messages provided | Check `len(messages) == 0` at the top of `Render()` | `return "", fmt.Errorf(...)` | Rejection 1: `"No messages provided."` |
 
 ### Validations to add in `ChatHandler` at `server/routes.go` (before rendering):
 
@@ -464,6 +465,10 @@ The grammar pipeline error in `ChatHandler` in `routes.go` should also change fr
 
 The fork's client input validation is concentrated in the C++ grammar builder (12 error codes for tool definitions, unique to the fork and stronger than llama.cpp's equivalent) and absent everywhere else. The entire path from HTTP endpoint through JSON parsing through system message prepending through prompt rendering has no validation of conversation structure, message roles, message ordering, or content conventions.
 
-The fix is 5 one-liner checks inside `Qwen35Renderer.Render()`, each placed at the exact code point where the relevant state is already computed. No separate validation function, no message re-walking, no code duplication. Plus one HTTP status code change from 500 to 400 for grammar pipeline errors.
+The fix is 6 one-liner checks inside `Qwen35Renderer.Render()`, each placed at the exact code point where the relevant state is already computed. No separate validation function, no message re-walking, no code duplication. Plus one HTTP status code change from 500 to 400 for grammar pipeline errors. The 6th check — empty tool function name — goes beyond the official template, which silently produces malformed `<function=>` XML. The fork should be stricter: `<function=>` is a token sequence absent from all training data, and letting it through gains nothing. Being more strict than the template is the right default when the alternative is silent corruption.
+
+Verified (2026-04-03): adding all 6 validation checks would not break any existing test. All 59 byte-exact subtests in `qwen35_test.go` and `qwen3coder_test.go` use valid message arrays that pass every check — system at index 0 (or absent), at least one real user query, all roles valid, no images in system messages, no empty function names. The validation tests themselves (once written) would construct deliberately invalid inputs and assert that `Render()` returns an error.
+
+See also `test_gap_analysis.md` Gap 11 — the `lastQueryIndex` edge cases (all-tool-response users, no user messages) are the test-side counterpart to validation checks 2-3 here. Gap 11 is currently blocked on the decision to add validation; once validation is implemented, those edge cases become error-path tests rather than behavior tests.
 
 llama.cpp avoids this problem architecturally by executing Jinja2 templates directly — the template IS the validator. But llama.cpp's approach is not available to Ollama because Ollama uses hand-written Go renderers instead of Jinja2 templates. The Go renderer approach is faster and more predictable, but it means validation must be added explicitly rather than inherited from the template.
